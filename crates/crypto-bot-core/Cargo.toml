@@ -35,7 +35,7 @@ publish      = false
 # HTTPS POST shares the same TLS backend as the exchange clients. Pinned to the
 # same git rev the `crypto` repo used; downstream bots enable the venue features
 # they need and cargo unifies them onto this one copy.
-exchange-apiws = { git = "https://github.com/nuniesmith/exchange-apiws", rev = "fa35543", default-features = false }
+exchange-apiws = { version = "0.9.0", default-features = false }
 
 # Async runtime: alerts spawns the webhook POST; the status server binds a
 # TcpListener and serves connections.

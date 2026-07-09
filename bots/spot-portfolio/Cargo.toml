@@ -43,7 +43,7 @@ crypto-bot-core = { path = "../../crates/crypto-bot-core" }
 # KuCoin (always on) + Kraken + Crypto.com spot connectors. Pinned to the same
 # git rev the `crypto` repo used; cargo unifies this onto the one exchange-apiws
 # copy crypto-bot-core also pulls.
-exchange-apiws = { git = "https://github.com/nuniesmith/exchange-apiws", rev = "fa35543", default-features = false, features = ["kraken", "cryptocom"] }
+exchange-apiws = { version = "0.9.0", default-features = false, features = ["kraken", "cryptocom"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
 tracing = "0.1"

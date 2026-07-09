@@ -25,8 +25,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use exchange_apiws::kraken::KrakenRestClient;
-use serde_json::Value;
+use exchange_apiws::kraken::{KrakenOhlc, KrakenRestClient};
 
 use spot_portfolio::spot::backtest::{BacktestParams, BacktestResult, backtest_portfolio};
 use spot_portfolio::spot::config::PortfolioConfig;
@@ -53,35 +52,17 @@ fn kraken_pair(asset: &str) -> String {
     }
 }
 
-/// Extract `{unix_time → close}` from a Kraken `get_ohlc` response. The pair
-/// array elements are `[time, open, high, low, close, vwap, volume, count]`
-/// with the numeric fields serialized as strings. The **last** element is the
-/// current, still-forming candle (its close is the live mid-interval price, not
-/// a settled close), so it's dropped — otherwise the final bar of the backtest
-/// would be scored against an incomplete candle.
-fn closes_by_time(resp: &Value) -> Result<HashMap<i64, f64>> {
-    let obj = resp.as_object().context("OHLC response is not an object")?;
-    let arr = obj
-        .iter()
-        .find(|(k, _)| *k != "last")
-        .map(|(_, v)| v)
-        .and_then(Value::as_array)
-        .context("OHLC response has no pair array")?;
+/// Extract `{unix_time → close}` from a typed Kraken OHLC response
+/// (exchange-apiws 0.9: `KrakenOhlc { candles, .. }`). The **last** element is
+/// the current, still-forming candle (its close is the live mid-interval price,
+/// not a settled close), so it's dropped — otherwise the final bar of the
+/// backtest would be scored against an incomplete candle.
+fn closes_by_time(resp: &KrakenOhlc) -> Result<HashMap<i64, f64>> {
     // Drop the trailing forming candle (keep only settled bars).
-    let settled = &arr[..arr.len().saturating_sub(1)];
+    let settled = &resp.candles[..resp.candles.len().saturating_sub(1)];
     let mut out = HashMap::with_capacity(settled.len());
-    for row in settled {
-        let cols = row.as_array().context("OHLC row is not an array")?;
-        let time = cols
-            .first()
-            .and_then(Value::as_i64)
-            .context("OHLC row missing time")?;
-        let close = cols
-            .get(4)
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .context("OHLC row missing close")?;
-        out.insert(time, close);
+    for c in settled {
+        out.insert(c.time, c.close_f64());
     }
     Ok(out)
 }
