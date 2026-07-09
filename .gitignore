@@ -1,0 +1,42 @@
+# ============================================================================
+# fks-spawner — .gitignore
+# ============================================================================
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+.claude/
+
+# --- Rust ---
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+# sqlx offline query cache — spawner uses runtime (string) queries only.
+.sqlx/
+# NOTE: Cargo.lock is intentionally NOT ignored — these are binary crates.
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Bot configs: only the *.example.toml templates are tracked ---
+# The operator's tuned spot config (mirrors the fks repo's .gitignore). The
+# Docker build globs it in when it sits next to the example; it must never be
+# committed.
+bots/spot-portfolio/spot-portfolio.toml
+
+# --- Logs / journals ---
+*.log
+*.jsonl
+
+# --- Archives ---
+*.zip
+*.tar.gz

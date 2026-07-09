@@ -1,0 +1,160 @@
+# =============================================================================
+# Rust CI — per-workspace check / test / clippy / fmt
+# =============================================================================
+# fks-spawner is a collection of standalone Cargo workspaces (each crate has
+# its own [workspace] block + committed Cargo.lock; there is no root
+# Cargo.toml). This workflow runs each one's compile + test gate independently,
+# mirroring the fks repo's rust.yml pattern.
+#
+# Trigger: PRs against main, plus pushes to main.
+# Concurrency: in-flight runs on the same ref are cancelled when a new
+# commit lands.
+# =============================================================================
+
+name: 🦀 Rust
+
+on:
+    pull_request:
+        # Skip the matrix when the diff is doc/config only.
+        paths-ignore:
+            - "**.md"
+            - "LICENSE"
+            - "**/LICENSE"
+            - ".gitignore"
+    push:
+        branches: [main]
+        paths-ignore:
+            - "**.md"
+            - "LICENSE"
+            - "**/LICENSE"
+            - ".gitignore"
+
+concurrency:
+    group: rust-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+    # sqlx in spawner uses runtime (string) queries, not compile-time macros,
+    # so DATABASE_URL is not required at build time. Set SQLX_OFFLINE just
+    # in case a future query! macro is added — it'll fall back to the cached
+    # metadata instead of trying to reach a live database.
+    SQLX_OFFLINE: "true"
+
+jobs:
+    # -------------------------------------------------------------------------
+    # Per-workspace check / test / clippy
+    # -------------------------------------------------------------------------
+    check:
+        name: ${{ matrix.workspace }}
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # Every workspace here ships a committed Cargo.lock, so all
+                    # cargo invocations run with --locked for reproducibility.
+                    - workspace: "spawner"
+                      path: "crates/spawner"
+                      # Bot-container lifecycle service. `db` (Postgres) is the
+                      # default feature; the stateless build is checked too
+                      # (see the extra step below).
+                      check_no_default: true
+                    - workspace: "crypto-bot-core"
+                      path: "crates/crypto-bot-core"
+                      # Shared bot SDK (alerts / journal / status server) that
+                      # spot-portfolio path-depends on. fks-state's private
+                      # crypto-futures git-pins it too.
+                      check_no_default: false
+                    - workspace: "fks-bot-example"
+                      path: "bots/fks-bot-example"
+                      # Standalone bot consuming the published rustrade-framework
+                      # from crates.io — proves end-to-end consumption.
+                      check_no_default: false
+                    - workspace: "crypto-demo"
+                      path: "bots/crypto-demo"
+                      # Working demo bot: rustrade + indicators-ta + exchange-apiws
+                      # from crates.io, paper-traded.
+                      check_no_default: false
+                    - workspace: "rustrade-exchange-apiws"
+                      path: "bots/rustrade-exchange-apiws"
+                      # rustrade ExchangeClient over exchange-apiws (the live KuCoin
+                      # order path). fks-state's crypto-futures git-pins it.
+                      check_no_default: false
+                    - workspace: "spot-portfolio"
+                      path: "bots/spot-portfolio"
+                      # Production spot rebalancer; path-deps
+                      # ../../crates/crypto-bot-core (both live in this repo,
+                      # same relative layout as in fks).
+                      check_no_default: false
+        steps:
+            - name: 📥 Checkout
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain (stable)
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy
+
+            - name: 🗄️ Cargo cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: ${{ matrix.path }}
+                  # Distinguish caches per workspace so a clean clippy run in
+                  # one doesn't poison another's incremental cache.
+                  prefix-key: ${{ matrix.workspace }}
+
+            - name: 🧪 cargo check
+              working-directory: ${{ matrix.path }}
+              run: cargo check --workspace --all-targets --locked
+
+            - name: 🧪 cargo check (--no-default-features)
+              if: ${{ matrix.check_no_default }}
+              working-directory: ${{ matrix.path }}
+              # spawner's stateless mode (no Postgres) is a supported build —
+              # keep it compiling.
+              run: cargo check --workspace --all-targets --locked --no-default-features
+
+            - name: 🧪 cargo test
+              working-directory: ${{ matrix.path }}
+              run: cargo test --workspace --locked
+
+            - name: 🔍 cargo clippy (-D warnings)
+              working-directory: ${{ matrix.path }}
+              # Blocking gate: every workspace in the matrix is clippy-clean
+              # under `-D warnings`, so a newly-introduced lint fails CI.
+              run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+    # -------------------------------------------------------------------------
+    # cargo fmt — runs per workspace using --manifest-path so the formatter
+    # doesn't follow path deps into sibling workspaces (`cargo fmt --all`
+    # follows path-based dependencies, which would otherwise make this job
+    # touch files outside the workspace under test).
+    # -------------------------------------------------------------------------
+    fmt:
+        name: rustfmt
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - name: 📥 Checkout
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain (stable)
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: rustfmt
+
+            - name: 🎨 cargo fmt --check (per workspace)
+              shell: bash
+              run: |
+                  set -e
+                  for ws in crates/spawner crates/crypto-bot-core bots/fks-bot-example bots/crypto-demo bots/rustrade-exchange-apiws bots/spot-portfolio; do
+                      printf "\n===> %s\n" "$ws"
+                      # `--manifest-path` keeps fmt scoped to THIS workspace's
+                      # members — without it, `--all` follows path deps into
+                      # sibling workspaces (e.g. running from spot-portfolio
+                      # would try to format crypto-bot-core too).
+                      cargo fmt --all --manifest-path "$ws/Cargo.toml" -- --check
+                  done

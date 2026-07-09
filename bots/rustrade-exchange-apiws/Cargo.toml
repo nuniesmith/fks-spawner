@@ -1,0 +1,58 @@
+# =============================================================================
+# rustrade-exchange-apiws — a rustrade `ExchangeClient` over exchange-apiws
+# =============================================================================
+# Bridges the two published crates so a `rustrade` bot can place *real* orders:
+#
+#   rustrade-framework  → the `ExchangeClient` trait the framework calls
+#   exchange-apiws      → the signed KuCoin Futures REST surface that executes
+#
+# Today the bots under `bots/` trade against `MockExchange`; this crate is the
+# first thing that turns a framework `Order` into a live KuCoin order (or a
+# paper/testnet one — point it at sandbox creds). It is Track 1 of
+# docs/MULTI_ASSET_BRAIN_ROADMAP.md.
+#
+# Standalone crate (own `[workspace]`) — resolves both deps from crates.io.
+# =============================================================================
+
+[package]
+name        = "rustrade-exchange-apiws"
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.94.1"
+publish     = false
+description = "rustrade ExchangeClient adapters over exchange-apiws — KuCoin Futures + Kraken spot"
+license     = "MIT OR Apache-2.0"
+
+[lib]
+name = "rustrade_exchange_apiws"
+path = "src/lib.rs"
+
+[dependencies]
+# ── The published FKS stack (crates.io) ───────────────────────────────────────
+# Framework facade — published as `rustrade-framework`, imported as `rustrade`.
+# Provides the `ExchangeClient` trait + the `Order`/`Position`/`Capability` types.
+# 0.3 adds `InstrumentSpec`/`AssetClass` (the adapter advertises a real spec below).
+rustrade       = { package = "rustrade-framework", version = "0.4" }
+# Exchange REST/WS clients. KuCoin REST is always-on, so drop the other
+# exchanges' code we don't touch here.
+# Exchange REST/WS clients. KuCoin REST is always-on; enable `kraken` for the
+# spot adapter. The other exchanges' code stays out of the build.
+exchange-apiws = { version = "0.9.0", default-features = false, features = ["kraken"] }
+
+# ── Async / glue ──────────────────────────────────────────────────────────────
+async-trait = "0.1"
+chrono      = "0.4"
+serde_json  = "1"
+tracing     = "0.1"
+# Runtime for the fill source's background task (spawn + channels + interval).
+tokio       = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Standalone crate — detaches from any parent virtual workspace so `cargo build`
+# resolves rustrade-framework + exchange-apiws straight from crates.io.
+[workspace]

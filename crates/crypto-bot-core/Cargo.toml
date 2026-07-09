@@ -1,0 +1,60 @@
+# ============================================================================
+# crypto-bot-core — shared bot scaffolding for the crypto trading bots
+# ============================================================================
+# The generic, non-edge infrastructure that BOTH the spot-portfolio bot (public,
+# in this repo's `bots/spot-portfolio`) and the futures/funding edges (private,
+# in the `fks-state` repo) import:
+#
+#   alerts   — fire-and-forget Discord webhook notifications
+#   journal  — append-only JSONL trade journal
+#   status   — the FKS bot HTTP contract (/health, /metrics, /status)
+#
+# Extracted verbatim from the `crypto` repo's `src/{alerts,journal,status}.rs`
+# (which both bots shared via `use crate::…`). Contains no trading edge — only
+# the plumbing every bot needs. Consumed as a PATH dependency for now; git-rev
+# pinning is a later migration step.
+#
+# The empty [workspace] block keeps cargo from attaching this to the fks root
+# workspace (which only lists `src/proto`), so `cargo build` works both here and
+# from a downstream bot crate that path-depends on it.
+# ============================================================================
+[workspace]
+
+[package]
+name         = "crypto-bot-core"
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.94.1"
+license      = "MIT"
+description  = "Shared, edge-free scaffolding (Discord alerts, JSONL journal, FKS status/metrics server) for the crypto trading bots"
+publish      = false
+
+[dependencies]
+# Discord webhook alerts install exchange-apiws's rustls(ring) crypto provider
+# (`ensure_crypto_provider`, unconditional — not behind a venue feature) so the
+# HTTPS POST shares the same TLS backend as the exchange clients. Pinned to the
+# same git rev the `crypto` repo used; downstream bots enable the venue features
+# they need and cargo unifies them onto this one copy.
+exchange-apiws = { git = "https://github.com/nuniesmith/exchange-apiws", rev = "fa35543", default-features = false }
+
+# Async runtime: alerts spawns the webhook POST; the status server binds a
+# TcpListener and serves connections.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+
+# Discord webhook client (JSON only — TLS via exchange-apiws's rustls(ring)).
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+# Status HTTP server (/health, /metrics, /status — the FKS bot contract).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+# Serialisation (status snapshots + JSONL records + Discord payloads).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

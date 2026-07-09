@@ -1,0 +1,76 @@
+# =============================================================================
+# crypto-demo — a working rustrade bot over live crypto pairs
+# =============================================================================
+# Exercises the full published stack together, paper-trading over time:
+#
+#   rustrade-framework  → Bot / Brain / Supervisor / risk gate / backtest
+#   indicators-ta       → EMA / ATR / RSI signal logic (the Brain's math)
+#   exchange-apiws      → live Binance kline polling (the market data)
+#
+# Mirrors the shape of the kucoin reference bot (multi-symbol, candle-driven,
+# session PnL + circuit breaker) but built ON the framework instead of
+# hand-rolling the loop. Runs in PAPER mode against a MockExchange — safe to
+# leave running for days to confirm the stack stays healthy.
+#
+# Run:
+#   cargo run -p crypto-demo                      # live Binance data, paper trades
+#   DEMO_SOURCE=synthetic cargo run -p crypto-demo   # offline (no network)
+# =============================================================================
+
+[package]
+name        = "crypto-demo"
+version     = "0.1.0"
+edition     = "2024"
+publish     = false
+description = "Reference rustrade bot: indicators-ta strategy over live exchange-apiws crypto data, paper-traded"
+
+[[bin]]
+name = "crypto-demo"
+path = "src/main.rs"
+
+[dependencies]
+# ── The published FKS stack (crates.io) ───────────────────────────────────────
+# Framework facade — published as `rustrade-framework`, imported as `rustrade`.
+# 0.3 adds account-level PortfolioRisk, per-asset-class presets, and JsonFileStore.
+rustrade       = { package = "rustrade-framework", version = "0.4" }
+# TA math — crate `indicators-ta`, library imports as `indicators`.
+indicators-ta  = "0.2"        # 0.2.2 on crates.io
+# Exchange REST/WS clients (KuCoin kline polling for market data).
+# >=0.8.1 ships its own rustls TLS backend + ring provider (self-contained HTTPS).
+# Kept in lockstep with rustrade-exchange-apiws (below): both pin chrono exactly,
+# so the demo and the adapter must resolve to the same exchange-apiws version.
+exchange-apiws = { version = "0.9.0", default-features = false }
+# rustrade `ExchangeClient` over exchange-apiws — the live KuCoin order path,
+# selected with DEMO_EXCHANGE=kucoin (default is the paper MockExchange).
+rustrade-exchange-apiws = { path = "../rustrade-exchange-apiws" }
+
+# ── Async runtime / utilities ─────────────────────────────────────────────────
+async-trait  = "0.1"
+tokio        = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+tokio-util   = { version = "0.7", features = ["rt"] }
+
+# ── Metrics HTTP server (fks_bot_* contract, same as fks-bot-example) ─────────
+axum       = "0.8"
+prometheus = "0.14"
+once_cell  = "1"
+
+# ── HTTP client (JanusBrain → janus over plain HTTP) ──────────────────────────
+# The live-venue HTTPS path is fully handled by exchange-apiws >=0.9.0 (its own
+# rustls backend + ring provider). This client only reaches janus over HTTP, so
+# it needs nothing beyond JSON.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+anyhow     = "1"
+chrono     = { version = "0.4", features = ["serde"] }
+rand       = "0.10"
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Standalone crate — resolves its own deps from crates.io (own [workspace]
+# so it detaches from the fks root virtual workspace).
+[workspace]

@@ -1,0 +1,40 @@
+# .dockerignore — keep the build context lean (mirrors the fks repo pattern).
+# The spot-portfolio image builds with context = THIS REPO ROOT, so target/
+# dirs and VCS metadata must stay out of the context.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Rust build artifacts
+**/target/
+**/*.rs.bk
+**/*.rmeta
+*.pdb
+.sqlx/
+
+# Docs (keep READMEs out of images; nothing COPYs them)
+*.md
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+.claude
+
+# Logs / data
+*.log
+*.jsonl
+logs/
+
+# Archives
+*.zip
+*.tar.gz

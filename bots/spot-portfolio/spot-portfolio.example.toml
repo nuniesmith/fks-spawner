@@ -1,0 +1,95 @@
+# Spot portfolio bot — copy to spot-portfolio.toml and edit.
+# Venues: Kraken, Crypto.com, and KuCoin spot (KuCoin also runs the separate
+# futures dip bot). API keys are NOT in this file — they come from the environment:
+#   KRAKEN_API_KEY / KRAKEN_API_SECRET                              (Kraken)
+#   CRYPTOCOM_API_KEY / CRYPTOCOM_API_SECRET                        (Crypto.com)
+#   KUCOIN_API_KEY / KUCOIN_API_SECRET / KUCOIN_API_PASSPHRASE      (KuCoin spot;
+#       falls back to the futures bot's KC_KEY/KC_SECRET/KC_PASSPHRASE if unset)
+# Keys should be TRADE + QUERY only — never enable Withdraw.
+
+poll_secs = 300      # check the portfolio every 5 min
+live      = false    # set true to place REAL orders (default: dry-run)
+# Per-venue LIVE allowlist — a safety gate ON TOP of `live`. Omit it (default)
+# and every venue trades live under `live = true`. Set it to keep unverified
+# venues in dry-run while a verified one trades live, e.g.:
+# live_venues = ["kraken"]   # kraken lives; kucoin/cryptocom stay dry-run
+#
+# ── LIVE-MONEY risk guardrails (all optional) ────────────────────────────────
+# Drawdown circuit breaker: if portfolio net worth falls more than this fraction
+# below its high-water mark, HALT live trading (all venues → dry-run) + alert.
+# Sticky — resuming live needs a restart. Omit to disable. Set it above normal
+# market volatility so it catches a runaway/bug loss, not an ordinary correction.
+# NOTE for a spot HODL/DCA basket: spot can't liquidate, so a market-drawdown
+# halt has no forced-loss to protect against and will FIGHT the strategy — it
+# stops the dip-buying rebalance on an ordinary bear leg. The `spot-optimize`
+# sweep found a BTC/ETH/SOL basket's normal drawdown is ~34–45%+. Prefer leaving
+# this OFF and relying on max_trade_pct (the real buggy-plan guard); if you want
+# any halt, set it catastrophic-only (e.g. 0.70), not near market volatility.
+# max_drawdown_pct = 0.30
+# Skip (and alert on) any single trade whose notional exceeds this fraction of
+# the venue value — a guard against a mispriced/buggy plan. Keep it generous so a
+# legitimate post-deposit rebalance isn't blocked. Omit to disable.
+# max_trade_pct = 0.80
+# Alert when a live fill's price deviates from the plan by more than this (bad
+# fill / thin liquidity). Alert-only, never blocks. Default 0.02 (2%); 0 = off.
+# max_slippage_pct = 0.02
+# Post-trade reconciliation: after live orders, next cycle checks each traded
+# asset's balance moved by the filled amount; alert if it diverges by more than
+# this (order may not have settled). Alert-only. Omit to disable. e.g. 0.03.
+# reconcile_tolerance_pct = 0.03
+# alert_webhook = "https://discord.com/api/webhooks/..."   # optional Discord alerts
+# journal       = "spot-trades.jsonl"                       # optional JSONL trade log
+#
+# ── janus AI signal bridge (optional) ────────────────────────────────────────
+# Let the janus trading brain's per-symbol signals TILT the target weights. The
+# AI can only shift a weight by ±ai_tilt_max RELATIVE to its config value — it
+# never changes the asset set or the cash reserve, and every tilted trade still
+# passes the guardrails above (trade cap / slippage / cooldown). Reads Redis
+# (janus:signals:symbol:{SYMBOL}); a missing/stale/low-confidence signal or a
+# Redis outage ⇒ that asset keeps its config weight (fail-safe). Only BTC/ETH/SOL
+# map to janus symbols today; other assets (e.g. CRO) never tilt.
+#   off    — ignore janus entirely (default)
+#   shadow — read + LOG the tilt that WOULD apply, but trade on config weights
+#   on     — apply the bounded tilt to live targets
+# ai_signals             = "shadow"
+# ai_min_confidence      = 0.65   # act only on signals at/above this confidence
+# ai_tilt_max            = 0.10   # max ±10% relative tilt per asset (hard cap)
+# ai_max_signal_age_secs = 900    # ignore signals older than this (stale)
+# ai_redis_url = "redis://:PASSWORD@redis:6379/0"  # else $REDIS_URL, else redis://redis:6379/0
+paper_usd = 1000.0   # simulated cash per exchange in keyless paper mode
+
+# One [[exchange]] block per venue.
+[[exchange]]
+name          = "kraken"
+cash          = "USD"   # reserve currency held on this venue
+reserve_pct   = 0.20    # keep 20% in cash; deploy 80% across the basket below
+band          = 0.25    # rebalance when any asset drifts +/-25% off its target
+cooldown_secs = 3600    # min seconds between rebalances (anti-whipsaw)
+min_trade_usd = 10.0    # skip dust trades below this
+deposit_trigger_usd = 25.0   # rebalance immediately when cash jumps by >$25 (a deposit); 0 = off
+[exchange.targets]      # weights are normalized; the un-targeted remainder is cash
+BTC = 0.5
+ETH = 0.3
+SOL = 0.2
+
+# Crypto.com (adapter ready). Instruments are {ASSET}_{cash}, e.g. BTC_USDT.
+[[exchange]]
+name        = "cryptocom"
+cash        = "USDT"
+reserve_pct = 0.25
+deposit_trigger_usd = 25.0   # rebalance immediately when cash jumps by >$25 (a deposit)
+[exchange.targets]
+BTC = 0.6
+ETH = 0.4
+
+# KuCoin spot (symbols are {ASSET}-{cash}, e.g. BTC-USDT). Genuine spot — no
+# margin/leverage. Uses spot-enabled KuCoin keys; balances read the `trade`
+# account. EXPERIMENTAL: verify with a tiny live trade before trusting it.
+[[exchange]]
+name        = "kucoin"
+cash        = "USDT"
+reserve_pct = 0.25
+deposit_trigger_usd = 25.0   # rebalance immediately when cash jumps by >$25 (a deposit)
+[exchange.targets]
+BTC = 0.5
+ETH = 0.5
