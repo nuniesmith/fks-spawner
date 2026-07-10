@@ -17,6 +17,7 @@ pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod docker_client;
+pub mod edges;
 pub mod error;
 pub mod metrics;
 pub mod models;

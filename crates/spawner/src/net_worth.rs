@@ -329,6 +329,27 @@ mod sampler {
                     }
                 }
             }
+
+            // ── Piggyback: stale backtest-run sweep (edge factory) ──────────
+            // One-shot backtest containers report their own results row and
+            // exit; a container that dies silently leaves its backtest_runs
+            // row 'running' forever. Rather than a dedicated reaper (not
+            // needed for v1), this tick sweeps rows with
+            // `finished_at IS NULL AND started_at < now() - interval
+            // '2 hours'` to 'failed' — one cheap UPDATE per sampler sweep,
+            // best-effort like everything else in this loop.
+            match store.sweep_stale_backtest_runs().await {
+                Ok(0) => {}
+                Ok(n) => {
+                    warn!(
+                        swept = n,
+                        "backtest sweep: marked stale running backtest runs failed"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "backtest sweep: stale-run sweep failed");
+                }
+            }
         }
 
         /// GET one bot's `/status` and parse its net worth. `None` = unreachable,

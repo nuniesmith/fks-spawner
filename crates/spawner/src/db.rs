@@ -39,7 +39,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::error::SpawnerError;
-use crate::models::{AccountRequest, ConfigRequest};
+use crate::models::{AccountRequest, ConfigRequest, EdgeRequest};
 use crate::net_worth::NetWorthSnapshot;
 use crate::secrets_crypto::SecretsCipher;
 use crate::treasury::NewTransfer;
@@ -875,6 +875,207 @@ impl BotRunStore {
             transfer_amounts,
         })
     }
+
+    // ── edges + backtest_runs (see src/sql/spawner/008_edge_factory.sql) ─────
+    // The edge factory: `edges` is the edge-portfolio registry (janus-adaptive
+    // + operator rule-edges — the accounts-registry pattern) and
+    // `backtest_runs` is the factory's run ledger. The spawner INSERTs a run
+    // row before spawning the one-shot backtest container; the CONTAINER
+    // updates its own row with results (it gets the row id + this DB's URL
+    // via BACKTEST_RUN_ID / BACKTEST_DB_URL env). Inputs are validated by
+    // `crate::edges` before they reach here.
+
+    /// Save (UPSERT by edge_id) one registry edge — the accounts UPSERT
+    /// pattern. Returns whether a NEW row was created (`true`) vs an existing
+    /// one overwritten (`false`). Absent asset_scope defaults to `[]` and
+    /// validation_record to `{}` to match the table defaults.
+    pub async fn upsert_edge(&self, req: &EdgeRequest) -> Result<bool, SpawnerError> {
+        let empty_scope = serde_json::json!([]);
+        let empty_record = serde_json::json!({});
+        let row = sqlx::query(
+            "INSERT INTO edges (edge_id, display_name, edge_type, asset_scope, status, \
+                                backtest_image, validation_record, notes, active) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (edge_id) DO UPDATE \
+             SET display_name      = EXCLUDED.display_name, \
+                 edge_type         = EXCLUDED.edge_type, \
+                 asset_scope       = EXCLUDED.asset_scope, \
+                 status            = EXCLUDED.status, \
+                 backtest_image    = EXCLUDED.backtest_image, \
+                 validation_record = EXCLUDED.validation_record, \
+                 notes             = EXCLUDED.notes, \
+                 active            = EXCLUDED.active, \
+                 updated_at        = NOW() \
+             RETURNING (xmax = 0) AS inserted",
+        )
+        .bind(req.edge_id.trim())
+        .bind(req.display_name.as_deref())
+        .bind(req.edge_type.trim())
+        .bind(req.asset_scope.as_ref().unwrap_or(&empty_scope))
+        .bind(req.status.trim())
+        .bind(req.backtest_image.as_deref().map(str::trim))
+        .bind(req.validation_record.as_ref().unwrap_or(&empty_record))
+        .bind(req.notes.as_deref())
+        .bind(req.active)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let inserted: bool = row.try_get("inserted").unwrap_or(false);
+        debug!(edge_id = %req.edge_id.trim(), inserted, "edges row upserted");
+        Ok(inserted)
+    }
+
+    /// All registry edges, active first (then id) so the WebUI list leads
+    /// with the live portfolio.
+    pub async fn list_edges(&self) -> Result<Vec<EdgeRow>, SpawnerError> {
+        let rows = sqlx::query(
+            "SELECT edge_id, display_name, edge_type, asset_scope, status, backtest_image, \
+                    validation_record, notes, active, created_at, updated_at \
+             FROM edges \
+             ORDER BY active DESC, edge_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows.into_iter().map(EdgeRow::from_row).collect())
+    }
+
+    /// One ACTIVE edge by id — the backtest path's lookup. A soft-deleted
+    /// edge reads as absent here (you can't backtest a retired-and-removed
+    /// edge), while `list_edges` still shows it.
+    pub async fn get_edge(&self, edge_id: &str) -> Result<Option<EdgeRow>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT edge_id, display_name, edge_type, asset_scope, status, backtest_image, \
+                    validation_record, notes, active, created_at, updated_at \
+             FROM edges \
+             WHERE edge_id = $1 AND active = TRUE",
+        )
+        .bind(edge_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(row.map(EdgeRow::from_row))
+    }
+
+    /// Soft-delete an edge (active = FALSE, the accounts pattern) — its
+    /// backtest_runs history is never dropped. Returns whether an active row
+    /// was affected.
+    pub async fn deactivate_edge(&self, edge_id: &str) -> Result<bool, SpawnerError> {
+        let r = sqlx::query(
+            "UPDATE edges SET active = FALSE, updated_at = NOW() \
+             WHERE edge_id = $1 AND active = TRUE",
+        )
+        .bind(edge_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Open one backtest_runs row (status 'running') BEFORE the container is
+    /// spawned; returns the run id that becomes the container's
+    /// BACKTEST_RUN_ID. AWAITED by the handler — the row must exist before
+    /// the container that will update it starts.
+    pub async fn insert_backtest_run(
+        &self,
+        edge_id: &str,
+        params: &serde_json::Value,
+    ) -> Result<i64, SpawnerError> {
+        let row =
+            sqlx::query("INSERT INTO backtest_runs (edge_id, params) VALUES ($1, $2) RETURNING id")
+                .bind(edge_id)
+                .bind(params)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+
+        let id: i64 = row.try_get("id").map_err(map_sqlx)?;
+        debug!(id, edge_id = %edge_id, "backtest_runs row opened (running)");
+        Ok(id)
+    }
+
+    /// Stamp the spawned container's (short) id onto the run row.
+    pub async fn record_backtest_container(
+        &self,
+        run_id: i64,
+        container_id: &str,
+    ) -> Result<(), SpawnerError> {
+        sqlx::query("UPDATE backtest_runs SET container_id = $2 WHERE id = $1")
+            .bind(run_id)
+            .bind(container_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Close a run as failed from the SPAWNER side (the spawn itself failed,
+    /// so no container will ever report). The normal completed/failed path is
+    /// written by the backtest container itself.
+    pub async fn mark_backtest_failed(&self, run_id: i64, error: &str) -> Result<(), SpawnerError> {
+        sqlx::query(
+            "UPDATE backtest_runs \
+             SET status = 'failed', \
+                 results = COALESCE(results, jsonb_build_object('error', $2::text)), \
+                 finished_at = NOW() \
+             WHERE id = $1 AND finished_at IS NULL",
+        )
+        .bind(run_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Recent runs for one edge, newest first (GET /edges/{id}/backtests).
+    /// Clamp `limit` with [`crate::edges::backtests_query_plan`] first.
+    pub async fn list_backtest_runs(
+        &self,
+        edge_id: &str,
+        limit: i64,
+    ) -> Result<Vec<BacktestRunRow>, SpawnerError> {
+        let rows = sqlx::query(
+            "SELECT id, edge_id, container_id, status, params, results, started_at, finished_at \
+             FROM backtest_runs \
+             WHERE edge_id = $1 \
+             ORDER BY started_at DESC \
+             LIMIT $2",
+        )
+        .bind(edge_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows.into_iter().map(BacktestRunRow::from_row).collect())
+    }
+
+    /// Sweep runs whose one-shot container died without reporting: any row
+    /// still 'running' with `finished_at IS NULL AND started_at < now() -
+    /// interval '2 hours'` is marked failed. Piggybacked on the net-worth
+    /// sampler tick (see `crate::net_worth`) — a v1 reaper is deliberately
+    /// NOT built; this cheap staleness sweep is enough to keep the ledger
+    /// honest. Returns rows swept.
+    pub async fn sweep_stale_backtest_runs(&self) -> Result<u64, SpawnerError> {
+        let r = sqlx::query(
+            "UPDATE backtest_runs \
+             SET status = 'failed', \
+                 results = COALESCE(results, jsonb_build_object( \
+                     'error', 'stale: container never reported results (2h sweep)')), \
+                 finished_at = NOW() \
+             WHERE status = 'running' \
+               AND finished_at IS NULL \
+               AND started_at < NOW() - INTERVAL '2 hours'",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(r.rows_affected())
+    }
 }
 
 // ── GET /net-worth request shaping (pure — unit-tested) ──────────────────────
@@ -1046,6 +1247,88 @@ impl AccountRow {
             active: r.try_get("active").unwrap_or(false),
             created_at: r.try_get("created_at").unwrap_or_else(|_| Utc::now()),
             updated_at: r.try_get("updated_at").unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+/// A row from `edges` exposed via GET /edges (and consumed by the backtest
+/// path's lookup). Registry metadata only — NO credentials by design.
+#[derive(Debug, serde::Serialize)]
+pub struct EdgeRow {
+    pub edge_id: String,
+    pub display_name: Option<String>,
+    /// 'adaptive' (janus's learning core) | 'rule' (operator rule-edge).
+    pub edge_type: String,
+    /// JSON array of symbols; empty = all assets.
+    pub asset_scope: serde_json::Value,
+    /// Factory lifecycle: research | paper | live | retired.
+    pub status: String,
+    /// The fks-bot-* image that runs this edge's backtest; None = not yet
+    /// containerized (backtest requests 400).
+    pub backtest_image: Option<String>,
+    pub validation_record: serde_json::Value,
+    pub notes: Option<String>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EdgeRow {
+    fn from_row(r: PgRow) -> Self {
+        Self {
+            edge_id: r.try_get("edge_id").unwrap_or_default(),
+            display_name: r.try_get("display_name").ok(),
+            edge_type: r.try_get("edge_type").unwrap_or_default(),
+            asset_scope: r
+                .try_get("asset_scope")
+                .unwrap_or_else(|_| serde_json::json!([])),
+            status: r.try_get("status").unwrap_or_default(),
+            // Nullable column — NULL decodes as Err, which `.ok()` maps to None.
+            backtest_image: r.try_get("backtest_image").ok(),
+            validation_record: r
+                .try_get("validation_record")
+                .unwrap_or_else(|_| serde_json::json!({})),
+            notes: r.try_get("notes").ok(),
+            active: r.try_get("active").unwrap_or(false),
+            created_at: r.try_get("created_at").unwrap_or_else(|_| Utc::now()),
+            updated_at: r.try_get("updated_at").unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+/// A row from `backtest_runs` exposed via GET /edges/{id}/backtests.
+/// `results` is the harness's OWN summary JSON, written by the backtest
+/// container itself (None until the run reports; `{error}` on failure).
+#[derive(Debug, serde::Serialize)]
+pub struct BacktestRunRow {
+    pub id: i64,
+    pub edge_id: String,
+    /// Short Docker id of the spawned container (None if the spawn failed
+    /// before a container existed).
+    pub container_id: Option<String>,
+    /// running | completed | failed.
+    pub status: String,
+    /// The request's parameter overrides (what the container got as
+    /// BACKTEST_PARAMS).
+    pub params: serde_json::Value,
+    pub results: Option<serde_json::Value>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl BacktestRunRow {
+    fn from_row(r: PgRow) -> Self {
+        Self {
+            id: r.try_get("id").unwrap_or_default(),
+            edge_id: r.try_get("edge_id").unwrap_or_default(),
+            container_id: r.try_get("container_id").ok(),
+            status: r.try_get("status").unwrap_or_default(),
+            params: r
+                .try_get("params")
+                .unwrap_or_else(|_| serde_json::json!({})),
+            results: r.try_get("results").ok(),
+            started_at: r.try_get("started_at").unwrap_or_else(|_| Utc::now()),
+            finished_at: r.try_get("finished_at").ok(),
         }
     }
 }

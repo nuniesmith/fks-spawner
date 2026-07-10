@@ -68,6 +68,10 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `GET` `POST` | `/accounts` | yes (db only) | Account registry: list (active first) / save (UPSERT by `account_id`; tier 0–3, role + compliance_flag allowlists; carries NO credentials — keys stay in /secrets) |
 | `DELETE` | `/accounts/{id}` | yes (db only) | Soft-delete an account (`active=false`; its transfers/net-worth history is preserved) |
 | `GET` | `/profit` | yes (db only) | Decompose one account's net-worth drift into deposits vs trading profit (`?account_id=` required, `?since=` RFC3339): first/last snapshot in range bound the window; `profit = (end − start net worth) − net inflows` from net_worth_snapshots + transfers |
+| `GET` `POST` | `/edges` | yes (db only) | Edge registry (the edge portfolio's source of truth): list (active first) / save (UPSERT by `edge_id`; edge_type `adaptive`\|`rule` + status `research`\|`paper`\|`live`\|`retired` allowlists; `asset_scope` JSON symbol array, `[]` = all assets; `backtest_image` = the fks-bot-* image that runs the edge's backtest, NULL = not containerized) |
+| `DELETE` | `/edges/{id}` | yes (db only) | Soft-delete an edge (`active=false`; its backtest_runs history is preserved) |
+| `GET` | `/edges/{id}/backtests` | yes (db only) | Recent backtest runs (newest first, `?limit=` default 50 / cap 500) with their container-written `results` JSON |
+| `POST` | `/edges/{id}/backtest` | yes (db only) | Invoke one backtest: body `{params?: object}`; opens a `backtest_runs` row (status `running`), then spawns the edge's `backtest_image` through the SAME spawn path as `/spawn` (prefix guard, forced network, caps) with env `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/`BACKTEST_DB_URL` — the one-shot container writes its own results row and exits. 202 `{run_id, container_id}`; 400 on unknown edge / NULL image; stale runs (>2h unreported) are swept to `failed` by the net-worth sampler tick |
 
 Auth = `X-Internal-Token: ${NGINX_INTERNAL_TOKEN}` set by nginx.
 Empty token = dev passthrough.
@@ -176,5 +180,16 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   xpub derivation test vector); the writers are best-effort and never fatal. The
   one new dep is `bitcoin` (bip32/address derivation only — no wallet/signing
   features).
+- **Edge factory v1** (`src/edges.rs` pure validation/request-shaping; schema
+  `008_edge_factory.sql` in the fks repo): the `edges` registry (the
+  edge-portfolio's source of truth — janus-adaptive + operator rule-edges,
+  every edge facing the same validation bar) + the `backtest_runs` ledger.
+  `POST /edges/{id}/backtest` opens a run row and spawns the edge's
+  registered `backtest_image` as a one-shot container via the SAME
+  `DockerOps::spawn` path as `/spawn` (all guards apply); the container is
+  handed `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/
+  `BACKTEST_DB_URL` and UPDATEs its own row (status + results + finished_at)
+  before exiting. No dedicated reaper in v1 — a 2h staleness sweep
+  piggybacked on the net-worth sampler tick marks silently-dead runs failed.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

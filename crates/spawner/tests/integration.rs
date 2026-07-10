@@ -1008,6 +1008,286 @@ async fn net_worth_sampler_targets_only_running_bots() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Edge factory (db feature) — registry round-trips gracefully without a live
+// Postgres; the backtest endpoint validates before the store and reuses the
+// exact /spawn machinery (exercised against the MockDockerClient)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edges_list_degrades_gracefully_without_db() {
+    // No DATABASE_URL (store: None) — GET /edges must degrade to an empty
+    // list with db_enabled:false, never 500.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(Request::get("/edges").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"total\":0"), "body: {payload}");
+    assert!(payload.contains("\"edges\":[]"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edges_post_without_db_returns_503() {
+    // A well-formed registration with no DB configured must report an honest
+    // 503, not a fake success — the POST /edges round-trip degrades like
+    // /accounts.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "edge_id": "funding-reversion",
+        "edge_type": "rule",
+        "asset_scope": ["ETHUSDTM"],
+        "status": "research",
+        "backtest_image": "fks-bot-backtest-crypto-futures:latest"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/edges")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edges_post_rejects_bad_type_status_and_id() {
+    // Validation precedes the store check: allowlist misses and a
+    // non-identifier edge_id are 400s regardless of DB availability.
+    let (app, _) = build_app(test_config(""));
+
+    for body in [
+        serde_json::json!({ "edge_id": "x", "edge_type": "vibes" }),
+        serde_json::json!({ "edge_id": "x", "edge_type": "rule", "status": "moon" }),
+        serde_json::json!({ "edge_id": "has space", "edge_type": "rule" }),
+        serde_json::json!({ "edge_id": "x", "edge_type": "rule", "asset_scope": "ETH" }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/edges")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edges_delete_degrades_gracefully_without_db() {
+    // DELETE /edges/{id} with no DB degrades to ok:false + db_enabled:false.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::delete("/edges/funding-reversion")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"ok\":false"), "body: {payload}");
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edge_backtests_list_degrades_gracefully_without_db() {
+    // GET /edges/{id}/backtests with no DB degrades to an empty run list
+    // (including with ?limit=, exercising the Query extractor wiring).
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::get("/edges/funding-reversion/backtests?limit=5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"runs\":[]"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn backtest_post_without_db_returns_503() {
+    // Without a DB there is no registry to resolve the edge in and no run
+    // ledger — an honest 503, never a blind spawn.
+    let (app, mock) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::post("/edges/funding-reversion/backtest")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    // And crucially: nothing was spawned.
+    let state = mock.state.lock().unwrap();
+    assert!(state.containers.is_empty(), "no container without a ledger");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn backtest_post_rejects_malformed_edge_id_and_params() {
+    // Validation precedes the store check: an edge id outside the container-
+    // name charset, or non-object params, are 400s with or without a DB —
+    // the unknown-edge 400 itself needs the registry (integration-tested
+    // against a live Postgres at deploy time).
+    let (app, _) = build_app(test_config(""));
+
+    // Malformed edge id ("%20" decodes to a space — not identifier-shaped).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/edges/bad%20id/backtest")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Non-object params.
+    let resp = app
+        .oneshot(
+            Request::post("/edges/funding-reversion/backtest")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "params": [1, 2, 3] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn backtest_spawn_request_round_trips_through_the_spawn_path() {
+    // The happy-path spawn: POST /edges/{id}/backtest builds its SpawnRequest
+    // via edges::build_backtest_spawn_request and hands it to the SAME
+    // DockerOps::spawn the /spawn handler uses. The full HTTP path needs a
+    // live registry row (Postgres), so the handler-side lookups are covered
+    // at deploy time; here the spawn half is driven against the
+    // MockDockerClient, which records what a real daemon would have been
+    // asked to run.
+    use spawner::edges::build_backtest_spawn_request;
+
+    let config = test_config("");
+    let mock = MockDockerClient::from_config(&config);
+
+    let params = serde_json::json!({ "days": 365, "symbols": ["ETHUSDTM"] });
+    let req = build_backtest_spawn_request(
+        "funding-reversion",
+        42,
+        "fks-bot-backtest-crypto-futures:latest",
+        &params,
+        "postgres://fks_user:pw@postgres:5432/ruby_db",
+    );
+    let resp = mock.spawn(req).await.expect("spawn accepted");
+
+    // The bot identity follows the bt-{edge_id}-{run_id} contract and the
+    // container carries the fks-bot- name prefix the guard demands.
+    assert_eq!(resp.bot_id, "bt-funding-reversion-42");
+    assert_eq!(resp.container_name, "fks-bot-bt-funding-reversion-42");
+    assert_eq!(resp.mode, "backtest");
+
+    // The mock recorded the container with the edge-attribution label.
+    let state = mock.state.lock().unwrap();
+    assert_eq!(state.containers.len(), 1);
+    let info = state.containers.values().next().unwrap();
+    assert_eq!(info.image, "fks-bot-backtest-crypto-futures:latest");
+    assert_eq!(
+        info.labels.get("fks.edge_id").map(String::as_str),
+        Some("funding-reversion")
+    );
+    assert_eq!(info.mode, "backtest");
+}
+
+#[tokio::test]
+async fn backtest_spawn_request_still_hits_the_image_prefix_guard() {
+    // Reusing the spawn path means reusing its guards: a registry row whose
+    // backtest_image doesn't carry the fks-bot- prefix is refused at spawn
+    // time exactly like a hand-rolled /spawn request would be.
+    use spawner::edges::build_backtest_spawn_request;
+
+    let config = test_config("");
+    let mock = MockDockerClient::from_config(&config);
+
+    let req = build_backtest_spawn_request(
+        "funding-reversion",
+        1,
+        "evil-image:latest",
+        &serde_json::json!({}),
+        "postgres://x",
+    );
+    let err = mock.spawn(req).await.expect_err("prefix guard fires");
+    assert!(matches!(err, SpawnerError::InvalidImage(_)), "{err:?}");
+
+    let state = mock.state.lock().unwrap();
+    assert!(state.containers.is_empty());
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn edge_routes_are_token_gated() {
+    // With a configured token, the edge-factory routes reject
+    // unauthenticated requests (401) before touching the store — same gate
+    // as the rest.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    for req in [
+        Request::get("/edges").body(Body::empty()).unwrap(),
+        Request::get("/edges/x/backtests")
+            .body(Body::empty())
+            .unwrap(),
+        Request::post("/edges/x/backtest")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+    ] {
+        let uri = req.uri().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route: {uri}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Auth middleware
 // ─────────────────────────────────────────────────────────────────────────────
 
