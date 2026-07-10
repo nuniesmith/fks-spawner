@@ -283,6 +283,78 @@ fn default_true() -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Edge factory: edge registry + backtest requests (POST /edges,
+// POST /edges/{id}/backtest) — see src/sql/spawner/008_edge_factory.sql +
+// crate::edges
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /edges` — creates/UPSERTs one row of the `edges`
+/// registry (the edge portfolio's source of truth: janus-adaptive + operator
+/// rule-edges, every one facing the same validation bar). Re-posting the same
+/// `edge_id` overwrites.
+///
+/// SECURITY: carries NO credentials and no executable config beyond the
+/// `backtest_image` NAME — the spawn-time fks-bot- prefix guard stays
+/// authoritative when a backtest actually runs.
+#[derive(Debug, Deserialize)]
+pub struct EdgeRequest {
+    /// Logical edge identity (the UPSERT key), e.g. "janus-adaptive", "orb",
+    /// "funding-reversion". Identifier-shaped (it names the backtest
+    /// container: `bt-{edge_id}-{run_id}`).
+    pub edge_id: String,
+
+    /// Human-friendly label for the WebUI.
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// 'adaptive' (janus's learning core) | 'rule' (operator rule-edge).
+    pub edge_type: String,
+
+    /// JSON array of symbols the edge applies to (e.g. ["GC","NQ","ES"]).
+    /// Omitted/empty = all assets (the adaptive edge's scope).
+    #[serde(default)]
+    pub asset_scope: Option<serde_json::Value>,
+
+    /// Factory lifecycle stage: research | paper | live | retired.
+    /// Defaults to research — every edge starts at the bottom of the bar.
+    #[serde(default = "default_edge_status")]
+    pub status: String,
+
+    /// The fks-bot-* image that runs this edge's backtest as a one-shot
+    /// container. Omitted = not yet containerized (backtest requests 400).
+    #[serde(default)]
+    pub backtest_image: Option<String>,
+
+    /// Honest-stats validation evidence JSON (fee-inclusive, multi-regime,
+    /// de-overlapped significance, …).
+    #[serde(default)]
+    pub validation_record: Option<serde_json::Value>,
+
+    /// Free-form operator annotation.
+    #[serde(default)]
+    pub notes: Option<String>,
+
+    /// Soft-delete flag; defaults to true. DELETE /edges/{id} flips it off.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_edge_status() -> String {
+    "research".to_string()
+}
+
+/// Request body for `POST /edges/{id}/backtest` — invoke one backtest run.
+/// `params` (a JSON object) rides into the container verbatim as the
+/// BACKTEST_PARAMS env var; the harness treats it as knob overrides
+/// (absent = `{}` = the harness's defaults).
+#[derive(Debug, Deserialize)]
+pub struct BacktestRequest {
+    /// Harness parameter overrides. Must be a JSON object when present.
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Manual net-worth snapshot request (POST /net-worth) — a hand-entered balance
 // (see src/sql/spawner/006_net_worth_snapshots.sql + crate::net_worth)
 // ─────────────────────────────────────────────────────────────────────────────

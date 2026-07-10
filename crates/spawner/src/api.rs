@@ -47,9 +47,14 @@ use crate::{
 #[cfg(feature = "db")]
 use crate::db::{BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
+use crate::edges::{
+    backtest_bot_id, backtests_query_plan, build_backtest_spawn_request, validate_backtest_params,
+    validate_edge, validate_edge_id,
+};
+#[cfg(feature = "db")]
 use crate::models::{
-    AccountRequest, ConfigRequest, LayoutRequest, NetWorthManualRequest,
-    NotificationChannelRequest, SecretRequest, TransferRequest,
+    AccountRequest, BacktestRequest, ConfigRequest, EdgeRequest, LayoutRequest,
+    NetWorthManualRequest, NotificationChannelRequest, SecretRequest, TransferRequest,
 };
 #[cfg(feature = "db")]
 use crate::notifications::{NotificationDispatcher, NotificationEvent, TestOutcome};
@@ -166,7 +171,11 @@ pub fn build_router(state: AppState) -> Router {
             get(list_accounts_handler).post(save_account_handler),
         )
         .route("/accounts/{id}", delete(delete_account_handler))
-        .route("/profit", get(profit_handler));
+        .route("/profit", get(profit_handler))
+        .route("/edges", get(list_edges_handler).post(save_edge_handler))
+        .route("/edges/{id}", delete(delete_edge_handler))
+        .route("/edges/{id}/backtests", get(list_edge_backtests_handler))
+        .route("/edges/{id}/backtest", post(run_edge_backtest_handler));
 
     let protected = protected
         .layer(middleware::from_fn_with_state(
@@ -1439,6 +1448,324 @@ async fn profit_handler(
         _ => profit_empty_body(account_id, since, true),
     };
     Ok((StatusCode::OK, Json(body)))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Edge factory  (db feature only) — edge registry + backtest runs
+//
+// WHY: the platform runs a PORTFOLIO of edges (janus-adaptive + operator
+// rule-edges) and every edge faces the SAME honest validation bar (fks-state
+// docs/ARCHITECTURE.md). The registry (POST/GET/DELETE /edges) mirrors the
+// /accounts handlers exactly; POST /edges/{id}/backtest is the factory's
+// core loop: open a backtest_runs row, then spawn the edge's registered
+// fks-bot-* backtest image through the SAME internal spawn path /spawn uses
+// (image-prefix guard, forced network, cap_drop ALL). The one-shot container
+// gets BACKTEST_RUN_ID / BACKTEST_EDGE_ID / BACKTEST_PARAMS /
+// BACKTEST_DB_URL env and writes its OWN results row, then exits. Schema:
+// src/sql/spawner/008_edge_factory.sql. Pure validation/request-shaping
+// lives in crate::edges (unit-tested); these handlers wire it to the store
+// and the Docker path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// GET /edges — the registry, active edges first.
+#[cfg(feature = "db")]
+async fn list_edges_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "edges": [],
+            "total": 0,
+            "db_enabled": false,
+        })));
+    };
+
+    let rows = store.list_edges().await?;
+    Ok(Json(serde_json::json!({
+        "edges": rows,
+        "total": rows.len(),
+        "db_enabled": true,
+    })))
+}
+
+/// POST /edges — create/UPSERT one registry edge by edge_id (the /accounts
+/// UPSERT pattern). Validation (edge_type/status allowlists, identifier-
+/// shaped edge_id, JSON shapes) precedes the store check, so a bad edge is a
+/// 400 with or without a database.
+#[cfg(feature = "db")]
+async fn save_edge_handler(
+    State(state): State<AppState>,
+    Json(req): Json<EdgeRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let edge_id = match validate_edge(&req) {
+        Ok(id) => id,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "the edge registry requires the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    let created = store.upsert_edge(&req).await?;
+    info!(edge_id = %edge_id, created, edge_type = %req.edge_type, "edge registered");
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "edge_id": edge_id, "created": created })),
+    ))
+}
+
+/// DELETE /edges/{id} — soft-delete (active = FALSE). The edge's
+/// backtest_runs history is never dropped.
+#[cfg(feature = "db")]
+async fn delete_edge_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let id = id.trim().to_string();
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(
+            serde_json::json!({ "ok": false, "db_enabled": false }),
+        ));
+    };
+
+    let removed = store.deactivate_edge(&id).await?;
+    info!(edge_id = %id, removed, "edge deactivated");
+    Ok(Json(serde_json::json!({ "ok": removed, "edge_id": id })))
+}
+
+/// Query params for GET /edges/{id}/backtests.
+#[cfg(feature = "db")]
+#[derive(Deserialize)]
+struct BacktestsQuery {
+    /// Max runs to return (clamped to 1..=500). Default: 50.
+    limit: Option<i64>,
+}
+
+/// GET /edges/{id}/backtests — recent runs (newest first) with their
+/// container-written results. Degrades to an empty list without a database.
+#[cfg(feature = "db")]
+async fn list_edge_backtests_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<BacktestsQuery>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let edge_id = id.trim().to_string();
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "edge_id": edge_id,
+            "runs": [],
+            "total": 0,
+            "db_enabled": false,
+        })));
+    };
+
+    let limit = backtests_query_plan(params.limit);
+    let rows = store.list_backtest_runs(&edge_id, limit).await?;
+    Ok(Json(serde_json::json!({
+        "edge_id": edge_id,
+        "runs": rows,
+        "total": rows.len(),
+        "db_enabled": true,
+    })))
+}
+
+/// POST /edges/{id}/backtest — the factory's core loop: record a
+/// backtest_runs row (status 'running'), then spawn the edge's registered
+/// backtest_image as a one-shot fks-bot-* container via the SAME internal
+/// spawn path POST /spawn uses (prefix guard, forced network, caps — see
+/// `edges::build_backtest_spawn_request`). Responds 202 {run_id,
+/// container_id}: the run is ACCEPTED, and the container itself reports the
+/// outcome by updating its own row (it exits when done; rows whose container
+/// died silently are swept to 'failed' after 2h by the net-worth sampler
+/// tick's piggybacked sweep).
+///
+/// Failure honesty: unknown/uncontainerized edge is a 400 before any row is
+/// written; a spawn failure AFTER the row was opened closes it as 'failed'
+/// (awaited) so the ledger never carries a phantom running row.
+#[cfg(feature = "db")]
+async fn run_edge_backtest_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<BacktestRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let t = Instant::now();
+
+    // Validation precedes the store check (400 with or without a DB).
+    let edge_id = match validate_edge_id(&id) {
+        Ok(id) => id,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+    let params = match validate_backtest_params(req.params.as_ref()) {
+        Ok(p) => p,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let Some(store) = state.store.clone() else {
+        // No Postgres — there is no registry to look the edge up in and no
+        // ledger for the run. Honest 503, never a blind spawn.
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "edge backtests require the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    // Look up the edge's backtest image (400 if unknown / not containerized).
+    let Some(edge) = store.get_edge(&edge_id).await? else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("unknown edge '{edge_id}' — register it via POST /edges first"),
+            })),
+        ));
+    };
+    let image = match edge.backtest_image.as_deref().map(str::trim) {
+        Some(image) if !image.is_empty() => image.to_string(),
+        _ => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "edge '{edge_id}' has no backtest_image — its backtest isn't \
+                         containerized yet (set one via POST /edges)"
+                    ),
+                })),
+            ));
+        }
+    };
+
+    // Open the run row FIRST (awaited): the container that will update it
+    // must find it existing, and its id is the container's BACKTEST_RUN_ID.
+    let run_id = store.insert_backtest_run(&edge_id, &params).await?;
+
+    // Spawn through the exact same DockerOps path as POST /spawn — every
+    // guard (fks-bot- prefix, bot cap, forced network, cap_drop ALL,
+    // no-new-privileges) applies unchanged.
+    let spawn_req = build_backtest_spawn_request(
+        &edge_id,
+        run_id,
+        &image,
+        &params,
+        &state.config.database_url,
+    );
+    let image_prefix = image.split(':').next().unwrap_or(&image).to_string();
+    let resp = match state.docker.spawn(spawn_req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            metrics::SPAWN_ERRORS_TOTAL.inc();
+            warn!(error = %e, edge_id = %edge_id, run_id, "backtest spawn failed");
+            // Close the ledger row honestly (awaited) — no container will
+            // ever report, and a phantom 'running' row would sit until the
+            // 2h sweep otherwise.
+            if let Err(db_e) = store.mark_backtest_failed(run_id, &e.to_string()).await {
+                warn!(error = %db_e, run_id, "failed to close backtest run after spawn error");
+            }
+            spawn_dispatch(
+                &state,
+                NotificationEvent::error(
+                    &backtest_bot_id(&edge_id, run_id),
+                    &image,
+                    "backtest",
+                    &e.to_string(),
+                ),
+            );
+            return Err(e);
+        }
+    };
+
+    metrics::SPAWNS_TOTAL.inc();
+    metrics::SPAWN_DURATION
+        .with_label_values(&[&image_prefix])
+        .observe(t.elapsed().as_secs_f64());
+
+    info!(
+        run_id,
+        edge_id = %edge_id,
+        container_id = %resp.container_id,
+        image = %resp.image,
+        "backtest container spawned"
+    );
+
+    // Stamp the container id onto the run row (best-effort, off the response
+    // path — the row already exists and the sweep covers the worst case).
+    {
+        let store = store.clone();
+        let container_id = resp.container_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = store.record_backtest_container(run_id, &container_id).await {
+                warn!(error = %e, run_id, "record_backtest_container failed");
+            }
+        });
+    }
+
+    // Parity with POST /spawn: the container also lands in bot_runs history
+    // (best-effort), notifies configured channels, and refreshes the
+    // Prometheus SD file.
+    {
+        let store = store.clone();
+        let args = OwnedSpawnRecord::from(&resp);
+        tokio::spawn(async move {
+            if let Err(e) = store
+                .record_spawn(RecordSpawn {
+                    container_id: &args.container_id,
+                    container_name: &args.container_name,
+                    image: &args.image,
+                    mode: &args.mode,
+                    started_at: args.started_at,
+                })
+                .await
+            {
+                warn!(error = %e, container_id = %args.container_id, "record_spawn failed");
+            }
+        });
+    }
+    spawn_dispatch(&state, NotificationEvent::spawned(&resp));
+    {
+        let docker = state.docker.clone();
+        let config = state.config.clone();
+        tokio::spawn(async move {
+            prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
+        });
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "ok": true,
+            "run_id": run_id,
+            "container_id": resp.container_id,
+            "bot_id": resp.bot_id,
+            "edge_id": edge_id,
+            "image": resp.image,
+        })),
+    ))
 }
 
 async fn logs_sse_handler(
