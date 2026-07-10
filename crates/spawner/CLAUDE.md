@@ -64,6 +64,10 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `DELETE` | `/configs/{name}` | yes (db only) | Soft-delete a saved config |
 | `GET` `POST` | `/ui/layouts` | yes (db only) | List (names + updated_at) / save (UPSERT) named WebUI dock layouts |
 | `GET` `DELETE` | `/ui/layouts/{name}` | yes (db only) | Fetch one full layout envelope / hard-delete it |
+| `GET` `POST` | `/transfers` | yes (db only) | Treasury cash-flow ledger: list (`?account_id=` filter, `?limit=` default 500 / cap 5000; oldest→newest like /net-worth) / append one signed row (positive = deposit in, negative = withdrawal out; kind: deposit / withdrawal / payout / sweep; source: manual / bot_detected; optional backfill `ts`) |
+| `GET` `POST` | `/accounts` | yes (db only) | Account registry: list (active first) / save (UPSERT by `account_id`; tier 0–3, role + compliance_flag allowlists; carries NO credentials — keys stay in /secrets) |
+| `DELETE` | `/accounts/{id}` | yes (db only) | Soft-delete an account (`active=false`; its transfers/net-worth history is preserved) |
+| `GET` | `/profit` | yes (db only) | Decompose one account's net-worth drift into deposits vs trading profit (`?account_id=` required, `?since=` RFC3339): first/last snapshot in range bound the window; `profit = (end − start net worth) − net inflows` from net_worth_snapshots + transfers |
 
 Auth = `X-Internal-Token: ${NGINX_INTERNAL_TOKEN}` set by nginx.
 Empty token = dev passthrough.
@@ -139,5 +143,12 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   (default true — opt-out). Channel `events=[]` is catch-all; a non-empty list
   filters by kind. `POST /notifications/{name}/test` sends a one-off probe.
   Webhook URLs are NEVER logged (channel name only).
+- **Treasury layer** (`src/treasury.rs`; schema `007_treasury.sql` in the fks
+  repo): the `transfers` signed cash-flow ledger + `accounts` topology registry
+  (tiers: 0 cold-BTC backbone / 1 personal-crypto / 2 rithmic-main /
+  3 prop-copy-target) + the `GET /profit` decomposition, so net-worth drift
+  splits into deposits vs trading profit instead of later deposits showing up
+  as PnL. Pure validation/arithmetic in `treasury.rs` is unit-tested; the
+  handlers are db-gated with graceful no-DB degradation.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

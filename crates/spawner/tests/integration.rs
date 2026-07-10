@@ -1176,3 +1176,299 @@ async fn layouts_routes_are_token_gated() {
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Treasury (db feature) — transfers ledger + accounts registry + /profit
+// round-tripping gracefully without a live Postgres
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn transfers_list_degrades_gracefully_without_db() {
+    // No DATABASE_URL (store: None) — GET /transfers must degrade to an empty
+    // JSON array (not 500), including with the ?account_id=/?limit= filters
+    // (exercises the Query extractor + query-plan wiring, like /net-worth).
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::get("/transfers?account_id=spot-portfolio&limit=10")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert_eq!(payload, "[]", "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn transfers_post_without_db_returns_503() {
+    // A well-formed deposit with no DB configured must report an honest 503
+    // (ledger unavailable), not a fake success — a silently dropped deposit
+    // would corrupt every later profit decomposition.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "account_id": "spot-portfolio",
+        "amount": 250.0,
+        "kind": "deposit",
+        "note": "July DCA"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/transfers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn transfers_post_rejects_unknown_kind() {
+    // Validation runs before the store check: a kind outside the allowlist is
+    // a 400 regardless of DB availability.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "account_id": "spot-portfolio",
+        "amount": 250.0,
+        "kind": "donation"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/transfers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn transfers_post_rejects_zero_amount() {
+    // A zero flow is meaningless in the ledger — 400 before the store.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "account_id": "spot-portfolio",
+        "amount": 0.0,
+        "kind": "deposit"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/transfers")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn accounts_list_degrades_gracefully_without_db() {
+    // No DATABASE_URL (store: None) — GET /accounts must degrade to an empty
+    // list with db_enabled:false, never 500.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(Request::get("/accounts").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"total\":0"), "body: {payload}");
+    assert!(payload.contains("\"accounts\":[]"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn accounts_post_without_db_returns_503() {
+    // A well-formed registration with no DB configured must report an honest
+    // 503, not a fake success.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "account_id": "kraken-main",
+        "tier": 1,
+        "account_class": "personal-crypto",
+        "role": "bot-trade",
+        "venue": "kraken"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn accounts_post_rejects_bad_tier_and_role() {
+    // Validation precedes the store check: out-of-range tier / unknown role
+    // are 400s regardless of DB availability.
+    let (app, _) = build_app(test_config(""));
+
+    for body in [
+        serde_json::json!({
+            "account_id": "x",
+            "tier": 9,
+            "account_class": "prop",
+            "role": "watch"
+        }),
+        serde_json::json!({
+            "account_id": "x",
+            "tier": 3,
+            "account_class": "prop",
+            "role": "yolo-trade"
+        }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/accounts")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn accounts_delete_degrades_gracefully_without_db() {
+    // DELETE /accounts/{id} with no DB degrades to ok:false + db_enabled:false.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::delete("/accounts/kraken-main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"ok\":false"), "body: {payload}");
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn profit_degrades_gracefully_without_db() {
+    // No DATABASE_URL (store: None) — GET /profit must degrade to a stable
+    // null-figure envelope (200, db_enabled:false), never 500.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::get("/profit?account_id=spot-portfolio&since=2026-01-01T00:00:00Z")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"profit\":null"), "body: {payload}");
+    assert!(
+        payload.contains("\"account_id\":\"spot-portfolio\""),
+        "body: {payload}"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn profit_requires_account_id() {
+    // /profit is per-account by definition — no account_id is a 400.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(Request::get("/profit").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn profit_rejects_malformed_since() {
+    // A non-RFC3339 ?since= is a 400, not a silent full-history read.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::get("/profit?account_id=x&since=yesterday")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn treasury_routes_are_token_gated() {
+    // With a configured token, the treasury routes reject unauthenticated
+    // requests (401) before touching the store — same gate as the rest.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    for req in [
+        Request::get("/transfers").body(Body::empty()).unwrap(),
+        Request::get("/accounts").body(Body::empty()).unwrap(),
+        Request::get("/profit?account_id=x")
+            .body(Body::empty())
+            .unwrap(),
+    ] {
+        let uri = req.uri().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route: {uri}");
+    }
+}
