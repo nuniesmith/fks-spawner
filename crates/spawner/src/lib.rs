@@ -24,3 +24,4 @@ pub mod notifications;
 pub mod prometheus_sd;
 #[cfg(feature = "db")]
 pub mod secrets_crypto;
+pub mod treasury;

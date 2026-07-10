@@ -39,9 +39,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::error::SpawnerError;
-use crate::models::ConfigRequest;
+use crate::models::{AccountRequest, ConfigRequest};
 use crate::net_worth::NetWorthSnapshot;
 use crate::secrets_crypto::SecretsCipher;
+use crate::treasury::NewTransfer;
 
 /// One exchange's decrypted API credentials, as fetched by
 /// [`BotRunStore::get_secret`] for spawn-time env injection. Never serialized
@@ -664,6 +665,216 @@ impl BotRunStore {
             .map(NetWorthSnapshotRow::from_row)
             .collect())
     }
+
+    // ── transfers + accounts (see src/sql/spawner/007_treasury.sql) ──────────
+    // The treasury layer: `transfers` is the signed cash-flow ledger (positive
+    // = into the account, negative = out) that lets GET /profit decompose
+    // net-worth drift into deposits vs trading profit; `accounts` is the
+    // multi-account topology registry (NO credentials — those stay in
+    // exchange_secrets). Inputs are validated/normalised by `crate::treasury`
+    // before they reach here.
+
+    /// Append one validated transfer to the ledger; returns the new row id.
+    /// The NUMERIC `amount` is bound as text + `::numeric` cast because this
+    /// sqlx build has no decimal feature (same as `record_net_worth`). A
+    /// `None` ts lets the DB default the row to NOW(); a backfilled manual
+    /// entry carries its own timestamp.
+    pub async fn insert_transfer(&self, t: &NewTransfer) -> Result<i64, SpawnerError> {
+        let row = sqlx::query(
+            "INSERT INTO transfers (account_id, ts, amount, currency, kind, source, note) \
+             VALUES ($1, COALESCE($2::timestamptz, NOW()), $3::numeric, $4, $5, $6, $7) \
+             RETURNING id",
+        )
+        .bind(&t.account_id)
+        .bind(t.ts)
+        .bind(t.amount.to_string())
+        .bind(&t.currency)
+        .bind(&t.kind)
+        .bind(&t.source)
+        .bind(t.note.as_deref())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let id: i64 = row.try_get("id").map_err(map_sqlx)?;
+        debug!(id, account_id = %t.account_id, kind = %t.kind, "transfers row inserted");
+        Ok(id)
+    }
+
+    /// Read a window of the ledger for `GET /transfers`. Selects the most
+    /// recent `limit` rows (optionally filtered to one `account_id`) but
+    /// returns them oldest → newest, mirroring `list_net_worth`. The NUMERIC
+    /// `amount` is cast to `float8` in SQL (no decimal feature). Clamp and
+    /// normalise the inputs with [`crate::treasury::transfers_query_plan`]
+    /// first.
+    pub async fn list_transfers(
+        &self,
+        account_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<TransferRow>, SpawnerError> {
+        let rows = sqlx::query(
+            "SELECT id, account_id, ts, amount::float8 AS amount, currency, kind, source, note \
+             FROM ( \
+                 SELECT id, account_id, ts, amount, currency, kind, source, note \
+                 FROM transfers \
+                 WHERE ($1::text IS NULL OR account_id = $1) \
+                 ORDER BY ts DESC \
+                 LIMIT $2 \
+             ) recent \
+             ORDER BY ts ASC",
+        )
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows.into_iter().map(TransferRow::from_row).collect())
+    }
+
+    /// Save (UPSERT by account_id) one registry account — the `bot_configs`
+    /// UPSERT pattern. Returns whether a NEW row was created (`true`) vs an
+    /// existing one overwritten (`false`). Absent risk_caps/sizing default to
+    /// `{}` to match the table default.
+    pub async fn upsert_account(&self, req: &AccountRequest) -> Result<bool, SpawnerError> {
+        let empty = serde_json::json!({});
+        let row = sqlx::query(
+            "INSERT INTO accounts (account_id, display_name, tier, account_class, venue, \
+                                   role, firm, compliance_flag, risk_caps, sizing, active) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             ON CONFLICT (account_id) DO UPDATE \
+             SET display_name    = EXCLUDED.display_name, \
+                 tier            = EXCLUDED.tier, \
+                 account_class   = EXCLUDED.account_class, \
+                 venue           = EXCLUDED.venue, \
+                 role            = EXCLUDED.role, \
+                 firm            = EXCLUDED.firm, \
+                 compliance_flag = EXCLUDED.compliance_flag, \
+                 risk_caps       = EXCLUDED.risk_caps, \
+                 sizing          = EXCLUDED.sizing, \
+                 active          = EXCLUDED.active, \
+                 updated_at      = NOW() \
+             RETURNING (xmax = 0) AS inserted",
+        )
+        .bind(req.account_id.trim())
+        .bind(req.display_name.as_deref())
+        .bind(req.tier)
+        .bind(req.account_class.trim())
+        .bind(req.venue.as_deref())
+        .bind(req.role.trim())
+        .bind(req.firm.as_deref())
+        .bind(req.compliance_flag.trim())
+        .bind(req.risk_caps.as_ref().unwrap_or(&empty))
+        .bind(req.sizing.as_ref().unwrap_or(&empty))
+        .bind(req.active)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let inserted: bool = row.try_get("inserted").unwrap_or(false);
+        debug!(account_id = %req.account_id.trim(), inserted, "accounts row upserted");
+        Ok(inserted)
+    }
+
+    /// All registry accounts, active first (then tier, then id) so the WebUI
+    /// list leads with what matters.
+    pub async fn list_accounts(&self) -> Result<Vec<AccountRow>, SpawnerError> {
+        let rows = sqlx::query(
+            "SELECT account_id, display_name, tier, account_class, venue, role, firm, \
+                    compliance_flag, risk_caps, sizing, active, created_at, updated_at \
+             FROM accounts \
+             ORDER BY active DESC, tier ASC, account_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(rows.into_iter().map(AccountRow::from_row).collect())
+    }
+
+    /// Soft-delete an account (active = FALSE, the bot_configs pattern) —
+    /// history keyed by the account_id (transfers / net-worth rows) is never
+    /// dropped. Returns whether an active row was affected.
+    pub async fn deactivate_account(&self, account_id: &str) -> Result<bool, SpawnerError> {
+        let r = sqlx::query(
+            "UPDATE accounts SET active = FALSE, updated_at = NOW() \
+             WHERE account_id = $1 AND active = TRUE",
+        )
+        .bind(account_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Gather the raw inputs for `GET /profit`: the first + last net-worth
+    /// snapshots for `account_id` in the window (`since`..now — snapshots key
+    /// on bot_id, which IS the account id for bot-traded accounts) plus the
+    /// signed transfer amounts strictly AFTER the first snapshot and up to
+    /// the last (a flow already reflected in the first snapshot must not be
+    /// double-counted). The pure arithmetic lives in
+    /// [`crate::treasury::decompose_profit`].
+    pub async fn profit_inputs(
+        &self,
+        account_id: &str,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<ProfitInputs, SpawnerError> {
+        let start = sqlx::query(
+            "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+             WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+             ORDER BY ts ASC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(since)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .map(snapshot_point);
+
+        let end = sqlx::query(
+            "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+             WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+             ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .bind(since)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .map(snapshot_point);
+
+        // No snapshots in the window → nothing to decompose (the handler
+        // reports null figures rather than inventing a zero baseline).
+        let (Some((start_ts, _)), Some((end_ts, _))) = (start, end) else {
+            return Ok(ProfitInputs {
+                start,
+                end,
+                transfer_amounts: Vec::new(),
+            });
+        };
+
+        let rows = sqlx::query(
+            "SELECT amount::float8 AS amount FROM transfers \
+             WHERE account_id = $1 AND ts > $2 AND ts <= $3",
+        )
+        .bind(account_id)
+        .bind(start_ts)
+        .bind(end_ts)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let transfer_amounts = rows
+            .iter()
+            .map(|r| r.try_get("amount").unwrap_or(0.0))
+            .collect();
+
+        Ok(ProfitInputs {
+            start,
+            end,
+            transfer_amounts,
+        })
+    }
 }
 
 // ── GET /net-worth request shaping (pure — unit-tested) ──────────────────────
@@ -759,6 +970,97 @@ impl NetWorthSnapshotRow {
             venue: r.try_get("venue").ok(),
         }
     }
+}
+
+/// A row from `transfers` exposed via GET /transfers. `amount` is signed:
+/// positive = into the account (deposit), negative = out (withdrawal).
+#[derive(Debug, serde::Serialize)]
+pub struct TransferRow {
+    pub id: i64,
+    pub account_id: String,
+    pub ts: DateTime<Utc>,
+    pub amount: f64,
+    pub currency: String,
+    pub kind: String,
+    pub source: String,
+    pub note: Option<String>,
+}
+
+impl TransferRow {
+    fn from_row(r: PgRow) -> Self {
+        Self {
+            id: r.try_get("id").unwrap_or_default(),
+            account_id: r.try_get("account_id").unwrap_or_default(),
+            ts: r.try_get("ts").unwrap_or_else(|_| Utc::now()),
+            // `amount::float8` in the query — a bare NUMERIC can't decode
+            // without sqlx's decimal feature.
+            amount: r.try_get("amount").unwrap_or(0.0),
+            currency: r.try_get("currency").unwrap_or_default(),
+            kind: r.try_get("kind").unwrap_or_default(),
+            source: r.try_get("source").unwrap_or_default(),
+            // Nullable column — NULL decodes as Err, which `.ok()` maps to None.
+            note: r.try_get("note").ok(),
+        }
+    }
+}
+
+/// A row from `accounts` exposed via GET /accounts. Topology + policy
+/// metadata only — the registry holds NO credentials by design (keys live in
+/// the encrypted exchange_secrets store).
+#[derive(Debug, serde::Serialize)]
+pub struct AccountRow {
+    pub account_id: String,
+    pub display_name: Option<String>,
+    /// 0 = cold-BTC backbone, 1 = personal-crypto, 2 = rithmic-main,
+    /// 3 = prop-copy-target.
+    pub tier: i16,
+    pub account_class: String,
+    pub venue: Option<String>,
+    pub role: String,
+    pub firm: Option<String>,
+    pub compliance_flag: String,
+    pub risk_caps: serde_json::Value,
+    pub sizing: serde_json::Value,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AccountRow {
+    fn from_row(r: PgRow) -> Self {
+        Self {
+            account_id: r.try_get("account_id").unwrap_or_default(),
+            display_name: r.try_get("display_name").ok(),
+            tier: r.try_get("tier").unwrap_or(0),
+            account_class: r.try_get("account_class").unwrap_or_default(),
+            venue: r.try_get("venue").ok(),
+            role: r.try_get("role").unwrap_or_default(),
+            firm: r.try_get("firm").ok(),
+            compliance_flag: r.try_get("compliance_flag").unwrap_or_default(),
+            risk_caps: r
+                .try_get("risk_caps")
+                .unwrap_or_else(|_| serde_json::json!({})),
+            sizing: r
+                .try_get("sizing")
+                .unwrap_or_else(|_| serde_json::json!({})),
+            active: r.try_get("active").unwrap_or(false),
+            created_at: r.try_get("created_at").unwrap_or_else(|_| Utc::now()),
+            updated_at: r.try_get("updated_at").unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+/// Raw inputs for the `GET /profit` decomposition, as gathered by
+/// [`BotRunStore::profit_inputs`]: the first/last net-worth snapshots in the
+/// window plus the signed transfer amounts between them. Fed to the pure
+/// [`crate::treasury::decompose_profit`].
+pub struct ProfitInputs {
+    /// First snapshot in the window: (ts, net_worth). None = no data.
+    pub start: Option<(DateTime<Utc>, f64)>,
+    /// Last snapshot in the window: (ts, net_worth). None = no data.
+    pub end: Option<(DateTime<Utc>, f64)>,
+    /// Signed transfer amounts with start.ts < ts <= end.ts.
+    pub transfer_amounts: Vec<f64>,
 }
 
 /// A row from `exchange_secrets` exposed via GET /secrets/status. Carries only
@@ -881,6 +1183,14 @@ impl BotConfigRow {
 
 fn map_sqlx(e: sqlx::Error) -> SpawnerError {
     SpawnerError::Other(format!("postgres: {e}"))
+}
+
+/// Decode one `(ts, net_worth::float8)` snapshot row for `profit_inputs`.
+fn snapshot_point(r: PgRow) -> (DateTime<Utc>, f64) {
+    (
+        r.try_get("ts").unwrap_or_else(|_| Utc::now()),
+        r.try_get("net_worth").unwrap_or(0.0),
+    )
 }
 
 /// Strip user:password from a postgres URL for safe logging.

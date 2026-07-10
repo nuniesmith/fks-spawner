@@ -47,9 +47,16 @@ use crate::{
 #[cfg(feature = "db")]
 use crate::db::{BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
-use crate::models::{ConfigRequest, LayoutRequest, NotificationChannelRequest, SecretRequest};
+use crate::models::{
+    AccountRequest, ConfigRequest, LayoutRequest, NotificationChannelRequest, SecretRequest,
+    TransferRequest,
+};
 #[cfg(feature = "db")]
 use crate::notifications::{NotificationDispatcher, NotificationEvent, TestOutcome};
+#[cfg(feature = "db")]
+use crate::treasury::{
+    decompose_profit, transfers_query_plan, validate_account, validate_transfer,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared state
@@ -146,7 +153,17 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/ui/layouts/{name}",
             get(get_layout_handler).delete(delete_layout_handler),
-        );
+        )
+        .route(
+            "/transfers",
+            get(list_transfers_handler).post(record_transfer_handler),
+        )
+        .route(
+            "/accounts",
+            get(list_accounts_handler).post(save_account_handler),
+        )
+        .route("/accounts/{id}", delete(delete_account_handler))
+        .route("/profit", get(profit_handler));
 
     let protected = protected
         .layer(middleware::from_fn_with_state(
@@ -1072,6 +1089,299 @@ async fn delete_layout_handler(
 
     let removed = store.delete_layout(&name).await?;
     Ok(Json(serde_json::json!({ "ok": removed, "name": name })))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Treasury  (db feature only) — transfers ledger + accounts registry + /profit
+//
+// WHY: net_worth_snapshots shows drift, but drift conflates deposits with
+// trading profit (the operator DCAs cash in regularly; the spot bot's own
+// status code documents "later deposits show up as PnL"). POST /transfers
+// records the signed external cash flows; GET /profit joins them against the
+// snapshots to report what an account actually EARNED. The accounts registry
+// is the multi-account topology's source of truth (NO credentials — those
+// live in exchange_secrets). Schema: src/sql/spawner/007_treasury.sql. Pure
+// validation/arithmetic lives in crate::treasury (unit-tested); these
+// handlers just wire it to the store.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POST /transfers — append one signed cash-flow row (positive = deposit in,
+/// negative = withdrawal out). Validation (allowlisted kind/source, finite
+/// non-zero amount) precedes the store check, so a bad row is a 400 with or
+/// without a database. The write is AWAITED (like /secrets) — success means
+/// the ledger row persisted, since a silently dropped deposit would corrupt
+/// every later profit decomposition.
+#[cfg(feature = "db")]
+async fn record_transfer_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TransferRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let transfer = match validate_transfer(&req) {
+        Ok(t) => t,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        // No Postgres configured — can't persist. Tell the caller honestly
+        // instead of pretending the ledger row was recorded.
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "the transfers ledger requires the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    let id = store.insert_transfer(&transfer).await?;
+    info!(
+        id,
+        account_id = %transfer.account_id,
+        kind = %transfer.kind,
+        source = %transfer.source,
+        "transfer recorded"
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "ok": true,
+            "id": id,
+            "account_id": transfer.account_id,
+            "kind": transfer.kind,
+            "amount": transfer.amount,
+        })),
+    ))
+}
+
+/// Query params for GET /transfers (mirrors /net-worth).
+#[cfg(feature = "db")]
+#[derive(Deserialize)]
+struct TransfersQuery {
+    /// Optional exact-match filter on account_id. Blank = all accounts.
+    account_id: Option<String>,
+    /// Max rows to return (clamped to 1..=5000). Default: 500.
+    limit: Option<i64>,
+}
+
+/// GET /transfers — a window of the ledger as a flat JSON array
+/// `[{id, account_id, ts, amount, currency, kind, source, note}]`, ordered
+/// oldest → newest (like /net-worth) so the WebUI renders it directly.
+/// Degrades to `[]` without a database.
+#[cfg(feature = "db")]
+async fn list_transfers_handler(
+    State(state): State<AppState>,
+    Query(params): Query<TransfersQuery>,
+) -> Result<Json<Vec<crate::db::TransferRow>>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        // DB not configured — empty ledger so the WebUI degrades gracefully.
+        return Ok(Json(Vec::new()));
+    };
+
+    let (account_id, limit) = transfers_query_plan(params.account_id.as_deref(), params.limit);
+    let rows = store.list_transfers(account_id.as_deref(), limit).await?;
+    Ok(Json(rows))
+}
+
+/// GET /accounts — the registry, active accounts first.
+#[cfg(feature = "db")]
+async fn list_accounts_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "accounts": [],
+            "total": 0,
+            "db_enabled": false,
+        })));
+    };
+
+    let rows = store.list_accounts().await?;
+    Ok(Json(serde_json::json!({
+        "accounts": rows,
+        "total": rows.len(),
+        "db_enabled": true,
+    })))
+}
+
+/// POST /accounts — create/UPSERT one registry account by account_id (the
+/// /configs UPSERT pattern). Validation (tier range, role/compliance
+/// allowlists) precedes the store check. Carries NO credentials by design.
+#[cfg(feature = "db")]
+async fn save_account_handler(
+    State(state): State<AppState>,
+    Json(req): Json<AccountRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let account_id = match validate_account(&req) {
+        Ok(id) => id,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "the account registry requires the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    let created = store.upsert_account(&req).await?;
+    info!(account_id = %account_id, created, tier = req.tier, "account registered");
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "account_id": account_id, "created": created })),
+    ))
+}
+
+/// DELETE /accounts/{id} — soft-delete (active = FALSE). The account's
+/// history (transfers / net-worth rows keyed by its id) is never dropped.
+#[cfg(feature = "db")]
+async fn delete_account_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let id = id.trim().to_string();
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(
+            serde_json::json!({ "ok": false, "db_enabled": false }),
+        ));
+    };
+
+    let removed = store.deactivate_account(&id).await?;
+    info!(account_id = %id, removed, "account deactivated");
+    Ok(Json(serde_json::json!({ "ok": removed, "account_id": id })))
+}
+
+/// Query params for GET /profit.
+#[cfg(feature = "db")]
+#[derive(Deserialize)]
+struct ProfitQuery {
+    /// Required: which account to decompose.
+    account_id: Option<String>,
+    /// Optional RFC3339 window start. Omitted = the account's full history.
+    since: Option<String>,
+}
+
+/// Build the null-figure /profit envelope (no DB, or no snapshots in range).
+#[cfg(feature = "db")]
+fn profit_empty_body(
+    account_id: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    db_enabled: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "account_id": account_id,
+        "since": since,
+        "db_enabled": db_enabled,
+        "start_ts": null,
+        "end_ts": null,
+        "start_net_worth": null,
+        "end_net_worth": null,
+        "delta": null,
+        "deposits_in": null,
+        "withdrawals_out": null,
+        "net_inflows": null,
+        "profit": null,
+        "transfers": 0,
+    })
+}
+
+/// GET /profit — decompose one account's net-worth drift into deposits vs
+/// trading profit over `?since=`..now.
+///
+/// The window is bounded by the FIRST and LAST net_worth_snapshots rows in
+/// range (snapshots key on bot_id, which is the account id for bot-traded
+/// accounts); the transfers strictly between those snapshots explain the
+/// external cash flows, and `profit = delta − net_inflows` is what the
+/// account actually earned (see `treasury::decompose_profit`). With no
+/// database, or no snapshots in the window, the figures come back null —
+/// never an invented zero baseline.
+#[cfg(feature = "db")]
+async fn profit_handler(
+    State(state): State<AppState>,
+    Query(params): Query<ProfitQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let account_id = params
+        .account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(account_id) = account_id else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "account_id is required",
+            })),
+        ));
+    };
+
+    let since = match params
+        .since
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(_) => {
+                return Ok((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "since must be an RFC3339 timestamp (e.g. 2026-01-01T00:00:00Z)",
+                    })),
+                ));
+            }
+        },
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        // DB not configured — null figures so the WebUI degrades gracefully.
+        return Ok((
+            StatusCode::OK,
+            Json(profit_empty_body(account_id, since, false)),
+        ));
+    };
+
+    let inputs = store.profit_inputs(account_id, since).await?;
+    let body = match (inputs.start, inputs.end) {
+        (Some((start_ts, start_nw)), Some((end_ts, end_nw))) => {
+            let d = decompose_profit(start_nw, end_nw, &inputs.transfer_amounts);
+            serde_json::json!({
+                "account_id": account_id,
+                "since": since,
+                "db_enabled": true,
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "start_net_worth": d.start_net_worth,
+                "end_net_worth": d.end_net_worth,
+                "delta": d.delta,
+                "deposits_in": d.deposits_in,
+                "withdrawals_out": d.withdrawals_out,
+                "net_inflows": d.net_inflows,
+                "profit": d.profit,
+                "transfers": inputs.transfer_amounts.len(),
+            })
+        }
+        // No snapshots in the window — nothing to decompose.
+        _ => profit_empty_body(account_id, since, true),
+    };
+    Ok((StatusCode::OK, Json(body)))
 }
 
 async fn logs_sse_handler(

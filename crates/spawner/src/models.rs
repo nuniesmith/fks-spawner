@@ -169,6 +169,120 @@ pub struct LayoutRequest {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Treasury: transfer ledger + account registry requests (POST /transfers,
+// POST /accounts) — see src/sql/spawner/007_treasury.sql + crate::treasury
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /transfers` — appends one signed cash-flow row to
+/// the `transfers` ledger so net-worth drift decomposes into deposits vs
+/// trading profit (GET /profit).
+///
+/// SIGN CONVENTION: `amount` is signed from the account's point of view —
+/// positive = money INTO the account (deposit), negative = money OUT
+/// (withdrawal). Validated (finite, non-zero, allowlisted kind/source) by
+/// `treasury::validate_transfer` before touching the store.
+#[derive(Debug, Deserialize)]
+pub struct TransferRequest {
+    /// Which account the flow belongs to: a bot_id (the fks.bot_id label, so
+    /// the ledger joins net_worth_snapshots) or an accounts-registry id.
+    pub account_id: String,
+
+    /// Signed flow (positive = in, negative = out). Must be finite, non-zero.
+    pub amount: f64,
+
+    /// What the flow is: deposit | withdrawal | payout | sweep.
+    pub kind: String,
+
+    /// Which writer produced the row: manual (operator entry, the default) |
+    /// bot_detected (a bot noticing an unexplained balance jump).
+    #[serde(default = "default_transfer_source")]
+    pub source: String,
+
+    /// Denomination of `amount`. Defaults to USD.
+    #[serde(default = "default_currency")]
+    pub currency: String,
+
+    /// Free-form operator annotation ("July DCA", "APEX payout #3", …).
+    #[serde(default)]
+    pub note: Option<String>,
+
+    /// Optional explicit timestamp (RFC3339) for backfilled entries — the
+    /// operator recording a past deposit after the fact. Omitted = the DB
+    /// stamps NOW().
+    #[serde(default)]
+    pub ts: Option<DateTime<Utc>>,
+}
+
+fn default_transfer_source() -> String {
+    "manual".to_string()
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
+}
+
+/// Request body for `POST /accounts` — creates/UPSERTs one row of the
+/// `accounts` registry (the multi-account treasury topology's source of
+/// truth). Re-posting the same `account_id` overwrites.
+///
+/// SECURITY: deliberately NO credential fields — API keys live in the
+/// encrypted `exchange_secrets` store (POST /secrets), never in the registry.
+#[derive(Debug, Deserialize)]
+pub struct AccountRequest {
+    /// Logical account identity (the UPSERT key). For bot-traded accounts,
+    /// the fks.bot_id label, so registry rows join transfers/net-worth.
+    pub account_id: String,
+
+    /// Human-friendly label for the WebUI.
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// Treasury tier: 0 = cold-BTC backbone, 1 = personal-crypto,
+    /// 2 = rithmic-main, 3 = prop-copy-target.
+    pub tier: i16,
+
+    /// Coarse classification: personal-crypto | paper | prop | cold-storage | …
+    pub account_class: String,
+
+    /// Venue/exchange/broker the account lives at (kraken, rithmic, …).
+    #[serde(default)]
+    pub venue: Option<String>,
+
+    /// How the platform interacts with the account:
+    /// watch | bot-trade | human-trade-source | copy-target.
+    pub role: String,
+
+    /// Prop firm the account belongs to (None for non-prop accounts).
+    #[serde(default)]
+    pub firm: Option<String>,
+
+    /// Copy-trading compliance posture. Defaults to manual-mirror (a human
+    /// confirms every mirrored fill); auto-fill only where firm rules allow.
+    #[serde(default = "default_compliance_flag")]
+    pub compliance_flag: String,
+
+    /// Operator-set risk policy JSON object (enforced by later phases).
+    #[serde(default)]
+    pub risk_caps: Option<serde_json::Value>,
+
+    /// Operator-set sizing policy JSON object.
+    #[serde(default)]
+    pub sizing: Option<serde_json::Value>,
+
+    /// Soft-delete flag; defaults to true. DELETE /accounts/{id} flips it off.
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_compliance_flag() -> String {
+    "manual-mirror".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Spawn response
 // ─────────────────────────────────────────────────────────────────────────────
 
