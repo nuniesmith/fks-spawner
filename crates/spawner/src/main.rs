@@ -17,6 +17,14 @@
 //   PRUNE_AFTER_SECS          seconds before a stopped bot is pruned (default: 300)
 //   PRUNE_INTERVAL_SECS       seconds between prune sweeps (default: 60)
 //   NET_WORTH_SAMPLE_INTERVAL_SECS  seconds between net-worth samples (default: 300; DB only)
+//   BTC_WATCH_XPUB            account xpub for the cold-BTC watcher (read-only; derives addresses)
+//   BTC_WATCH_ADDRESSES       comma-separated BTC addresses to watch (alternative/addition to xpub)
+//   BTC_WATCH_GAP             receive+change addresses derived per branch (default: 20)
+//   BTC_WATCH_INTERVAL_SECS   seconds between cold-BTC ticks (default: 3600; DB only)
+//   BTC_WATCH_ACCOUNT_ID      account id for the cold-BTC snapshot rows (default: btc-cold)
+//   ESPLORA_API_BASE          Esplora API base for balances (default: https://blockstream.info/api)
+//   RITHMIC_SAMPLER_URL       rithmic-connector base URL for the balance sampler (read-only; off unless set)
+//   RITHMIC_SAMPLE_INTERVAL_SECS  seconds between rithmic balance samples (default: 300; DB only)
 //   RUST_LOG                  log level (default: info,spawner=debug)
 // =============================================================================
 
@@ -128,6 +136,63 @@ async fn main() -> anyhow::Result<()> {
             interval_secs = %config.net_worth_sample_interval_secs,
             "net-worth sampler started"
         );
+    }
+
+    // ── Background: cold-BTC on-chain watcher (read-only, source=onchain) ───────
+    // Derives addresses from a public xpub and/or reads an explicit address
+    // list, sums their confirmed on-chain balance via Esplora, prices BTC→USD
+    // off Kraken, and writes one onchain net-worth snapshot per tick. DB-only,
+    // best-effort, and OFF unless BTC_WATCH_XPUB/BTC_WATCH_ADDRESSES is set.
+    // Holds no keys — it can only READ. See crate::btc_watch.
+    #[cfg(feature = "db")]
+    if config.btc_watch.enabled() {
+        if let Some(store_btc) = store.clone() {
+            let config_btc = config.clone();
+            tokio::spawn(async move {
+                spawner::btc_watch::run_watcher(config_btc, store_btc).await;
+            });
+            info!(
+                interval_secs = config.btc_watch.interval_secs,
+                gap = config.btc_watch.gap,
+                has_xpub = config.btc_watch.xpub.is_some(),
+                explicit_addresses = config.btc_watch.addresses.len(),
+                "cold-BTC watcher ENABLED"
+            );
+        } else {
+            info!(
+                "cold-BTC watcher configured but DB is disabled — not starting (nothing to write to)"
+            );
+        }
+    } else {
+        info!(
+            "cold-BTC watcher disabled (set BTC_WATCH_XPUB and/or BTC_WATCH_ADDRESSES to enable)"
+        );
+    }
+
+    // ── Background: Rithmic account-balance sampler (read-only, source=rithmic) ─
+    // Polls the rithmic-connector's read-only /positions endpoint for the
+    // account balance and writes one rithmic net-worth snapshot per tick.
+    // DB-only, best-effort, and OFF unless RITHMIC_SAMPLER_URL is set (the
+    // connector is gated on live creds and usually down in dev). See
+    // crate::rithmic_sampler.
+    #[cfg(feature = "db")]
+    if config.rithmic_sampler.enabled() {
+        if let Some(store_rithmic) = store.clone() {
+            let config_rithmic = config.rithmic_sampler.clone();
+            tokio::spawn(async move {
+                spawner::rithmic_sampler::run_sampler(config_rithmic, store_rithmic).await;
+            });
+            info!(
+                interval_secs = config.rithmic_sampler.interval_secs,
+                "rithmic balance sampler ENABLED"
+            );
+        } else {
+            info!(
+                "rithmic sampler configured but DB is disabled — not starting (nothing to write to)"
+            );
+        }
+    } else {
+        info!("rithmic balance sampler disabled (set RITHMIC_SAMPLER_URL to enable)");
     }
 
     // ── HTTP server ───────────────────────────────────────────────────────────

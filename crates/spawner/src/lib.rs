@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod btc_watch;
 pub mod config;
 #[cfg(feature = "db")]
 pub mod db;
@@ -22,6 +23,7 @@ pub mod models;
 pub mod net_worth;
 pub mod notifications;
 pub mod prometheus_sd;
+pub mod rithmic_sampler;
 #[cfg(feature = "db")]
 pub mod secrets_crypto;
 pub mod treasury;

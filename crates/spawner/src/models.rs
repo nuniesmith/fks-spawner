@@ -283,6 +283,38 @@ fn default_true() -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Manual net-worth snapshot request (POST /net-worth) — a hand-entered balance
+// (see src/sql/spawner/006_net_worth_snapshots.sql + crate::net_worth)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /net-worth` — records ONE hand-entered net-worth
+/// snapshot with `source='manual'`. This is how balances that have no watcher
+/// node of their own yet (prop-firm payout accounts, a bank balance, a
+/// hardware-wallet total read off a screen) get into the net-worth series until
+/// their own read-only node exists.
+///
+/// Validated (finite value, non-empty account_id) by
+/// `net_worth::validate_manual_snapshot` before touching the store. Carries no
+/// credentials and can only RECORD a reading — never move funds.
+#[derive(Debug, Deserialize)]
+pub struct NetWorthManualRequest {
+    /// Logical account id (lands in the `bot_id`/account column). For a
+    /// bot-traded account this is the fks.bot_id so the row joins /profit.
+    pub account_id: String,
+
+    /// The net-worth value in `currency`. Must be finite.
+    pub net_worth: f64,
+
+    /// Denomination of `net_worth`. Defaults to USD.
+    #[serde(default = "default_currency")]
+    pub currency: String,
+
+    /// Optional venue/source tag (e.g. "apex", "chase-bank", "ledger").
+    #[serde(default)]
+    pub venue: Option<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Spawn response
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -52,7 +52,7 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `POST` | `/container/{id}/restart` | yes | 10s graceful stop + start |
 | `GET` | `/container/{id}/logs` | yes | SSE stream |
 | `GET` | `/runs` | yes (db only) | Recent `bot_runs` history |
-| `GET` | `/net-worth` | yes (db only) | Recent `net_worth_snapshots` (`?bot_id=` filter, `?limit=` default 500 / cap 5000); `[{bot_id, ts, net_worth, currency, venue}]` oldest→newest |
+| `GET` `POST` | `/net-worth` | yes (db only) | GET: recent `net_worth_snapshots` (`?bot_id=` filter, `?limit=` default 500 / cap 5000); `[{bot_id, ts, net_worth, currency, venue}]` oldest→newest. POST: record ONE hand-entered snapshot `{account_id, net_worth, currency?='USD', venue?}` with `source='manual'` (validates finite value + non-empty account_id; awaited write, 201 on success, honest 503 without a DB) — how prop-payout / bank balances get entered until their own node exists |
 | `POST` | `/secrets` | yes (db only) | Store exchange API credentials (never read back) |
 | `GET` | `/secrets/status` | yes (db only) | Which exchanges have keys configured |
 | `DELETE` | `/secrets/{exchange}` | yes (db only) | Remove one exchange's stored credentials (hard delete) |
@@ -150,5 +150,31 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   splits into deposits vs trading profit instead of later deposits showing up
   as PnL. Pure validation/arithmetic in `treasury.rs` is unit-tested; the
   handlers are db-gated with graceful no-DB degradation.
+- **Read-only treasury nodes** (P0.6) — three DB-gated background/endpoint
+  writers that all APPEND `net_worth_snapshots` rows (distinguished by the
+  `source` column) and can NEVER move money by construction:
+  - **Cold-BTC watcher** (`src/btc_watch.rs`, `source='onchain'`): derives
+    BIP84 p2wpkh receive+change addresses from a public account xpub
+    (`BTC_WATCH_XPUB`, gap `BTC_WATCH_GAP` default 20 — raise for a deep wallet)
+    and/or reads `BTC_WATCH_ADDRESSES` (comma-separated). Sums confirmed balance
+    via a public Esplora API (`ESPLORA_API_BASE`, default blockstream.info),
+    prices BTC→USD off Kraken's public ticker, and writes ONE row per tick
+    (`BTC_WATCH_INTERVAL_SECS` default 3600; account_id `BTC_WATCH_ACCOUNT_ID`
+    default `btc-cold`, venue `cold-btc`). OFF unless an xpub/addresses are set.
+    An xpub is public-key material — it can derive addresses but never sign. Any
+    fetch/price failure skips the whole tick (never a partial/zero row).
+  - **Rithmic balance sampler** (`src/rithmic_sampler.rs`, `source='rithmic'`):
+    polls the read-only `rithmic-connector` `GET /positions`
+    (`RITHMIC_SAMPLER_URL`, e.g. http://fks_rithmic_connector:9091;
+    `RITHMIC_SAMPLE_INTERVAL_SECS` default 300) for
+    `account_summary.account_balance`, writing rows account_id
+    `rithmic:<id>`, venue `rithmic`. OFF unless the URL is set; the connector is
+    usually down (gated on creds) → silent debug skip.
+  - **Manual snapshot** (`POST /net-worth`, `source='manual'`): a hand-entered
+    balance for accounts without a watcher yet.
+  Pure parse/derive/validate logic in each module is unit-tested (incl. a BIP84
+  xpub derivation test vector); the writers are best-effort and never fatal. The
+  one new dep is `bitcoin` (bip32/address derivation only — no wallet/signing
+  features).
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

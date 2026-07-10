@@ -48,8 +48,8 @@ use crate::{
 use crate::db::{BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
 use crate::models::{
-    AccountRequest, ConfigRequest, LayoutRequest, NotificationChannelRequest, SecretRequest,
-    TransferRequest,
+    AccountRequest, ConfigRequest, LayoutRequest, NetWorthManualRequest,
+    NotificationChannelRequest, SecretRequest, TransferRequest,
 };
 #[cfg(feature = "db")]
 use crate::notifications::{NotificationDispatcher, NotificationEvent, TestOutcome};
@@ -128,7 +128,10 @@ pub fn build_router(state: AppState) -> Router {
     #[cfg(feature = "db")]
     let protected = protected
         .route("/runs", get(runs_handler))
-        .route("/net-worth", get(net_worth_handler))
+        .route(
+            "/net-worth",
+            get(net_worth_handler).post(record_manual_net_worth_handler),
+        )
         .route("/secrets", post(secrets_handler))
         .route("/secrets/status", get(secrets_status_handler))
         .route("/secrets/{exchange}", delete(delete_secret_handler))
@@ -591,6 +594,60 @@ async fn net_worth_handler(
     let (bot_id, limit) = crate::db::net_worth_query_plan(params.bot_id.as_deref(), params.limit);
     let rows = store.list_net_worth(bot_id.as_deref(), limit).await?;
     Ok(Json(rows))
+}
+
+/// POST /net-worth — record ONE hand-entered net-worth snapshot
+/// (`source='manual'`). This is how balances without a watcher node of their
+/// own (prop payout accounts, a bank balance, a hardware-wallet total) get into
+/// the series until their own read-only node exists. Validation (finite value,
+/// non-empty account_id) precedes the store check, so a bad body is a 400 with
+/// or without a database. The write is AWAITED (like /transfers) — success
+/// means the row persisted. Records a reading only; can never move funds.
+#[cfg(feature = "db")]
+async fn record_manual_net_worth_handler(
+    State(state): State<AppState>,
+    Json(req): Json<NetWorthManualRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let snap = match crate::net_worth::validate_manual_snapshot(&req) {
+        Ok(s) => s,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        // No Postgres configured — can't persist. Tell the caller honestly
+        // instead of pretending the snapshot was recorded.
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "manual net-worth snapshots require the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    store.record_net_worth(&snap).await?;
+    info!(
+        account_id = %snap.bot_id,
+        currency = %snap.currency,
+        source = %snap.source,
+        "manual net-worth snapshot recorded"
+    );
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "ok": true,
+            "account_id": snap.bot_id,
+            "net_worth": snap.net_worth,
+            "currency": snap.currency,
+            "source": snap.source,
+        })),
+    ))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -34,7 +34,7 @@
 // behind the `db` feature alongside the rest of the persistence layer.
 // =============================================================================
 
-use crate::models::ContainerInfo;
+use crate::models::{ContainerInfo, NetWorthManualRequest};
 
 /// Default sampling cadence in seconds when NET_WORTH_SAMPLE_INTERVAL_SECS is
 /// unset. Coarse on purpose: this is a years-horizon backbone, not a live tick.
@@ -73,8 +73,15 @@ pub struct NetWorthReading {
 
 /// One row destined for `net_worth_snapshots`. `ts` is intentionally omitted —
 /// the table defaults it to `NOW()` so the DB clock is authoritative.
+///
+/// The `bot_id` column doubles as the ACCOUNT id: for bot-status rows it is the
+/// `fks.bot_id` label, and for the read-only treasury nodes (onchain / rithmic /
+/// manual) it is the logical account id (e.g. `btc-cold`, `rithmic:ACCT1`). The
+/// `source` column disambiguates who wrote the row (see the `SOURCE_*`
+/// constants); it defaults to `bot_status` in the table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetWorthSnapshot {
+    /// Account id (stored in the `bot_id` column — see the struct doc).
     pub bot_id: String,
     pub net_worth: f64,
     pub currency: String,
@@ -83,12 +90,20 @@ pub struct NetWorthSnapshot {
     pub source: String,
 }
 
-/// The `source` value the sampler stamps on every row it writes.
+/// `source` values for `net_worth_snapshots`. `bot_status` is the periodic
+/// sampler polling a bot's `/status`; the P0.6 read-only treasury nodes each
+/// stamp their own so a row's provenance is never ambiguous:
+///   - `onchain`  — the cold-BTC watcher (derived xpub / explicit addresses)
+///   - `rithmic`  — the Rithmic account-balance sampler
+///   - `manual`   — a hand-entered snapshot (POST /net-worth)
 pub const SOURCE_BOT_STATUS: &str = "bot_status";
+pub const SOURCE_ONCHAIN: &str = "onchain";
+pub const SOURCE_RITHMIC: &str = "rithmic";
+pub const SOURCE_MANUAL: &str = "manual";
 
 impl NetWorthSnapshot {
     /// Build a snapshot row for `bot_id` from a parsed `/status` reading,
-    /// tagging it as sampler-sourced.
+    /// tagging it as sampler-sourced (`source = bot_status`).
     pub fn from_reading(bot_id: impl Into<String>, reading: NetWorthReading) -> Self {
         Self {
             bot_id: bot_id.into(),
@@ -98,6 +113,72 @@ impl NetWorthSnapshot {
             source: SOURCE_BOT_STATUS.to_string(),
         }
     }
+
+    /// Build a snapshot row for an arbitrary account + writer `source`. This is
+    /// the constructor the read-only treasury nodes (onchain / rithmic / manual)
+    /// use: `account_id` lands in the `bot_id` column, and `source` records who
+    /// wrote it. No I/O and no privilege — building a row can only ever RECORD a
+    /// net-worth reading, never move funds.
+    pub fn for_account(
+        account_id: impl Into<String>,
+        net_worth: f64,
+        currency: impl Into<String>,
+        venue: Option<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            bot_id: account_id.into(),
+            net_worth,
+            currency: currency.into(),
+            venue,
+            source: source.into(),
+        }
+    }
+}
+
+/// Generous-but-bounded cap on the manual snapshot's account_id, mirroring the
+/// treasury registry's identifier cap.
+const MAX_ACCOUNT_ID_LEN: usize = 128;
+
+/// Validate + normalise a `POST /net-worth` (manual) submission into a
+/// [`NetWorthSnapshot`] tagged `source = manual`. Pure so the request shaping is
+/// unit-testable without a database. Errors are operator-facing 400 messages.
+pub fn validate_manual_snapshot(req: &NetWorthManualRequest) -> Result<NetWorthSnapshot, String> {
+    let account_id = req.account_id.trim();
+    if account_id.is_empty() {
+        return Err("account_id is required".to_string());
+    }
+    if account_id.len() > MAX_ACCOUNT_ID_LEN {
+        return Err(format!(
+            "account_id too long (max {MAX_ACCOUNT_ID_LEN} chars)"
+        ));
+    }
+
+    // Serde already rejects JSON NaN/Infinity, but keep the guard so a row can
+    // never carry a non-finite value.
+    if !req.net_worth.is_finite() {
+        return Err("net_worth must be a finite number".to_string());
+    }
+
+    let currency = req.currency.trim().to_uppercase();
+    if currency.is_empty() || currency.len() > 16 {
+        return Err("currency must be 1-16 chars".to_string());
+    }
+
+    let venue = req
+        .venue
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(NetWorthSnapshot::for_account(
+        account_id,
+        req.net_worth,
+        currency,
+        venue,
+        SOURCE_MANUAL,
+    ))
 }
 
 /// Coerce a JSON value to `f64`, accepting either a JSON number or a numeric
@@ -410,6 +491,24 @@ mod tests {
         assert_eq!(snap.source, SOURCE_BOT_STATUS);
     }
 
+    #[test]
+    fn for_account_sets_account_id_and_source() {
+        // The treasury-node constructor: account_id → bot_id column, explicit
+        // source/venue/currency preserved.
+        let snap = NetWorthSnapshot::for_account(
+            "btc-cold",
+            123_456.78,
+            "USD",
+            Some("cold-btc".to_string()),
+            SOURCE_ONCHAIN,
+        );
+        assert_eq!(snap.bot_id, "btc-cold");
+        assert_eq!(snap.net_worth, 123_456.78);
+        assert_eq!(snap.currency, "USD");
+        assert_eq!(snap.venue.as_deref(), Some("cold-btc"));
+        assert_eq!(snap.source, "onchain");
+    }
+
     // ── status url ───────────────────────────────────────────────────────────
 
     #[test]
@@ -421,6 +520,58 @@ mod tests {
     }
 
     // ── target filtering ─────────────────────────────────────────────────────
+
+    // ── manual snapshot validation ───────────────────────────────────────────
+
+    fn manual_req(json: &str) -> NetWorthManualRequest {
+        serde_json::from_str(json).expect("valid NetWorthManualRequest JSON")
+    }
+
+    #[test]
+    fn manual_snapshot_minimal_validates_with_defaults() {
+        let req = manual_req(r#"{"account_id":"  apex-payout ","net_worth":48250.5}"#);
+        let snap = validate_manual_snapshot(&req).expect("valid");
+        assert_eq!(snap.bot_id, "apex-payout", "account_id trimmed");
+        assert_eq!(snap.net_worth, 48250.5);
+        assert_eq!(snap.currency, "USD", "currency defaults to USD");
+        assert!(snap.venue.is_none());
+        assert_eq!(snap.source, SOURCE_MANUAL);
+    }
+
+    #[test]
+    fn manual_snapshot_normalises_currency_and_venue() {
+        let req = manual_req(
+            r#"{"account_id":"bank","net_worth":1000.0,"currency":"cad","venue":"  chase  "}"#,
+        );
+        let snap = validate_manual_snapshot(&req).expect("valid");
+        assert_eq!(snap.currency, "CAD");
+        assert_eq!(snap.venue.as_deref(), Some("chase"));
+    }
+
+    #[test]
+    fn manual_snapshot_rejects_blank_id_and_non_finite() {
+        let blank = manual_req(r#"{"account_id":"   ","net_worth":10.0}"#);
+        assert!(validate_manual_snapshot(&blank).is_err());
+
+        let mut nan = manual_req(r#"{"account_id":"a","net_worth":1.0}"#);
+        nan.net_worth = f64::NAN;
+        assert!(validate_manual_snapshot(&nan).is_err());
+        nan.net_worth = f64::INFINITY;
+        assert!(validate_manual_snapshot(&nan).is_err());
+    }
+
+    #[test]
+    fn manual_snapshot_allows_negative_and_zero_values() {
+        // Unlike a transfer, a net-worth snapshot may legitimately be zero (an
+        // emptied account) or negative (a margin/debt balance).
+        assert!(
+            validate_manual_snapshot(&manual_req(r#"{"account_id":"a","net_worth":0.0}"#)).is_ok()
+        );
+        assert!(
+            validate_manual_snapshot(&manual_req(r#"{"account_id":"a","net_worth":-500.0}"#))
+                .is_ok()
+        );
+    }
 
     #[test]
     fn running_targets_skips_non_running_and_incomplete() {

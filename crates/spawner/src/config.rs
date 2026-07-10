@@ -7,6 +7,9 @@
 
 use std::env;
 
+use crate::btc_watch::BtcWatchConfig;
+use crate::rithmic_sampler::RithmicSamplerConfig;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Address to bind the HTTP server on.
@@ -75,6 +78,15 @@ pub struct Config {
     /// channels configured it is a cheap no-op regardless; set
     /// `NOTIFY_ENABLED=false` to hard-disable the sender. Env: NOTIFY_ENABLED.
     pub notify_enabled: bool,
+
+    /// Cold-BTC on-chain watcher (read-only, source='onchain'). OFF unless
+    /// BTC_WATCH_XPUB and/or BTC_WATCH_ADDRESSES is configured. See
+    /// `crate::btc_watch`.
+    pub btc_watch: BtcWatchConfig,
+
+    /// Rithmic account-balance sampler (read-only, source='rithmic'). OFF unless
+    /// RITHMIC_SAMPLER_URL is set. See `crate::rithmic_sampler`.
+    pub rithmic_sampler: RithmicSamplerConfig,
 }
 
 impl Config {
@@ -107,6 +119,8 @@ impl Config {
                 .unwrap_or_default(),
             internal_token: env::var("NGINX_INTERNAL_TOKEN").unwrap_or_default(),
             notify_enabled: env_parse_bool("NOTIFY_ENABLED", true),
+            btc_watch: BtcWatchConfig::from_env(),
+            rithmic_sampler: RithmicSamplerConfig::from_env(),
         }
     }
 
@@ -173,6 +187,8 @@ mod tests {
             database_url: String::new(),
             internal_token: String::new(),
             notify_enabled: true,
+            btc_watch: BtcWatchConfig::default(),
+            rithmic_sampler: RithmicSamplerConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8090");
         assert!(
@@ -203,6 +219,8 @@ mod tests {
             database_url: String::new(),
             internal_token: String::new(),
             notify_enabled: true,
+            btc_watch: BtcWatchConfig::default(),
+            rithmic_sampler: RithmicSamplerConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");
     }
