@@ -213,6 +213,8 @@ fn test_config(internal_token: &str) -> Config {
         database_url: String::new(),
         internal_token: internal_token.to_string(),
         notify_enabled: true,
+        btc_watch: spawner::btc_watch::BtcWatchConfig::default(),
+        rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
     }
 }
 
@@ -511,6 +513,80 @@ async fn net_worth_degrades_gracefully_without_db() {
     assert_eq!(resp.status(), StatusCode::OK);
     let payload = body_string(resp).await;
     assert_eq!(payload, "[]", "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn manual_net_worth_post_without_db_returns_503() {
+    // A well-formed manual snapshot with no DB configured must report an honest
+    // 503 (storage unavailable), not a fake success — like /transfers, a
+    // silently dropped snapshot would corrupt the net-worth series.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "account_id": "apex-payout",
+        "net_worth": 48250.5,
+        "venue": "apex"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/net-worth")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn manual_net_worth_post_rejects_blank_account_id() {
+    // Validation runs before the store check: a blank account_id is a 400
+    // regardless of DB availability.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({ "account_id": "   ", "net_worth": 100.0 }).to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/net-worth")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn manual_net_worth_post_is_token_gated() {
+    // With a configured token, POST /net-worth rejects an unauthenticated
+    // request (401) before touching validation/store — same gate as the rest.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    let body = serde_json::json!({ "account_id": "apex", "net_worth": 1.0 }).to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/net-worth")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
