@@ -79,8 +79,18 @@ pub struct Config {
     /// `proxy_set_header X-Internal-Token "${NGINX_INTERNAL_TOKEN}"`.
     /// When this is non-empty, all routes except `/health` and `/metrics`
     /// reject requests that don't carry the matching header value.
-    /// Empty = no auth (dev mode).
+    /// Empty = no auth (dev mode); the disabled posture is logged loudly at
+    /// startup (see `crate::auth::check_internal_auth_posture`) so a
+    /// misconfigured prod box can never fail open silently.
     pub internal_token: String,
+
+    /// Hardened posture: when `true`, an empty `internal_token` is a fatal
+    /// misconfiguration — the spawner refuses to boot rather than serving the
+    /// money-adjacent routes unauthenticated. Default `false` (dev passthrough
+    /// with a loud warning). Env: REQUIRE_INTERNAL_TOKEN. Set this in any
+    /// deployment where the spawner port could be reachable without the nginx
+    /// hop that injects `X-Internal-Token`.
+    pub require_internal_auth: bool,
 
     /// Whether bot-lifecycle events are dispatched to configured notification
     /// channels (Discord webhooks). Opt-out: defaults to `true`. With zero
@@ -128,6 +138,7 @@ impl Config {
                 .unwrap_or_default(),
             backtest_database_url: env::var("BACKTEST_DB_URL").unwrap_or_default(),
             internal_token: env::var("NGINX_INTERNAL_TOKEN").unwrap_or_default(),
+            require_internal_auth: env_parse_bool("REQUIRE_INTERNAL_TOKEN", false),
             notify_enabled: env_parse_bool("NOTIFY_ENABLED", true),
             btc_watch: BtcWatchConfig::from_env(),
             rithmic_sampler: RithmicSamplerConfig::from_env(),
@@ -197,6 +208,7 @@ mod tests {
             database_url: String::new(),
             backtest_database_url: String::new(),
             internal_token: String::new(),
+            require_internal_auth: false,
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
@@ -230,6 +242,7 @@ mod tests {
             database_url: String::new(),
             backtest_database_url: String::new(),
             internal_token: String::new(),
+            require_internal_auth: false,
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),

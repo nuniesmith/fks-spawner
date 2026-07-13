@@ -220,6 +220,7 @@ fn test_config(internal_token: &str) -> Config {
         database_url: String::new(),
         backtest_database_url: String::new(),
         internal_token: internal_token.to_string(),
+        require_internal_auth: false,
         notify_enabled: true,
         btc_watch: spawner::btc_watch::BtcWatchConfig::default(),
         rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
