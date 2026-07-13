@@ -28,6 +28,11 @@
 //   ESPLORA_API_BASE          Esplora API base for balances (default: https://blockstream.info/api)
 //   RITHMIC_SAMPLER_URL       rithmic-connector base URL for the balance sampler (read-only; off unless set)
 //   RITHMIC_SAMPLE_INTERVAL_SECS  seconds between rithmic balance samples (default: 300; DB only)
+//   EDGE_DECAY_ENABLED        weekly edge-backtest scheduler on/off (default: false; DB only)
+//   EDGE_DECAY_INTERVAL_SECS  fixed-interval override for the scheduler (unset = weekly wall-clock)
+//   EDGE_DECAY_WEEKDAY        weekly fire weekday, days-from-Sunday 0..=6 (default: 0 = Sun)
+//   EDGE_DECAY_HOUR_UTC       weekly fire hour, UTC 0..=23 (default: 16 = 12:00 EDT, before Sun 18:00 ET report)
+//   EDGE_DECAY_MINUTE_UTC     weekly fire minute, UTC 0..=59 (default: 0)
 //   RUST_LOG                  log level (default: info,spawner=debug)
 // =============================================================================
 
@@ -210,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
         info!("rithmic balance sampler disabled (set RITHMIC_SAMPLER_URL to enable)");
     }
 
-    // ── HTTP server ───────────────────────────────────────────────────────────
+    // ── Shared handler state ───────────────────────────────────────────────────
     #[cfg(feature = "db")]
     let state = AppState {
         docker,
@@ -222,6 +227,40 @@ async fn main() -> anyhow::Result<()> {
         docker,
         config: config.clone(),
     };
+
+    // ── Background: weekly edge-backtest scheduler (EDGE-DECAY DETECTION) ────────
+    // On a weekly cadence (default Sun 16:00 UTC — before the advisor's Sun
+    // 18:00 ET report) it fires each ACTIVE, containerized edge's backtest
+    // through the SAME internal trigger path POST /edges/{id}/backtest uses, so
+    // the advisor always has a fresh run to diff against last week's. DB-only
+    // (it reads the edge registry + writes the run ledger) and OFF unless
+    // EDGE_DECAY_ENABLED=true. Respects the concurrent-bot cap. See
+    // crate::edge_decay.
+    #[cfg(feature = "db")]
+    if config.edge_decay.enabled() {
+        if state.store.is_some() {
+            let sched_state = state.clone();
+            let sched_config = config.edge_decay.clone();
+            tokio::spawn(async move {
+                spawner::edge_decay::run_scheduler(sched_state, sched_config).await;
+            });
+            info!(
+                weekday_sun0 = config.edge_decay.weekday_sun0,
+                hour_utc = config.edge_decay.hour_utc,
+                minute_utc = config.edge_decay.minute_utc,
+                interval_secs = ?config.edge_decay.interval_secs,
+                "edge-decay scheduler ENABLED"
+            );
+        } else {
+            info!(
+                "edge-decay scheduler enabled but DB is disabled — not starting (nothing to fire)"
+            );
+        }
+    } else {
+        info!("edge-decay scheduler disabled (set EDGE_DECAY_ENABLED=true to enable)");
+    }
+
+    // ── HTTP server ───────────────────────────────────────────────────────────
     let app = build_router(state);
     let bind_addr = config.bind_addr();
 
