@@ -8,6 +8,7 @@
 use std::env;
 
 use crate::btc_watch::BtcWatchConfig;
+use crate::edge_decay::EdgeDecayConfig;
 use crate::rithmic_sampler::RithmicSamplerConfig;
 
 #[derive(Debug, Clone)]
@@ -106,6 +107,12 @@ pub struct Config {
     /// Rithmic account-balance sampler (read-only, source='rithmic'). OFF unless
     /// RITHMIC_SAMPLER_URL is set. See `crate::rithmic_sampler`.
     pub rithmic_sampler: RithmicSamplerConfig,
+
+    /// Weekly edge-backtest scheduler (EDGE-DECAY DETECTION). OFF unless
+    /// EDGE_DECAY_ENABLED=true; fires each active containerized edge's backtest
+    /// on a weekly cadence so the advisor's Sunday report has a fresh point to
+    /// compare. See `crate::edge_decay`.
+    pub edge_decay: EdgeDecayConfig,
 }
 
 impl Config {
@@ -142,6 +149,7 @@ impl Config {
             notify_enabled: env_parse_bool("NOTIFY_ENABLED", true),
             btc_watch: BtcWatchConfig::from_env(),
             rithmic_sampler: RithmicSamplerConfig::from_env(),
+            edge_decay: EdgeDecayConfig::from_env(),
         }
     }
 
@@ -212,6 +220,7 @@ mod tests {
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
+            edge_decay: EdgeDecayConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8090");
         assert!(
@@ -246,6 +255,7 @@ mod tests {
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
+            edge_decay: EdgeDecayConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");
     }

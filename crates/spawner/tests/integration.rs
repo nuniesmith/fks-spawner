@@ -224,6 +224,7 @@ fn test_config(internal_token: &str) -> Config {
         notify_enabled: true,
         btc_watch: spawner::btc_watch::BtcWatchConfig::default(),
         rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
+        edge_decay: spawner::edge_decay::EdgeDecayConfig::default(),
     }
 }
 

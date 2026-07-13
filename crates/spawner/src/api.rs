@@ -1607,9 +1607,7 @@ async fn run_edge_backtest_handler(
     Path(id): Path<String>,
     Json(req): Json<BacktestRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
-    let t = Instant::now();
-
-    // Validation precedes the store check (400 with or without a DB).
+    // Validation precedes the trigger core (400 with or without a DB).
     let edge_id = match validate_edge_id(&id) {
         Ok(id) => id,
         Err(error) => {
@@ -1629,6 +1627,96 @@ async fn run_edge_backtest_handler(
         }
     };
 
+    // The heavy lifting — cap pre-check, registry lookup, ledger row, spawn,
+    // bookkeeping — lives in the shared trigger core so the weekly edge-decay
+    // scheduler fires through the EXACT same path (crate::edge_decay). The
+    // handler only maps the outcome back onto HTTP status codes.
+    match trigger_edge_backtest(&state, &edge_id, &params).await? {
+        BacktestTrigger::Spawned { run_id, resp } => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "ok": true,
+                "run_id": run_id,
+                "container_id": resp.container_id,
+                "bot_id": resp.bot_id,
+                "edge_id": edge_id,
+                "image": resp.image,
+            })),
+        )),
+        // Cap reached: 429, same as before this was inside docker.spawn.
+        BacktestTrigger::CapReached { running } => Err(SpawnerError::TooManyBots(running)),
+        BacktestTrigger::NoDb => Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "edge backtests require the spawner Postgres DB",
+            })),
+        )),
+        BacktestTrigger::UnknownEdge => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("unknown edge '{edge_id}' — register it via POST /edges first"),
+            })),
+        )),
+        BacktestTrigger::NotContainerized => Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "edge '{edge_id}' has no backtest_image — its backtest isn't \
+                     containerized yet (set one via POST /edges)"
+                ),
+            })),
+        )),
+    }
+}
+
+/// Outcome of the shared internal backtest-trigger path
+/// ([`trigger_edge_backtest`]). The HTTP handler maps these onto status codes;
+/// the weekly edge-decay scheduler logs them. `edge_id`/`params` are assumed
+/// PRE-VALIDATED (both callers validate — the registry ids the scheduler
+/// passes were validated at registration).
+#[cfg(feature = "db")]
+pub(crate) enum BacktestTrigger {
+    /// A backtest container was spawned (HTTP 202). Carries the run id + the
+    /// spawn response so the handler can echo the container/bot ids.
+    Spawned {
+        run_id: i64,
+        resp: crate::models::SpawnResponse,
+    },
+    /// The concurrency cap was reached before any ledger write (HTTP 429). The
+    /// spawn-error metric + warn were already emitted.
+    CapReached { running: usize },
+    /// No Postgres store is configured (HTTP 503) — no registry, no ledger.
+    NoDb,
+    /// The edge id is not in the registry (HTTP 400).
+    UnknownEdge,
+    /// The edge has no `backtest_image` — not containerized yet (HTTP 400).
+    NotContainerized,
+}
+
+/// The shared internal backtest-trigger path used by BOTH
+/// `POST /edges/{id}/backtest` and the weekly edge-decay scheduler
+/// (crate::edge_decay). It: pre-checks the concurrency cap (so a cap-refused
+/// fire never opens a ledger row), resolves the edge's registered image (400
+/// if unknown / not containerized), opens the `backtest_runs` row, then spawns
+/// the one-shot backtest container through the EXACT same `DockerOps::spawn`
+/// path `POST /spawn` uses — every guard (fks-bot- prefix, bot cap, forced
+/// network, cap_drop ALL, no-new-privileges) applies unchanged. On a spawn
+/// failure it closes the freshly-opened row 'failed' (awaited) so the ledger
+/// never carries a phantom 'running' row, then returns the error. Bookkeeping
+/// (container-id stamp, bot_runs history, notify, Prometheus SD) is detached
+/// and best-effort, identical to the old handler.
+#[cfg(feature = "db")]
+pub(crate) async fn trigger_edge_backtest(
+    state: &AppState,
+    edge_id: &str,
+    params: &serde_json::Value,
+) -> Result<BacktestTrigger, SpawnerError> {
+    let t = Instant::now();
+
     // Concurrency-cap PRE-CHECK, before any DB write: the spawn path
     // re-checks authoritatively (a racing spawn still loses there), but
     // refusing here keeps a cap-refused request from opening a
@@ -1647,51 +1735,27 @@ async fn run_edge_backtest_handler(
             max = state.config.max_concurrent_bots,
             "backtest refused before ledger insert — concurrent bot cap reached"
         );
-        return Err(SpawnerError::TooManyBots(running));
+        return Ok(BacktestTrigger::CapReached { running });
     }
 
     let Some(store) = state.store.clone() else {
         // No Postgres — there is no registry to look the edge up in and no
-        // ledger for the run. Honest 503, never a blind spawn.
-        return Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "db_enabled": false,
-                "error": "edge backtests require the spawner Postgres DB",
-            })),
-        ));
+        // ledger for the run. Honest failure, never a blind spawn.
+        return Ok(BacktestTrigger::NoDb);
     };
 
-    // Look up the edge's backtest image (400 if unknown / not containerized).
-    let Some(edge) = store.get_edge(&edge_id).await? else {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("unknown edge '{edge_id}' — register it via POST /edges first"),
-            })),
-        ));
+    // Look up the edge's backtest image (unknown / not containerized).
+    let Some(edge) = store.get_edge(edge_id).await? else {
+        return Ok(BacktestTrigger::UnknownEdge);
     };
     let image = match edge.backtest_image.as_deref().map(str::trim) {
         Some(image) if !image.is_empty() => image.to_string(),
-        _ => {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!(
-                        "edge '{edge_id}' has no backtest_image — its backtest isn't \
-                         containerized yet (set one via POST /edges)"
-                    ),
-                })),
-            ));
-        }
+        _ => return Ok(BacktestTrigger::NotContainerized),
     };
 
     // Open the run row FIRST (awaited): the container that will update it
     // must find it existing, and its id is the container's BACKTEST_RUN_ID.
-    let run_id = store.insert_backtest_run(&edge_id, &params).await?;
+    let run_id = store.insert_backtest_run(edge_id, params).await?;
 
     // The container's BACKTEST_DB_URL: prefer the dedicated low-privilege
     // fks_backtest URL (env BACKTEST_DB_URL); fall back to the spawner's own
@@ -1716,7 +1780,7 @@ async fn run_edge_backtest_handler(
     // Spawn through the exact same DockerOps path as POST /spawn — every
     // guard (fks-bot- prefix, bot cap, forced network, cap_drop ALL,
     // no-new-privileges) applies unchanged.
-    let spawn_req = build_backtest_spawn_request(&edge_id, run_id, &image, &params, db_url);
+    let spawn_req = build_backtest_spawn_request(edge_id, run_id, &image, params, db_url);
     let image_prefix = image.split(':').next().unwrap_or(&image).to_string();
     let resp = match state.docker.spawn(spawn_req).await {
         Ok(resp) => resp,
@@ -1730,9 +1794,9 @@ async fn run_edge_backtest_handler(
                 warn!(error = %db_e, run_id, "failed to close backtest run after spawn error");
             }
             spawn_dispatch(
-                &state,
+                state,
                 NotificationEvent::error(
-                    &backtest_bot_id(&edge_id, run_id),
+                    &backtest_bot_id(edge_id, run_id),
                     &image,
                     "backtest",
                     &e.to_string(),
@@ -1788,7 +1852,7 @@ async fn run_edge_backtest_handler(
             }
         });
     }
-    spawn_dispatch(&state, NotificationEvent::spawned(&resp));
+    spawn_dispatch(state, NotificationEvent::spawned(&resp));
     {
         let docker = state.docker.clone();
         let config = state.config.clone();
@@ -1797,17 +1861,7 @@ async fn run_edge_backtest_handler(
         });
     }
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "ok": true,
-            "run_id": run_id,
-            "container_id": resp.container_id,
-            "bot_id": resp.bot_id,
-            "edge_id": edge_id,
-            "image": resp.image,
-        })),
-    ))
+    Ok(BacktestTrigger::Spawned { run_id, resp })
 }
 
 async fn logs_sse_handler(
