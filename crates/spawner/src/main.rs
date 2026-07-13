@@ -8,7 +8,10 @@
 //   SPAWNER_HOST              bind address (default: 0.0.0.0)
 //   SPAWNER_PORT              bind port    (default: 8090)
 //   ALLOWED_IMAGE_PREFIX      image whitelist prefix (default: fks-bot-)
-//   MAX_CONCURRENT_BOTS       hard cap on running bots (default: 20)
+//   MAX_CONCURRENT_BOTS       hard cap on RUNNING bots (default: 20; exited containers don't count)
+//   BACKTEST_DB_URL           scoped low-privilege Postgres URL handed to backtest containers
+//                             (fks_backtest role); unset = fall back to the spawner's own
+//                             database_url with a loud per-run warning (DB only)
 //   ALLOWED_NETWORK           Docker network for spawned containers (default: fks_network)
 //   DEFAULT_CPU_LIMIT         fractional cores (default: 1.0)
 //   DEFAULT_MEMORY_LIMIT_MB   memory cap in MiB (default: 512)
@@ -78,6 +81,18 @@ async fn main() -> anyhow::Result<()> {
         }
         s
     };
+
+    // Surface the degraded backtest-credentials posture at boot, not just per
+    // run: without BACKTEST_DB_URL every backtest container is handed the
+    // spawner's own full-privilege fks_user URL (see api.rs, edges.rs).
+    #[cfg(feature = "db")]
+    if store.is_some() && config.backtest_database_url.trim().is_empty() {
+        tracing::warn!(
+            "BACKTEST_DB_URL not set — backtest containers will receive the spawner's OWN \
+             full-privilege Postgres credentials (can read exchange_secrets); set it to the \
+             scoped fks_backtest role URL"
+        );
+    }
 
     // ── Initial SD file write ──────────────────────────────────────────────────
     prometheus_sd::update_sd_file(docker.as_ref(), &config).await;

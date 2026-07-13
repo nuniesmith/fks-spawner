@@ -125,6 +125,19 @@ fn validate_identifier(value: &str, field: &str, max_len: usize) -> SpawnerResul
     Ok(())
 }
 
+/// Count the containers that occupy a slot under `MAX_CONCURRENT_BOTS`: only
+/// RUNNING ones. Exited/dead one-shot containers (finished backtests waiting
+/// for auto_prune) must NOT hold cap slots — counting them let a burst of
+/// completed `bt-*` containers wedge every subsequent spawn until the prune
+/// sweep caught up. The cap is documented as a bound on *simultaneously
+/// running* bots (config.rs, CLAUDE.md); this is the single definition of
+/// "running" the cap uses, shared by [`DockerClient::spawn`] and the
+/// pre-insert cap check in `api::run_edge_backtest_handler`. Kept pure so
+/// it's unit-tested without a Docker daemon.
+pub fn count_running_bots(bots: &[ContainerInfo]) -> usize {
+    bots.iter().filter(|b| b.state == "running").count()
+}
+
 /// Validate the operator-controlled fields of a spawn request before any Docker
 /// call: identifier charset (`bot_id`/`mode`), resource-limit bounds, and
 /// env/label cardinality. The image-prefix + concurrency guards stay in
@@ -191,7 +204,10 @@ impl DockerClient {
         validate_spawn_request(&req, self.config.max_cpu_limit, self.config.max_memory_mb)?;
 
         // ── Safety guard: concurrent bot cap ──────────────────────────────────
-        let running = self.list_bots().await?.len();
+        // Only RUNNING containers occupy slots (list_bots returns ALL states,
+        // including exited one-shot backtests awaiting auto_prune — see
+        // count_running_bots).
+        let running = count_running_bots(&self.list_bots().await?);
         if running >= self.config.max_concurrent_bots {
             return Err(SpawnerError::TooManyBots(running));
         }
@@ -797,9 +813,54 @@ fn stats_from_response(r: bollard::models::ContainerStatsResponse) -> ContainerS
 #[cfg(test)]
 mod tests {
     use super::{
-        SpawnRequest, SpawnerError, build_bot_host_config, compute_cpu_percent, mem_used_bytes,
-        validate_spawn_request,
+        ContainerInfo, SpawnRequest, SpawnerError, build_bot_host_config, compute_cpu_percent,
+        count_running_bots, mem_used_bytes, validate_spawn_request,
     };
+
+    /// Minimal ContainerInfo in the given Docker state, for cap-count tests.
+    fn bot_in_state(state: &str) -> ContainerInfo {
+        ContainerInfo {
+            id: "abc123def456".to_string(),
+            id_full: "abc123def456".to_string(),
+            name: "fks-bot-x".to_string(),
+            image: "fks-bot-example:latest".to_string(),
+            status: String::new(),
+            state: state.to_string(),
+            bot_id: "x".to_string(),
+            mode: "paper".to_string(),
+            created_at: None,
+            started_at: None,
+            finished_at: None,
+            labels: std::collections::HashMap::new(),
+            cpu_percent: None,
+            memory_bytes: None,
+            memory_limit_bytes: None,
+        }
+    }
+
+    #[test]
+    fn cap_count_ignores_exited_and_dead_containers() {
+        // The MAX_CONCURRENT_BOTS regression: list_bots(.all(true)) returns
+        // exited one-shot backtest containers too, and counting them let
+        // finished bt-* runs wedge every spawn until auto_prune caught up.
+        // Only "running" occupies a slot.
+        let bots: Vec<ContainerInfo> = ["running", "exited", "exited", "dead", "created", "paused"]
+            .iter()
+            .map(|s| bot_in_state(s))
+            .collect();
+        assert_eq!(count_running_bots(&bots), 1);
+    }
+
+    #[test]
+    fn cap_count_all_running_counts_all() {
+        let bots: Vec<ContainerInfo> = (0..3).map(|_| bot_in_state("running")).collect();
+        assert_eq!(count_running_bots(&bots), 3);
+    }
+
+    #[test]
+    fn cap_count_empty_is_zero() {
+        assert_eq!(count_running_bots(&[]), 0);
+    }
 
     #[test]
     fn cpu_percent_basic_delta() {

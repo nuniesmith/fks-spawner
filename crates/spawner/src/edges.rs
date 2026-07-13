@@ -19,10 +19,17 @@
 //   BACKTEST_RUN_ID   — its backtest_runs row id
 //   BACKTEST_EDGE_ID  — the edge it is validating
 //   BACKTEST_PARAMS   — the request's params object as a JSON string
-//   BACKTEST_DB_URL   — the spawner's own Postgres URL (same ruby_db; the
-//                       container is on fks_network so `postgres:5432`
-//                       resolves), with which the container UPDATEs ITS OWN
-//                       row: status completed|failed + results + finished_at
+//   BACKTEST_DB_URL   — a Postgres URL for the SAME ruby_db (the container is
+//                       on fks_network so `postgres:5432` resolves), with
+//                       which the container UPDATEs ITS OWN row: status
+//                       completed|failed + results + finished_at. The spawner
+//                       prefers its own BACKTEST_DB_URL env var here — a
+//                       scoped, low-privilege fks_backtest role — and only
+//                       falls back to its own full-privilege database_url
+//                       (with a loud per-run warning) when that var is unset,
+//                       so a compromised backtest image can't read
+//                       exchange_secrets or rewrite the treasury ledger. See
+//                       [`resolve_backtest_db_url`].
 //
 // One-shot: the container exits when done (no restart policy is set on
 // spawned bots). A container that dies without reporting leaves its row
@@ -187,6 +194,26 @@ pub fn validate_backtest_params(
 /// The bot_id (and thus `fks-bot-` container-name suffix) of one backtest run.
 pub fn backtest_bot_id(edge_id: &str, run_id: i64) -> String {
     format!("bt-{edge_id}-{run_id}")
+}
+
+/// Pick the Postgres URL that rides into a backtest container as
+/// BACKTEST_DB_URL. Prefers the dedicated `Config::backtest_database_url`
+/// (env BACKTEST_DB_URL — a scoped fks_backtest role that can only report
+/// results); falls back to the spawner's own full-privilege `database_url`
+/// when unset so existing deploys keep working. Returns `(url, degraded)` —
+/// the caller MUST warn loudly when `degraded` is true (the fallback hands
+/// the container credentials that can read exchange_secrets and rewrite the
+/// treasury ledger).
+pub fn resolve_backtest_db_url<'a>(
+    backtest_database_url: &'a str,
+    spawner_database_url: &'a str,
+) -> (&'a str, bool) {
+    let dedicated = backtest_database_url.trim();
+    if dedicated.is_empty() {
+        (spawner_database_url, true)
+    } else {
+        (dedicated, false)
+    }
 }
 
 /// Build the [`SpawnRequest`] for one backtest run. This deliberately goes
@@ -392,6 +419,37 @@ mod tests {
         );
         assert!(req.secrets.is_empty(), "backtests get no exchange keys");
         assert!(req.cmd.is_none() && req.entrypoint.is_none());
+    }
+
+    // ── backtest DB-URL resolution ───────────────────────────────────────────
+
+    #[test]
+    fn backtest_db_url_prefers_the_dedicated_low_privilege_role() {
+        let (url, degraded) = resolve_backtest_db_url(
+            "postgres://fks_backtest:pw@postgres:5432/ruby_db",
+            "postgres://fks_user:pw@postgres:5432/ruby_db",
+        );
+        assert_eq!(url, "postgres://fks_backtest:pw@postgres:5432/ruby_db");
+        assert!(!degraded, "dedicated URL is the healthy path");
+    }
+
+    #[test]
+    fn backtest_db_url_falls_back_degraded_when_unset() {
+        // Unset (or whitespace-only) BACKTEST_DB_URL keeps existing deploys
+        // functional — but flagged degraded so the caller warns loudly.
+        for unset in ["", "   "] {
+            let (url, degraded) =
+                resolve_backtest_db_url(unset, "postgres://fks_user:pw@postgres:5432/ruby_db");
+            assert_eq!(url, "postgres://fks_user:pw@postgres:5432/ruby_db");
+            assert!(degraded, "fallback to the spawner's own URL is degraded");
+        }
+    }
+
+    #[test]
+    fn backtest_db_url_trims_the_dedicated_value() {
+        let (url, degraded) = resolve_backtest_db_url("  postgres://fks_backtest@db/x  ", "own");
+        assert_eq!(url, "postgres://fks_backtest@db/x");
+        assert!(!degraded);
     }
 
     // ── backtests query plan ─────────────────────────────────────────────────

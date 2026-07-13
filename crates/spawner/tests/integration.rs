@@ -75,8 +75,15 @@ impl DockerOps for MockDockerClient {
         }
 
         let mut state = self.state.lock().expect("MockState mutex poisoned");
-        if state.containers.len() >= self.max_concurrent {
-            return Err(SpawnerError::TooManyBots(state.containers.len()));
+        // Mirror the real client's cap rule: only RUNNING containers occupy
+        // slots (exited one-shots awaiting prune must not wedge the cap).
+        let running = state
+            .containers
+            .values()
+            .filter(|c| c.state == "running")
+            .count();
+        if running >= self.max_concurrent {
+            return Err(SpawnerError::TooManyBots(running));
         }
 
         let bot_id = req.bot_id.unwrap_or_else(|| "test-id".to_string());
@@ -211,6 +218,7 @@ fn test_config(internal_token: &str) -> Config {
         prune_interval_secs: 60,
         net_worth_sample_interval_secs: 300,
         database_url: String::new(),
+        backtest_database_url: String::new(),
         internal_token: internal_token.to_string(),
         notify_enabled: true,
         btc_watch: spawner::btc_watch::BtcWatchConfig::default(),
@@ -403,6 +411,137 @@ async fn containers_listing_includes_live_stats() {
         payload.contains("\"memory_limit_bytes\":268435456"),
         "body: {payload}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Concurrency cap — only RUNNING containers occupy MAX_CONCURRENT_BOTS slots
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// JSON body for a minimal paper spawn of `bot_id`.
+fn spawn_body(bot_id: &str) -> String {
+    serde_json::json!({
+        "image": "fks-bot-example:latest",
+        "bot_id": bot_id,
+        "mode": "paper"
+    })
+    .to_string()
+}
+
+async fn post_spawn(app: &Router, bot_id: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::post("/spawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(spawn_body(bot_id)))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn spawn_cap_counts_only_running_containers() {
+    // The audit regression: the cap counted EXITED containers (list_bots uses
+    // .all(true)), so accumulated one-shot backtest containers wedged ALL
+    // spawns until auto_prune caught up. Exited containers must free their
+    // slot immediately.
+    let mut config = test_config("");
+    config.max_concurrent_bots = 1;
+    let (app, _) = build_app(config);
+
+    // Fill the single slot.
+    let resp = post_spawn(&app, "cap-a").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let a: SpawnResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    // Cap full → refused with 429.
+    let resp = post_spawn(&app, "cap-b").await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Stop the running bot (mock flips state → "exited"; the container still
+    // exists and still carries fks.bot=true, exactly like a finished one-shot
+    // backtest awaiting prune).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/container/{}/stop", a.container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The exited container must NOT hold the slot.
+    let resp = post_spawn(&app, "cap-b").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "an exited container must not occupy a cap slot"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn backtest_cap_precheck_fires_before_any_ledger_write() {
+    // POST /edges/{id}/backtest pre-checks the concurrency cap BEFORE it
+    // would open a backtest_runs row (finding: rows were inserted first, so
+    // cap-refused retries grew the ledger unbounded). With the cap full the
+    // handler must 429 before ever reaching the store gate (which would be a
+    // 503 here — no DB is configured, so reaching it proves no ledger write
+    // could have happened).
+    let mut config = test_config("");
+    config.max_concurrent_bots = 1;
+    let (app, _) = build_app(config);
+
+    // Fill the single slot with a running bot.
+    let resp = post_spawn(&app, "cap-hog").await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let hog: SpawnResponse = serde_json::from_str(&body_string(resp).await).unwrap();
+
+    // Cap full → 429 from the pre-check, NOT the store gate's 503.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post("/edges/funding-reversion/backtest")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "cap pre-check must refuse before any DB path is reached"
+    );
+
+    // Stop the hog (state → exited): the slot frees, and the SAME request now
+    // falls through to the store gate (503, stateless build) — proving both
+    // the running-only counting and the check ordering.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::post(format!("/container/{}/stop", hog.container_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .oneshot(
+            Request::post("/edges/funding-reversion/backtest")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
