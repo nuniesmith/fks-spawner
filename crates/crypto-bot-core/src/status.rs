@@ -184,10 +184,20 @@ impl StatusState {
         self.trades.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A completed round trip with its direction-signed return (fraction, not
-    /// %): updates W/L and converts to dollars via the paper notional.
-    pub fn record_round_trip(&self, ret_frac: f64) {
-        if ret_frac > 0.0 {
+    /// A completed round trip. `ret_frac` is the direction-signed **gross**
+    /// price return (fraction, not %) and drives the dollar conversion via the
+    /// paper notional. `net_pnl` — the trade's honest fees-included PnL (the
+    /// ledger's `net_pnl_usdt` = gross − fees + funding) — decides the W/L
+    /// classification when known: a trade whose gross return is positive but
+    /// nets a loss after fees counts as a **LOSS**, matching the ledger's
+    /// fees-decide-the-honest-W/L contract (the stat the Gate-A soak judges).
+    /// Falls back to the gross sign only when `net_pnl` is `None` (legacy
+    /// records that predate net booking).
+    pub fn record_round_trip(&self, ret_frac: f64, net_pnl: Option<f64>) {
+        // Win on the honest (fees-included) result when the net is known; the
+        // gross sign is only a fallback. Both are compared by sign, so the
+        // unit difference (net = dollars, ret_frac = fraction) is irrelevant.
+        if net_pnl.unwrap_or(ret_frac) > 0.0 {
             self.wins.fetch_add(1, Ordering::Relaxed);
         } else {
             self.losses.fetch_add(1, Ordering::Relaxed);
@@ -416,7 +426,11 @@ pub fn observe_paper_event(v: &Value) {
             if !live {
                 status.record_trade();
             }
-            status.record_round_trip(v["ret_pct"].as_f64().unwrap_or(0.0) / 100.0);
+            // W/L is decided by the honest net PnL the brain booked
+            // (`net_pnl_usdt`); the gross `ret_pct` still drives the dollar
+            // conversion via the paper notional.
+            let ret_frac = v["ret_pct"].as_f64().unwrap_or(0.0) / 100.0;
+            status.record_round_trip(ret_frac, v["net_pnl_usdt"].as_f64());
             status.set_position(sym, None);
         }
         _ => {}
@@ -577,12 +591,37 @@ mod tests {
     fn round_trips_drive_win_rate_and_dollar_pnl() {
         let s = fresh();
         s.set_paper_notional(1000.0);
-        s.record_round_trip(0.02); // +2% on $1000 → +$20
-        s.record_round_trip(-0.01); // −1% → −$10
+        // Gross +2% nets a win after fees; gross −1% nets a loss.
+        s.record_round_trip(0.02, Some(19.4)); // +$20 gross realized, net WIN
+        s.record_round_trip(-0.01, Some(-10.6)); // −$10 gross realized, net LOSS
         assert_eq!(s.wins.load(Ordering::Relaxed), 1);
         assert_eq!(s.losses.load(Ordering::Relaxed), 1);
         assert!((s.win_rate() - 0.5).abs() < 1e-9);
+        // Dollar realized PnL stays gross-of-fees (rides the notional): +20 − 10.
         assert!((s.realized_pnl.get() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gross_positive_but_net_negative_counts_as_a_loss() {
+        // The Gate-A honest-W/L contract: a close whose GROSS price return is
+        // positive but whose NET (fees-included) PnL is negative must count as
+        // a LOSS. +0.1% gross on 3000 notional = +$3.00 gross, but −$0.60 net
+        // after 12bps fees — the ledger books a net loss, so /status must too.
+        let s = fresh();
+        s.record_round_trip(0.001, Some(-0.60));
+        assert_eq!(s.wins.load(Ordering::Relaxed), 0, "gross-win/net-loss is a loss");
+        assert_eq!(s.losses.load(Ordering::Relaxed), 1);
+        assert_eq!(s.win_rate(), 0.0);
+
+        // Mirror: a gross loser that somehow nets positive is a WIN.
+        s.record_round_trip(-0.001, Some(0.60));
+        assert_eq!(s.wins.load(Ordering::Relaxed), 1);
+        assert_eq!(s.losses.load(Ordering::Relaxed), 1);
+
+        // No net booked (legacy record) → fall back to the gross sign.
+        s.record_round_trip(0.02, None);
+        assert_eq!(s.wins.load(Ordering::Relaxed), 2);
+        assert_eq!(s.losses.load(Ordering::Relaxed), 1);
     }
 
     #[test]

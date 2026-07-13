@@ -26,7 +26,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::api::AppState;
 use crate::models::ErrorResponse;
@@ -46,6 +46,46 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Announce the internal-auth posture once at startup and fail closed when the
+/// operator has explicitly demanded it. Call from `main` right after loading
+/// `Config`, before binding the server.
+///
+/// The middleware itself still short-circuits to a dev passthrough on an empty
+/// token (see [`require_internal_token`]); this function makes that decision
+/// *loud* instead of silent, so an empty `NGINX_INTERNAL_TOKEN` on a
+/// money-adjacent deployment can never fail open unnoticed:
+///
+/// - token set                         → `Ok`, auth ENFORCED (info log).
+/// - token empty + `require` = `true`  → `Err`: refuse to boot (fail closed).
+/// - token empty + `require` = `false` → `Ok`, but a LOUD warning is logged
+///   that every protected route is unauthenticated (dev passthrough).
+///
+/// `require` is `Config.require_internal_auth` (`REQUIRE_INTERNAL_TOKEN`).
+pub fn check_internal_auth_posture(internal_token: &str, require: bool) -> Result<(), String> {
+    if !internal_token.is_empty() {
+        info!(
+            "internal-token auth ENABLED — X-Internal-Token required on all routes except /health and /metrics"
+        );
+        return Ok(());
+    }
+    if require {
+        return Err(
+            "REQUIRE_INTERNAL_TOKEN is set but NGINX_INTERNAL_TOKEN is empty — refusing to boot \
+             with internal auth DISABLED on money-adjacent routes (/transfers, /accounts, \
+             /net-worth, /edges, /secrets, /spawn). Set NGINX_INTERNAL_TOKEN or unset \
+             REQUIRE_INTERNAL_TOKEN for dev."
+                .to_string(),
+        );
+    }
+    warn!(
+        "!!! internal-token auth DISABLED (NGINX_INTERNAL_TOKEN empty) — every route except \
+         /health and /metrics is UNAUTHENTICATED, including /transfers, /accounts, /net-worth, \
+         /edges, /secrets and /spawn. This is DEV-ONLY; set NGINX_INTERNAL_TOKEN in any \
+         deployment where the port is reachable, or set REQUIRE_INTERNAL_TOKEN=true to fail closed."
+    );
+    Ok(())
 }
 
 /// Reject requests missing or carrying the wrong `X-Internal-Token`.
@@ -87,7 +127,7 @@ pub async fn require_internal_token(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{check_internal_auth_posture, constant_time_eq};
 
     #[test]
     fn constant_time_eq_matches_normal_eq_for_correct_inputs() {
@@ -96,5 +136,25 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(!constant_time_eq(b"", b"a"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn posture_ok_when_token_set_regardless_of_require() {
+        // The oryx posture: token set → boots either way, auth enforced.
+        assert!(check_internal_auth_posture("s3cret", false).is_ok());
+        assert!(check_internal_auth_posture("s3cret", true).is_ok());
+    }
+
+    #[test]
+    fn posture_warns_but_boots_when_token_empty_and_not_required() {
+        // Dev passthrough: empty token is allowed (loud warn), boot proceeds.
+        assert!(check_internal_auth_posture("", false).is_ok());
+    }
+
+    #[test]
+    fn posture_fails_closed_when_token_empty_but_required() {
+        // Hardened posture: empty token + REQUIRE_INTERNAL_TOKEN → refuse boot.
+        let err = check_internal_auth_posture("", true).unwrap_err();
+        assert!(err.contains("REQUIRE_INTERNAL_TOKEN"));
     }
 }

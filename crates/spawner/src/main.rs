@@ -12,6 +12,8 @@
 //   BACKTEST_DB_URL           scoped low-privilege Postgres URL handed to backtest containers
 //                             (fks_backtest role); unset = fall back to the spawner's own
 //                             database_url with a loud per-run warning (DB only)
+//   NGINX_INTERNAL_TOKEN      shared secret nginx injects; empty = auth DISABLED (dev, logs a loud warn)
+//   REQUIRE_INTERNAL_TOKEN    when true, refuse to boot with an empty NGINX_INTERNAL_TOKEN (fail closed)
 //   ALLOWED_NETWORK           Docker network for spawned containers (default: fks_network)
 //   DEFAULT_CPU_LIMIT         fractional cores (default: 1.0)
 //   DEFAULT_MEMORY_LIMIT_MB   memory cap in MiB (default: 512)
@@ -66,6 +68,17 @@ async fn main() -> anyhow::Result<()> {
         allowed_network = %config.allowed_network,
         "FKS Bot Spawner starting"
     );
+
+    // Announce the internal-auth posture loudly at boot — an empty
+    // NGINX_INTERNAL_TOKEN disables auth on every money-adjacent route, so it
+    // must never fail open silently. Fails closed when REQUIRE_INTERNAL_TOKEN
+    // is set (see crate::auth).
+    if let Err(e) = spawner::auth::check_internal_auth_posture(
+        &config.internal_token,
+        config.require_internal_auth,
+    ) {
+        anyhow::bail!(e);
+    }
 
     // ── Docker client ─────────────────────────────────────────────────────────
     let docker: Arc<dyn DockerOps> = Arc::new(DockerClient::new(config.clone())?);
