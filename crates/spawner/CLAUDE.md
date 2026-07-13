@@ -52,7 +52,7 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `POST` | `/container/{id}/restart` | yes | 10s graceful stop + start |
 | `GET` | `/container/{id}/logs` | yes | SSE stream |
 | `GET` | `/runs` | yes (db only) | Recent `bot_runs` history |
-| `GET` `POST` | `/net-worth` | yes (db only) | GET: recent `net_worth_snapshots` (`?bot_id=` filter, `?limit=` default 500 / cap 5000); `[{bot_id, ts, net_worth, currency, venue}]` oldest→newest. POST: record ONE hand-entered snapshot `{account_id, net_worth, currency?='USD', venue?}` with `source='manual'` (validates finite value + non-empty account_id; awaited write, 201 on success, honest 503 without a DB) — how prop-payout / bank balances get entered until their own node exists |
+| `GET` `POST` | `/net-worth` | yes (db only) | GET: recent `net_worth_snapshots` (`?bot_id=` filter, `?limit=` default 500 / cap 5000 — applied PER account via a `PARTITION BY bot_id` window, so one busy sampler can never evict another account from the /treasury roll-up); `[{bot_id, ts, net_worth, currency, venue}]` oldest→newest. POST: record ONE hand-entered snapshot `{account_id, net_worth, currency?='USD', venue?}` with `source='manual'` (validates finite value + non-empty account_id; awaited write, 201 on success, honest 503 without a DB) — how prop-payout / bank balances get entered until their own node exists |
 | `POST` | `/secrets` | yes (db only) | Store exchange API credentials (never read back) |
 | `GET` | `/secrets/status` | yes (db only) | Which exchanges have keys configured |
 | `DELETE` | `/secrets/{exchange}` | yes (db only) | Remove one exchange's stored credentials (hard delete) |
@@ -71,7 +71,7 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `GET` `POST` | `/edges` | yes (db only) | Edge registry (the edge portfolio's source of truth): list (active first) / save (UPSERT by `edge_id`; edge_type `adaptive`\|`rule` + status `research`\|`paper`\|`live`\|`retired` allowlists; `asset_scope` JSON symbol array, `[]` = all assets; `backtest_image` = the fks-bot-* image that runs the edge's backtest, NULL = not containerized) |
 | `DELETE` | `/edges/{id}` | yes (db only) | Soft-delete an edge (`active=false`; its backtest_runs history is preserved) |
 | `GET` | `/edges/{id}/backtests` | yes (db only) | Recent backtest runs (newest first, `?limit=` default 50 / cap 500) with their container-written `results` JSON |
-| `POST` | `/edges/{id}/backtest` | yes (db only) | Invoke one backtest: body `{params?: object}`; opens a `backtest_runs` row (status `running`), then spawns the edge's `backtest_image` through the SAME spawn path as `/spawn` (prefix guard, forced network, caps) with env `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/`BACKTEST_DB_URL` — the one-shot container writes its own results row and exits. 202 `{run_id, container_id}`; 400 on unknown edge / NULL image; stale runs (>2h unreported) are swept to `failed` by the net-worth sampler tick |
+| `POST` | `/edges/{id}/backtest` | yes (db only) | Invoke one backtest: body `{params?: object}`; pre-checks the concurrency cap (429 BEFORE any ledger write), opens a `backtest_runs` row (status `running`), then spawns the edge's `backtest_image` through the SAME spawn path as `/spawn` (prefix guard, forced network, caps) with env `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/`BACKTEST_DB_URL` (the scoped low-privilege `BACKTEST_DB_URL` env var when set; falls back to the spawner's own full-privilege URL with a loud warning) — the one-shot container writes its own results row and exits. 202 `{run_id, container_id}`; 400 on unknown edge / NULL image; stale runs (>2h unreported) are swept to `failed` by the net-worth sampler tick |
 
 Auth = `X-Internal-Token: ${NGINX_INTERNAL_TOKEN}` set by nginx.
 Empty token = dev passthrough.
@@ -87,7 +87,9 @@ Empty token = dev passthrough.
 ## Safety guards on `/spawn`
 
 - Image must start with `ALLOWED_IMAGE_PREFIX` (default `fks-bot-`).
-- Max concurrent containers capped by `MAX_CONCURRENT_BOTS` (default 20).
+- Max concurrent containers capped by `MAX_CONCURRENT_BOTS` (default 20) —
+  only RUNNING containers occupy slots; exited/dead one-shots awaiting
+  auto-prune (finished backtests) don't count.
 - Every spawned container is forced onto `ALLOWED_NETWORK` (default `fks_network`).
 - `cap_drop: ALL` + `security_opt: no-new-privileges:true` are unconditional.
 - Every container gets `fks.bot=true`, `fks.bot_id=<uuid>`, `fks.mode=...` labels.
@@ -184,12 +186,18 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   `008_edge_factory.sql` in the fks repo): the `edges` registry (the
   edge-portfolio's source of truth — janus-adaptive + operator rule-edges,
   every edge facing the same validation bar) + the `backtest_runs` ledger.
-  `POST /edges/{id}/backtest` opens a run row and spawns the edge's
-  registered `backtest_image` as a one-shot container via the SAME
-  `DockerOps::spawn` path as `/spawn` (all guards apply); the container is
-  handed `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/
-  `BACKTEST_DB_URL` and UPDATEs its own row (status + results + finished_at)
-  before exiting. No dedicated reaper in v1 — a 2h staleness sweep
-  piggybacked on the net-worth sampler tick marks silently-dead runs failed.
+  `POST /edges/{id}/backtest` pre-checks the concurrency cap (429 before any
+  ledger write), opens a run row and spawns the edge's registered
+  `backtest_image` as a one-shot container via the SAME `DockerOps::spawn`
+  path as `/spawn` (all guards apply); the container is handed
+  `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/`BACKTEST_DB_URL`
+  and UPDATEs its own row (status + results + finished_at) before exiting.
+  The `BACKTEST_DB_URL` it receives is the spawner's `BACKTEST_DB_URL` env
+  var — a scoped, low-privilege `fks_backtest` role — falling back to the
+  spawner's own full-privilege `database_url` with a loud warning (boot +
+  per run) when unset, so a compromised backtest image can't read
+  `exchange_secrets` or rewrite the treasury ledger once the var is set. No
+  dedicated reaper in v1 — a 2h staleness sweep piggybacked on the net-worth
+  sampler tick marks silently-dead runs failed.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

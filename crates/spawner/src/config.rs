@@ -66,6 +66,15 @@ pub struct Config {
     /// Recognised env vars (in order): SPAWNER_DATABASE_URL, DATABASE_URL.
     pub database_url: String,
 
+    /// Postgres URL handed to backtest containers as their BACKTEST_DB_URL —
+    /// a SCOPED, low-privilege role (fks_backtest: UPDATE on its own
+    /// backtest_runs row, nothing else) so a malicious or compromised
+    /// backtest image can't read exchange_secrets or rewrite the treasury
+    /// ledger. Empty = fall back to `database_url` (the spawner's own full
+    /// fks_user credentials) with a loud warning per run — functional but
+    /// visibly degraded. Env: BACKTEST_DB_URL.
+    pub backtest_database_url: String,
+
     /// Shared secret nginx injects on internal traffic via
     /// `proxy_set_header X-Internal-Token "${NGINX_INTERNAL_TOKEN}"`.
     /// When this is non-empty, all routes except `/health` and `/metrics`
@@ -117,6 +126,7 @@ impl Config {
             database_url: env::var("SPAWNER_DATABASE_URL")
                 .or_else(|_| env::var("DATABASE_URL"))
                 .unwrap_or_default(),
+            backtest_database_url: env::var("BACKTEST_DB_URL").unwrap_or_default(),
             internal_token: env::var("NGINX_INTERNAL_TOKEN").unwrap_or_default(),
             notify_enabled: env_parse_bool("NOTIFY_ENABLED", true),
             btc_watch: BtcWatchConfig::from_env(),
@@ -185,6 +195,7 @@ mod tests {
             prune_interval_secs: 60,
             net_worth_sample_interval_secs: 300,
             database_url: String::new(),
+            backtest_database_url: String::new(),
             internal_token: String::new(),
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
@@ -217,6 +228,7 @@ mod tests {
             prune_interval_secs: 0,
             net_worth_sample_interval_secs: 0,
             database_url: String::new(),
+            backtest_database_url: String::new(),
             internal_token: String::new(),
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),

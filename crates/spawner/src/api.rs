@@ -47,9 +47,11 @@ use crate::{
 #[cfg(feature = "db")]
 use crate::db::{BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
+use crate::docker_client::count_running_bots;
+#[cfg(feature = "db")]
 use crate::edges::{
-    backtest_bot_id, backtests_query_plan, build_backtest_spawn_request, validate_backtest_params,
-    validate_edge, validate_edge_id,
+    backtest_bot_id, backtests_query_plan, build_backtest_spawn_request, resolve_backtest_db_url,
+    validate_backtest_params, validate_edge, validate_edge_id,
 };
 #[cfg(feature = "db")]
 use crate::models::{
@@ -577,8 +579,11 @@ async fn runs_handler(
 // Returns a flat JSON array `[{bot_id, ts, net_worth, currency, venue}]`
 // ordered by ts (oldest → newest within the window) so the WebUI can plot it
 // directly. `?bot_id=` filters to one bot; `?limit=` bounds the most-recent
-// rows returned (default 500, capped 5000). Without a database configured it
-// degrades to `[]` so the panel just shows "no data" rather than erroring.
+// rows returned PER account (default 500, capped 5000) — per-account
+// windowing, not a global cap, so a busy sampler can never evict another
+// account from the /treasury roll-up (see db::NET_WORTH_WINDOW_SQL). Without
+// a database configured it degrades to `[]` so the panel just shows "no
+// data" rather than erroring.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(feature = "db")]
@@ -586,7 +591,7 @@ async fn runs_handler(
 struct NetWorthQuery {
     /// Optional exact-match filter on the `fks.bot_id` label. Blank = all bots.
     bot_id: Option<String>,
-    /// Max rows to return (clamped to 1..=5000). Default: 500.
+    /// Max rows to return per account (clamped to 1..=5000). Default: 500.
     limit: Option<i64>,
 }
 
@@ -1592,8 +1597,10 @@ async fn list_edge_backtests_handler(
 /// tick's piggybacked sweep).
 ///
 /// Failure honesty: unknown/uncontainerized edge is a 400 before any row is
-/// written; a spawn failure AFTER the row was opened closes it as 'failed'
-/// (awaited) so the ledger never carries a phantom running row.
+/// written; the concurrency cap is pre-checked (429) BEFORE the row is
+/// opened, so cap-refused requests can't grow the ledger; a spawn failure
+/// AFTER the row was opened closes it as 'failed' (awaited) so the ledger
+/// never carries a phantom running row.
 #[cfg(feature = "db")]
 async fn run_edge_backtest_handler(
     State(state): State<AppState>,
@@ -1621,6 +1628,27 @@ async fn run_edge_backtest_handler(
             ));
         }
     };
+
+    // Concurrency-cap PRE-CHECK, before any DB write: the spawn path
+    // re-checks authoritatively (a racing spawn still loses there), but
+    // refusing here keeps a cap-refused request from opening a
+    // backtest_runs row at all — a retry storm against a full cap must not
+    // grow the ledger unbounded. Same counting rule as DockerClient::spawn:
+    // only RUNNING containers occupy slots.
+    let running = count_running_bots(&state.docker.list_bots().await?);
+    if running >= state.config.max_concurrent_bots {
+        // Counted as a spawn error for metric continuity: before the
+        // pre-check this refusal happened inside docker.spawn and was
+        // counted there.
+        metrics::SPAWN_ERRORS_TOTAL.inc();
+        warn!(
+            edge_id = %edge_id,
+            running,
+            max = state.config.max_concurrent_bots,
+            "backtest refused before ledger insert — concurrent bot cap reached"
+        );
+        return Err(SpawnerError::TooManyBots(running));
+    }
 
     let Some(store) = state.store.clone() else {
         // No Postgres — there is no registry to look the edge up in and no
@@ -1665,16 +1693,30 @@ async fn run_edge_backtest_handler(
     // must find it existing, and its id is the container's BACKTEST_RUN_ID.
     let run_id = store.insert_backtest_run(&edge_id, &params).await?;
 
+    // The container's BACKTEST_DB_URL: prefer the dedicated low-privilege
+    // fks_backtest URL (env BACKTEST_DB_URL); fall back to the spawner's own
+    // full fks_user credentials ONLY for deploys that haven't configured it
+    // yet — loudly, because that hands the (arbitrary-code) backtest image a
+    // role that can read exchange_secrets and rewrite the treasury ledger.
+    let (db_url, degraded) = resolve_backtest_db_url(
+        &state.config.backtest_database_url,
+        &state.config.database_url,
+    );
+    if degraded {
+        warn!(
+            edge_id = %edge_id,
+            run_id,
+            "BACKTEST_DB_URL not set — handing the backtest container the \
+             spawner's OWN full-privilege Postgres credentials (can read \
+             exchange_secrets). Configure BACKTEST_DB_URL with the scoped \
+             fks_backtest role to close this."
+        );
+    }
+
     // Spawn through the exact same DockerOps path as POST /spawn — every
     // guard (fks-bot- prefix, bot cap, forced network, cap_drop ALL,
     // no-new-privileges) applies unchanged.
-    let spawn_req = build_backtest_spawn_request(
-        &edge_id,
-        run_id,
-        &image,
-        &params,
-        &state.config.database_url,
-    );
+    let spawn_req = build_backtest_spawn_request(&edge_id, run_id, &image, &params, db_url);
     let image_prefix = image.split(':').next().unwrap_or(&image).to_string();
     let resp = match state.docker.spawn(spawn_req).await {
         Ok(resp) => resp,

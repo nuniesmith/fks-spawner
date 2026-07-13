@@ -73,7 +73,9 @@
 ### Safety guards (returned as `400` / `429`)
 
 - `image` must start with `ALLOWED_IMAGE_PREFIX` (defaults to `fks-bot-`).
-- Refuses to spawn when `MAX_CONCURRENT_BOTS` is already running.
+- Refuses to spawn when `MAX_CONCURRENT_BOTS` are already **running** — only
+  running containers occupy slots; exited/dead one-shots (e.g. finished
+  backtests awaiting auto-prune) don't count toward the cap.
 - Every container is forced onto `ALLOWED_NETWORK` (default `fks_network`).
 - `cap_drop: ALL` and `security_opt: no-new-privileges:true` are applied
   unconditionally (in `docker_client.rs::spawn`).
@@ -90,7 +92,7 @@ All settings come from environment variables; defaults are baked into the
 | `SPAWNER_HOST` | `0.0.0.0` | Bind address |
 | `SPAWNER_PORT` | `8090` | Bind port |
 | `ALLOWED_IMAGE_PREFIX` | `fks-bot-` | Image whitelist prefix |
-| `MAX_CONCURRENT_BOTS` | `20` | Hard cap on running bots |
+| `MAX_CONCURRENT_BOTS` | `20` | Hard cap on **running** bots (exited containers awaiting prune don't count) |
 | `ALLOWED_NETWORK` | `fks_network` | Docker network to attach containers to |
 | `DEFAULT_CPU_LIMIT` | `1.0` | Fractional cores per bot (override per-spawn) |
 | `DEFAULT_MEMORY_LIMIT_MB` | `512` | Memory cap per bot (override per-spawn) |
@@ -100,6 +102,7 @@ All settings come from environment variables; defaults are baked into the
 | `PRUNE_AFTER_SECS` | `300` | Stopped-container retention |
 | `PRUNE_INTERVAL_SECS` | `60` | Auto-prune sweep interval |
 | `SPAWNER_DATABASE_URL` / `DATABASE_URL` | *(empty)* | Postgres URL — empty = stateless mode |
+| `BACKTEST_DB_URL` | *(empty)* | Postgres URL handed to backtest containers as their `BACKTEST_DB_URL` env. Point it at the **scoped `fks_backtest` role** (UPDATE on its own `backtest_runs` row only — created by the fks repo's SQL bootstrap) so an arbitrary-code backtest image can't read `exchange_secrets` or rewrite the treasury ledger. Empty = fall back to the spawner's own `database_url` (full `fks_user` privileges) with a loud warning at boot and per run. |
 | `SPAWNER_SECRETS_KEY` | *(empty)* | 64 hex chars (32 bytes). Enables ChaCha20-Poly1305 encryption of `exchange_secrets` at rest (`enc:v1:` wire format). Empty = stored as legacy plaintext; invalid = secrets DB disabled (fail-safe, never plaintext fallback). |
 | `NGINX_INTERNAL_TOKEN` | *(empty)* | Shared secret validated on every protected route. Empty = dev mode (auth disabled). |
 | `RUST_LOG` | `info,spawner=debug` | tracing-subscriber filter |

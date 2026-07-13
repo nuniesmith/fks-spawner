@@ -632,33 +632,36 @@ impl BotRunStore {
     }
 
     /// Read recent net-worth snapshots for `GET /net-worth`. Selects the most
-    /// recent `limit` rows (optionally filtered to one `bot_id`) but returns
-    /// them oldest → newest so the WebUI can plot the series left-to-right
-    /// without reversing. The `NUMERIC` column is cast to `float8` in SQL
-    /// because this sqlx build has no decimal feature — the mirror of the
-    /// text/`::numeric` round-trip `record_net_worth` uses on the way in.
-    /// Clamp/normalise the inputs with [`net_worth_query_plan`] first.
+    /// recent `limit` rows PER bot_id (optionally filtered to one `bot_id`)
+    /// but returns them oldest → newest so the WebUI can plot the series
+    /// left-to-right without reversing.
+    ///
+    /// PER-ACCOUNT WINDOWING (not a single global LIMIT): the /treasury
+    /// headline carry-forwards every account's LAST-known snapshot, and a
+    /// global `ORDER BY ts DESC LIMIT n` silently evicted whole accounts —
+    /// any account whose most recent row was older than the busiest samplers'
+    /// combined horizon (e.g. a one-time manual bank/prop-payout snapshot)
+    /// vanished from the headline and its ProfitCard as row volume grew. The
+    /// `ROW_NUMBER() OVER (PARTITION BY bot_id …)` window caps rows per
+    /// account instead, so no account can be crowded out by another's volume.
+    /// The response shape is unchanged (fks-web treasury/rollup.ts consumes
+    /// it): flat rows, ordered `ts ASC` with an `id` tiebreak for determinism.
+    ///
+    /// The `NUMERIC` column is cast to `float8` in SQL because this sqlx
+    /// build has no decimal feature — the mirror of the text/`::numeric`
+    /// round-trip `record_net_worth` uses on the way in. Clamp/normalise the
+    /// inputs with [`net_worth_query_plan`] first.
     pub async fn list_net_worth(
         &self,
         bot_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<NetWorthSnapshotRow>, SpawnerError> {
-        let rows = sqlx::query(
-            "SELECT bot_id, ts, net_worth::float8 AS net_worth, currency, venue \
-             FROM ( \
-                 SELECT bot_id, ts, net_worth, currency, venue \
-                 FROM net_worth_snapshots \
-                 WHERE ($1::text IS NULL OR bot_id = $1) \
-                 ORDER BY ts DESC \
-                 LIMIT $2 \
-             ) recent \
-             ORDER BY ts ASC",
-        )
-        .bind(bot_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(map_sqlx)?;
+        let rows = sqlx::query(NET_WORTH_WINDOW_SQL)
+            .bind(bot_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
 
         Ok(rows
             .into_iter()
@@ -814,34 +817,33 @@ impl BotRunStore {
     /// the last (a flow already reflected in the first snapshot must not be
     /// double-counted). The pure arithmetic lives in
     /// [`crate::treasury::decompose_profit`].
+    ///
+    /// Boundary determinism: duplicate `ts` values are schema-legal (the
+    /// sampler, manual POST /net-worth backfills and the btc/rithmic writers
+    /// are independent), so both boundary picks tiebreak on the monotonic
+    /// `id` — without it, which of two tied rows became
+    /// start/end_net_worth was planner-dependent and identical requests
+    /// could report different profit. See the `PROFIT_*_SNAPSHOT_SQL` consts.
     pub async fn profit_inputs(
         &self,
         account_id: &str,
         since: Option<DateTime<Utc>>,
     ) -> Result<ProfitInputs, SpawnerError> {
-        let start = sqlx::query(
-            "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
-             WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
-             ORDER BY ts ASC LIMIT 1",
-        )
-        .bind(account_id)
-        .bind(since)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?
-        .map(snapshot_point);
+        let start = sqlx::query(PROFIT_START_SNAPSHOT_SQL)
+            .bind(account_id)
+            .bind(since)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .map(snapshot_point);
 
-        let end = sqlx::query(
-            "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
-             WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
-             ORDER BY ts DESC LIMIT 1",
-        )
-        .bind(account_id)
-        .bind(since)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_sqlx)?
-        .map(snapshot_point);
+        let end = sqlx::query(PROFIT_END_SNAPSHOT_SQL)
+            .bind(account_id)
+            .bind(since)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .map(snapshot_point);
 
         // No snapshots in the window → nothing to decompose (the handler
         // reports null figures rather than inventing a zero baseline).
@@ -1078,18 +1080,58 @@ impl BotRunStore {
     }
 }
 
+// ── GET /net-worth + /profit query text (consts — clause-asserted in tests) ──
+
+/// SQL for [`BotRunStore::list_net_worth`]: the latest `$2` rows PER `bot_id`
+/// (`$1` optionally filters to one bot). The per-bot `ROW_NUMBER()` window —
+/// NOT a global `LIMIT` — is the load-bearing part: a global limit silently
+/// evicted whole accounts from the /treasury roll-up as sampler volume grew.
+/// `ts DESC, id DESC` inside the window and `ts ASC, id ASC` on the output
+/// keep both the kept-rows choice and the row order deterministic under
+/// duplicate timestamps. Uses idx_net_worth_snapshots_bot_ts (bot_id, ts).
+const NET_WORTH_WINDOW_SQL: &str =
+    "SELECT bot_id, ts, net_worth::float8 AS net_worth, currency, venue \
+     FROM ( \
+         SELECT id, bot_id, ts, net_worth, currency, venue, \
+                ROW_NUMBER() OVER (PARTITION BY bot_id ORDER BY ts DESC, id DESC) AS rn \
+         FROM net_worth_snapshots \
+         WHERE ($1::text IS NULL OR bot_id = $1) \
+     ) recent \
+     WHERE rn <= $2 \
+     ORDER BY ts ASC, id ASC";
+
+/// SQL picking the FIRST snapshot bounding the `GET /profit` window. The
+/// `id` tiebreak makes a duplicate-`ts` boundary deterministic (first
+/// inserted wins) instead of planner-dependent.
+const PROFIT_START_SNAPSHOT_SQL: &str =
+    "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+     WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+     ORDER BY ts ASC, id ASC LIMIT 1";
+
+/// SQL picking the LAST snapshot bounding the `GET /profit` window. The
+/// `id` tiebreak makes a duplicate-`ts` boundary deterministic (last
+/// inserted wins) instead of planner-dependent.
+const PROFIT_END_SNAPSHOT_SQL: &str =
+    "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+     WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+     ORDER BY ts DESC, id DESC LIMIT 1";
+
 // ── GET /net-worth request shaping (pure — unit-tested) ──────────────────────
 
-/// Default number of net-worth snapshot rows returned by `GET /net-worth`.
+/// Default number of net-worth snapshot rows (per account) returned by
+/// `GET /net-worth`.
 pub const NET_WORTH_DEFAULT_LIMIT: i64 = 500;
-/// Hard cap on the number of rows `GET /net-worth` will return.
+/// Hard cap on the number of rows PER ACCOUNT `GET /net-worth` will return
+/// (the limit windows per bot_id — see [`NET_WORTH_WINDOW_SQL`] — so one
+/// noisy sampler can't evict another account's history).
 pub const NET_WORTH_MAX_LIMIT: i64 = 5000;
 
 /// Pure request-shaping for `GET /net-worth`. Clamps `limit` into
 /// `1..=NET_WORTH_MAX_LIMIT` (defaulting to [`NET_WORTH_DEFAULT_LIMIT`] when
-/// absent) and normalises the optional `bot_id` filter (trimmed; blank → no
-/// filter). Split out from the handler + query so the query-shaping logic is
-/// unit-testable without a live database. Returns `(bot_id_filter, limit)`.
+/// absent; applied PER account) and normalises the optional `bot_id` filter
+/// (trimmed; blank → no filter). Split out from the handler + query so the
+/// query-shaping logic is unit-testable without a live database. Returns
+/// `(bot_id_filter, limit)`.
 pub fn net_worth_query_plan(bot_id: Option<&str>, limit: Option<i64>) -> (Option<String>, i64) {
     let limit = limit
         .unwrap_or(NET_WORTH_DEFAULT_LIMIT)
@@ -1494,7 +1536,59 @@ fn sanitize_url(url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{NET_WORTH_DEFAULT_LIMIT, NET_WORTH_MAX_LIMIT, net_worth_query_plan, sanitize_url};
+    use super::{
+        NET_WORTH_DEFAULT_LIMIT, NET_WORTH_MAX_LIMIT, NET_WORTH_WINDOW_SQL,
+        PROFIT_END_SNAPSHOT_SQL, PROFIT_START_SNAPSHOT_SQL, net_worth_query_plan, sanitize_url,
+    };
+
+    // ── query-text contracts ─────────────────────────────────────────────────
+    // The sqlx queries themselves need a live Postgres (covered at deploy
+    // time); these lock the LOAD-BEARING clauses of the money-adjacent SQL so
+    // a refactor can't silently regress them.
+
+    #[test]
+    fn net_worth_window_is_per_account_not_a_global_limit() {
+        // The /treasury eviction bug: a global `ORDER BY ts DESC LIMIT n`
+        // dropped whole accounts (their carry-forward value AND ProfitCard)
+        // once busier samplers outgrew the window. The limit must partition
+        // per bot_id.
+        assert!(
+            NET_WORTH_WINDOW_SQL.contains("ROW_NUMBER() OVER (PARTITION BY bot_id"),
+            "limit must window per bot_id: {NET_WORTH_WINDOW_SQL}"
+        );
+        assert!(
+            NET_WORTH_WINDOW_SQL.contains("WHERE rn <= $2"),
+            "the $2 limit must bound the per-bot row number: {NET_WORTH_WINDOW_SQL}"
+        );
+        assert!(
+            !NET_WORTH_WINDOW_SQL.contains("LIMIT $2"),
+            "no global LIMIT — that's the eviction bug: {NET_WORTH_WINDOW_SQL}"
+        );
+        // Output stays oldest → newest (the WebUI plots it directly), with a
+        // deterministic id tiebreak, and the response projection is unchanged
+        // (fks-web rollup.ts reads bot_id/ts/net_worth/currency).
+        assert!(NET_WORTH_WINDOW_SQL.contains("ORDER BY ts ASC, id ASC"));
+        assert!(
+            NET_WORTH_WINDOW_SQL
+                .starts_with("SELECT bot_id, ts, net_worth::float8 AS net_worth, currency, venue"),
+            "response shape must stay identical: {NET_WORTH_WINDOW_SQL}"
+        );
+    }
+
+    #[test]
+    fn profit_window_boundaries_tiebreak_on_id() {
+        // Duplicate-ts rows are schema-legal; without a secondary key the
+        // boundary pick was planner-dependent and /profit could report a
+        // different delta on identical requests.
+        assert!(
+            PROFIT_START_SNAPSHOT_SQL.contains("ORDER BY ts ASC, id ASC LIMIT 1"),
+            "start boundary needs the id tiebreak: {PROFIT_START_SNAPSHOT_SQL}"
+        );
+        assert!(
+            PROFIT_END_SNAPSHOT_SQL.contains("ORDER BY ts DESC, id DESC LIMIT 1"),
+            "end boundary needs the id tiebreak: {PROFIT_END_SNAPSHOT_SQL}"
+        );
+    }
 
     #[test]
     fn sanitize_strips_credentials() {
