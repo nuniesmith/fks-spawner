@@ -25,13 +25,17 @@
    training job and show output in real time.
 3. **Records every spawn / stop / remove in `bot_runs`** (Postgres) so the
    WebUI can show run history, runtime, and exit reason — the table is
-   defined in `src/sql/ruby/007_spawner.sql` with a trigger that computes
-   `runtime_secs` automatically.
+   defined in the fks repo's `src/sql/spawner/002_spawner.sql` with a trigger
+   that computes `runtime_secs` automatically.
 4. **Writes a Prometheus file_sd config** to `/prometheus-sd/bots.json` on
    every lifecycle event, so each bot's `:9091/metrics` is scraped without a
    Prometheus reload.
 5. **Auto-prunes** exited/dead containers after a configurable threshold
    (default 5 minutes) so old runs don't accumulate.
+6. **Re-fires each active edge's backtest weekly** (edge-decay detection,
+   `EDGE_DECAY_ENABLED` — default off) through the same guarded trigger path
+   as `POST /edges/{id}/backtest`, so the advisor's Sunday report always has
+   a fresh run to compare against last week's.
 
 ---
 
@@ -104,7 +108,13 @@ All settings come from environment variables; defaults are baked into the
 | `SPAWNER_DATABASE_URL` / `DATABASE_URL` | *(empty)* | Postgres URL — empty = stateless mode |
 | `BACKTEST_DB_URL` | *(empty)* | Postgres URL handed to backtest containers as their `BACKTEST_DB_URL` env. Point it at the **scoped `fks_backtest` role** (UPDATE on its own `backtest_runs` row only — created by the fks repo's SQL bootstrap) so an arbitrary-code backtest image can't read `exchange_secrets` or rewrite the treasury ledger. Empty = fall back to the spawner's own `database_url` (full `fks_user` privileges) with a loud warning at boot and per run. |
 | `SPAWNER_SECRETS_KEY` | *(empty)* | 64 hex chars (32 bytes). Enables ChaCha20-Poly1305 encryption of `exchange_secrets` at rest (`enc:v1:` wire format). Empty = stored as legacy plaintext; invalid = secrets DB disabled (fail-safe, never plaintext fallback). |
-| `NGINX_INTERNAL_TOKEN` | *(empty)* | Shared secret validated on every protected route. Empty = dev mode (auth disabled). |
+| `NGINX_INTERNAL_TOKEN` | *(empty)* | Shared secret validated on every protected route. Empty = dev mode (auth disabled — announced with a loud boot warning). |
+| `REQUIRE_INTERNAL_TOKEN` | `false` | Hardened posture: `true` makes an empty `NGINX_INTERNAL_TOKEN` a fatal misconfiguration — the spawner refuses to boot rather than serving the money-adjacent routes unauthenticated. Set it in any deployment where the port could be reachable without the nginx hop. |
+| `EDGE_DECAY_ENABLED` | `false` | Weekly edge-backtest scheduler (edge-decay detection): re-fires every active edge with a `backtest_image` through the same guarded trigger path as `POST /edges/{id}/backtest`. Opt-in. |
+| `EDGE_DECAY_WEEKDAY` | `0` | Weekly fire weekday, days-from-Sunday (0 = Sunday; clamped 0–6). |
+| `EDGE_DECAY_HOUR_UTC` | `16` | Weekly fire hour, UTC (clamped 0–23). Default Sun 16:00 UTC lands ~6h before the advisor's Sun 18:00 ET report in either DST phase. |
+| `EDGE_DECAY_MINUTE_UTC` | `0` | Weekly fire minute, UTC (clamped 0–59). |
+| `EDGE_DECAY_INTERVAL_SECS` | *(unset)* | Testing override: switches the scheduler from the weekly wall-clock cadence to a fixed-interval loop. |
 | `RUST_LOG` | `info,spawner=debug` | tracing-subscriber filter |
 
 ---
@@ -135,11 +145,15 @@ When `db` is enabled and `DATABASE_URL` is set, the spawner:
 All DB writes happen in `tokio::spawn` — they **never block** the HTTP
 response on a slow Postgres. Failures are logged with `warn!`.
 
-To apply the schema:
+The schema lives in the **fks repo** at `src/sql/spawner/` and is baked into
+the postgres image (`25-spawner.sql` et al. under
+`/docker-entrypoint-initdb.d/`), so a fresh volume bootstraps it
+automatically. To re-apply on an existing database (the scripts are
+idempotent):
 
 ```bash
 docker compose exec postgres \
-  psql -U fks_user -d ruby_db -f /docker-entrypoint-initdb.d/007_spawner.sql
+  psql -U fks_user -d ruby_db -f /docker-entrypoint-initdb.d/25-spawner.sql
 ```
 
 ---
@@ -154,7 +168,7 @@ Already wired up in the repo — no further infra changes are required:
 | `infrastructure/docker/services/spawner/Dockerfile` | Multi-stage Rust build (`workspace` target → `runtime`) |
 | `infrastructure/config/nginx/conf.d/dev.conf` | `/api/bots/*` (rewritten) and `/api/spawner/*` (passthrough) routes to the service |
 | `infrastructure/config/prometheus/prometheus.yml` | `fks-spawner` scrape job + `fks-bots` `file_sd_configs` |
-| `src/sql/ruby/007_spawner.sql` | `bot_configs` + `bot_runs` schema |
+| `src/sql/spawner/*.sql` | spawner schema (`bot_configs` + `bot_runs` in `002_spawner.sql`, plus secrets / notifications / net-worth / treasury / edge-factory / backtest-role), baked into the postgres image |
 
 To bring it up:
 
@@ -182,7 +196,11 @@ route and returns:
   can hit the spawner directly inside the container.
 - Prometheus can scrape `/metrics` over the `fks_network` Docker network.
 
-Leave `NGINX_INTERNAL_TOKEN` empty for local dev to disable auth.
+Leave `NGINX_INTERNAL_TOKEN` empty for local dev to disable auth — the
+disabled posture is announced with a **loud boot warning** (every protected
+route, including the money-adjacent ones, is unauthenticated). Set
+`REQUIRE_INTERNAL_TOKEN=true` to fail closed instead: an empty token then
+refuses to boot (`auth::check_internal_auth_posture`).
 
 Implementation: `src/auth.rs`. The token compare is constant-time so a
 byte-by-byte timing leak isn't possible.

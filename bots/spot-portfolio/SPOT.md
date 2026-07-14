@@ -3,10 +3,10 @@
 Multi-exchange spot HODL: %-target baskets + a stablecoin/fiat **cash reserve**,
 rebalanced on drift and on new deposits. Venues: **Kraken**, **Crypto.com**, and
 **KuCoin spot** — all behind the `SpotExchange` trait. (Bybit is excluded: not
-available in Canada.) Lives at `fks/bots/spot-portfolio` as its own crate; the
-KuCoin **futures** dip bot it used to share a repo with now lives in the private
-`fks-state` repo (`bots/crypto-futures`). One KuCoin key can still drive both —
-keys are account-wide — but the env names stay distinct.
+available in Canada.) Lives at `fks-spawner/bots/spot-portfolio` as its own
+crate; the KuCoin **futures** dip bot it used to share a repo with now lives in
+the private `fks-state` repo (`bots/crypto-futures`). One KuCoin key can still
+drive both — keys are account-wide — but the env names stay distinct.
 
 ## Build
 ```
@@ -14,10 +14,10 @@ cargo build --release --bin spot-portfolio
 ```
 Binary: `target/release/spot-portfolio`.
 
-> `exchange-apiws` is pinned by git `rev = "fa35543"` (a `main` commit carrying
-> the Crypto.com `get-tickers` + v1 user-balance fixes — the same rev the old
-> `crypto` repo used), so this builds reproducibly (CI / Docker) with no sibling
-> checkout. `Cargo.lock` pins the exact revision.
+> `exchange-apiws` comes from **crates.io (`0.9.0`)** — the old `fa35543` git
+> pin's Crypto.com `get-tickers` + v1 user-balance fixes shipped in the
+> published release — so this builds reproducibly (CI / Docker) with no sibling
+> checkout. `Cargo.lock` pins the exact version.
 
 ## Configure
 ```
@@ -52,8 +52,8 @@ them. A KuCoin key is account-wide, so one key can drive both spot and futures.
 
 ## Run as a container (the platform way)
 The systemd units are retired — the platform runs the bot as a spawner-managed
-`fks-bot-*` container. Build from the **fks repo root** (the crate path-deps
-`crates/crypto-bot-core`):
+`fks-bot-*` container. Build from **this repo's root** (`fks-spawner` — the
+crate path-deps `crates/crypto-bot-core`):
 ```
 docker build -f bots/spot-portfolio/Dockerfile -t fks-bot-crypto-spot:latest .
 ```
@@ -66,7 +66,7 @@ The bot serves `GET /health`, `/metrics` (Prometheus), and `/status` (JSON:
 per-exchange balances, holdings, drift, recent trades, and the all-venue net
 worth) on `BOT_STATUS_PORT` (default 9091). The server ships from
 `crates/crypto-bot-core` (`status` module); the platform-wide bot contract is
-documented in `docs/architecture/PLATFORM_ARCHITECTURE.md` §5.1.
+documented in the fks repo's `docs/architecture/PLATFORM_ARCHITECTURE.md` §5.1.
 
 ```
 curl -s localhost:9091/status | jq '{net_worth_usd, exchanges: [.exchanges[] | {exchange, mode, total_value}]}'

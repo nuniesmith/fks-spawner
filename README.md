@@ -55,7 +55,7 @@ going live is an explicit runtime decision, never a default.
   `src/sql/spawner/` — the DB bootstrap is baked into the postgres image and
   travels with the fks stack.
 - `bots/crypto-futures` (private, in `fks-state`) git-pins
-  `rustrade-exchange-apiws` and `crypto-bot-core` — re-pinning those to this
-  repo is a follow-up stage.
+  `rustrade-exchange-apiws` and `crypto-bot-core` **to this repo** by rev
+  (bump the `rev` there deliberately when those crates change here).
 - No secrets in the tree: bot configs are tracked as `*.example.toml` only;
   API keys arrive as env, injected by the spawner's encrypted secret store.

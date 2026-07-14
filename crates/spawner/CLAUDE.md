@@ -74,7 +74,9 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `POST` | `/edges/{id}/backtest` | yes (db only) | Invoke one backtest: body `{params?: object}`; pre-checks the concurrency cap (429 BEFORE any ledger write), opens a `backtest_runs` row (status `running`), then spawns the edge's `backtest_image` through the SAME spawn path as `/spawn` (prefix guard, forced network, caps) with env `BACKTEST_RUN_ID`/`BACKTEST_EDGE_ID`/`BACKTEST_PARAMS`/`BACKTEST_DB_URL` (the scoped low-privilege `BACKTEST_DB_URL` env var when set; falls back to the spawner's own full-privilege URL with a loud warning) — the one-shot container writes its own results row and exits. 202 `{run_id, container_id}`; 400 on unknown edge / NULL image; stale runs (>2h unreported) are swept to `failed` by the net-worth sampler tick |
 
 Auth = `X-Internal-Token: ${NGINX_INTERNAL_TOKEN}` set by nginx.
-Empty token = dev passthrough.
+Empty token = dev passthrough, announced LOUDLY at boot
+(`auth::check_internal_auth_posture`); set `REQUIRE_INTERNAL_TOKEN=true` to
+fail closed instead (refuse to boot with an empty token).
 
 ## Code conventions
 
@@ -199,5 +201,17 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   `exchange_secrets` or rewrite the treasury ledger once the var is set. No
   dedicated reaper in v1 — a 2h staleness sweep piggybacked on the net-worth
   sampler tick marks silently-dead runs failed.
+- **Weekly edge-decay scheduler** (`src/edge_decay.rs`): on a weekly cadence,
+  re-fires every ACTIVE edge with a `backtest_image` through the SAME internal
+  trigger path as `POST /edges/{id}/backtest` (all spawn guards + the
+  concurrency cap apply; a cap-reached fire stops the sweep — the rest retry
+  next week), so the advisor's Sunday report always has a fresh run to compare
+  against last week's (the drift comparison itself lives in fks-state's
+  advisor). OFF unless `EDGE_DECAY_ENABLED=true`; fire time
+  `EDGE_DECAY_WEEKDAY`/`EDGE_DECAY_HOUR_UTC`/`EDGE_DECAY_MINUTE_UTC` (default
+  Sun 16:00 UTC — ~6h before the advisor's Sun 18:00 ET report in either DST
+  phase); `EDGE_DECAY_INTERVAL_SECS` switches to a fixed-interval loop for
+  testing. Schedule math + edge selection are pure and unit-tested; the loop is
+  `db`-gated like the rest of the persistence layer.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.
