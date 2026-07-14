@@ -23,9 +23,9 @@ works with rustrade, janus, and the crates."
 
 | Layer | Crate | What it does here |
 |-------|-------|-------------------|
-| Framework | `rustrade-framework` 0.2 | `Bot` + `Supervisor` + `ExecutionService` + risk (sizing, session PnL, circuit breaker) |
-| TA math | `indicators-ta` 0.1 | incremental `EMA` (fast/slow) + `ATR` driving the cross signals |
-| Exchange I/O | `exchange-apiws` 0.1 | KuCoin Futures kline polling (public market data) |
+| Framework | `rustrade-framework` 0.4 | `Bot` + `Supervisor` + `ExecutionService` + risk (sizing, session PnL, circuit breaker) |
+| TA math | `indicators-ta` 0.2 | incremental `EMA` (fast/slow) + `ATR` driving the cross signals |
+| Exchange I/O | `exchange-apiws` 0.9 | KuCoin Futures kline polling (public market data) |
 
 > **PAPER mode only.** Trades hit a `MockExchange` — no real orders, no
 > credentials required. Safe to leave running for days. It's the template for

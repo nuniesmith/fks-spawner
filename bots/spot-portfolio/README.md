@@ -25,7 +25,7 @@ cp spot-portfolio.example.toml spot-portfolio.toml   # then edit; keys go in .en
 
 ## Docker image (the spawner's `fks-bot-crypto-spot`)
 
-The build context is the **fks repo root** (the crate path-deps
+The build context is **this repo's root** (`fks-spawner` — the crate path-deps
 `crates/crypto-bot-core`):
 
 ```bash

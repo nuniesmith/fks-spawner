@@ -1,13 +1,13 @@
 # spawner — TODO
 
-> **Repo (future):** `github.com/nuniesmith/spawner`
-> **Last synced:** 2026-05-13
+> **Repo:** `github.com/nuniesmith/fks-spawner` (crate: `crates/spawner/`)
+> **Last synced:** 2026-07-13
 
 ## P0 — Pre-publish
 
 - [ ] **Name conflict on crates.io.** `spawner` is almost certainly taken. Rename candidates: `fks-spawner`, `bot-spawner`, `docker-bot-spawner`. Decide before publish.
-- [ ] **Cargo.toml metadata.** Missing fields: `license`, `repository`, `documentation`, `readme`, `keywords`, `categories`. See `PRE_PUBLISH_AUDIT.md` in the repo root for the full list.
-- [ ] **`LICENSE` file at the crate root** — required by crates.io and missing today.
+- [ ] **Cargo.toml metadata.** Missing fields: `license`, `repository`, `documentation`, `readme`, `keywords`, `categories`.
+- [x] **`LICENSE` file at the crate root** — MIT, present at `crates/spawner/LICENSE`.
 - [x] **Edition 2024** — bumped 2021 → 2024 (matches the repo-wide standard) and
       added `rust-version = "1.94.1"`. `cargo fix --edition` applied the only code
       change (RPIT `+ use<>` in `docker_client::stream_logs`); rustfmt re-styled
@@ -51,3 +51,8 @@
 - Root `Cargo.toml` workspace-members refreshed so `cargo check` from repo root works (PR #21).
 - Per-workspace CI job in `.github/workflows/rust.yml` (PR #23) — spawner's job has been passing throughout the CI green-up arc.
 - The "README polish — no fks path references" item from earlier was verified clean (zero `fks` references in `crates/spawner/README.md`).
+- Treasury layer (`/transfers` + `/accounts` + `/profit`, PR #1) and read-only treasury nodes (cold-BTC watcher, rithmic sampler, manual snapshot, PR #2).
+- Edge factory v1 — `/edges` registry + containerized backtest runs (PR #3).
+- 2026-07-11 audit mediums: scoped `BACKTEST_DB_URL` (low-privilege `fks_backtest` role, loud degraded fallback), running-only `MAX_CONCURRENT_BOTS` cap, per-account `/net-worth` window (PR #4).
+- Audit lows: net-PnL-based W/L in `crypto-bot-core` status + loud internal-auth posture (`REQUIRE_INTERNAL_TOKEN` fail-closed opt-in) (PR #5).
+- Weekly edge-backtest scheduler (edge-decay detection, `EDGE_DECAY_*` env, default Sun 16:00 UTC, opt-in) (PR #6).
