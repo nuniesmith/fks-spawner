@@ -381,7 +381,11 @@ mod tests {
         // Sunday 17:00 UTC — the 16:00 slot passed; next is +7 days.
         let now = utc(2026, 7, 19, 17, 0, 0);
         let d = duration_until_next(now, 0, 16, 0);
-        assert_eq!(d.as_secs(), 7 * 86_400 - 3600, "next Sunday, 23h short of 7d");
+        assert_eq!(
+            d.as_secs(),
+            7 * 86_400 - 3600,
+            "next Sunday, 23h short of 7d"
+        );
     }
 
     #[test]
@@ -436,7 +440,10 @@ mod tests {
             fired,
             vec![
                 ("orb", "fks-bot-backtest-orb:latest"),
-                ("funding-reversion", "fks-bot-backtest-crypto-futures:latest"),
+                (
+                    "funding-reversion",
+                    "fks-bot-backtest-crypto-futures:latest"
+                ),
             ],
             "only active + containerized, order preserved"
         );

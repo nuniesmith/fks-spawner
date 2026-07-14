@@ -1089,8 +1089,7 @@ impl BotRunStore {
 /// `ts DESC, id DESC` inside the window and `ts ASC, id ASC` on the output
 /// keep both the kept-rows choice and the row order deterministic under
 /// duplicate timestamps. Uses idx_net_worth_snapshots_bot_ts (bot_id, ts).
-const NET_WORTH_WINDOW_SQL: &str =
-    "SELECT bot_id, ts, net_worth::float8 AS net_worth, currency, venue \
+const NET_WORTH_WINDOW_SQL: &str = "SELECT bot_id, ts, net_worth::float8 AS net_worth, currency, venue \
      FROM ( \
          SELECT id, bot_id, ts, net_worth, currency, venue, \
                 ROW_NUMBER() OVER (PARTITION BY bot_id ORDER BY ts DESC, id DESC) AS rn \
@@ -1103,16 +1102,14 @@ const NET_WORTH_WINDOW_SQL: &str =
 /// SQL picking the FIRST snapshot bounding the `GET /profit` window. The
 /// `id` tiebreak makes a duplicate-`ts` boundary deterministic (first
 /// inserted wins) instead of planner-dependent.
-const PROFIT_START_SNAPSHOT_SQL: &str =
-    "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+const PROFIT_START_SNAPSHOT_SQL: &str = "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
      WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
      ORDER BY ts ASC, id ASC LIMIT 1";
 
 /// SQL picking the LAST snapshot bounding the `GET /profit` window. The
 /// `id` tiebreak makes a duplicate-`ts` boundary deterministic (last
 /// inserted wins) instead of planner-dependent.
-const PROFIT_END_SNAPSHOT_SQL: &str =
-    "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
+const PROFIT_END_SNAPSHOT_SQL: &str = "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
      WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
      ORDER BY ts DESC, id DESC LIMIT 1";
 

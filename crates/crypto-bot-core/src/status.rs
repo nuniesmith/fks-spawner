@@ -609,7 +609,11 @@ mod tests {
         // after 12bps fees — the ledger books a net loss, so /status must too.
         let s = fresh();
         s.record_round_trip(0.001, Some(-0.60));
-        assert_eq!(s.wins.load(Ordering::Relaxed), 0, "gross-win/net-loss is a loss");
+        assert_eq!(
+            s.wins.load(Ordering::Relaxed),
+            0,
+            "gross-win/net-loss is a loss"
+        );
         assert_eq!(s.losses.load(Ordering::Relaxed), 1);
         assert_eq!(s.win_rate(), 0.0);
 
