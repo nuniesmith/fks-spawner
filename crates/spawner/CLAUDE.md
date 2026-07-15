@@ -60,8 +60,9 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `GET` | `/notifications` | yes (db only) | List channels (name/kind/events — never the URL) |
 | `DELETE` | `/notifications/{name}` | yes (db only) | Remove one notification channel (hard delete) |
 | `POST` | `/notifications/{name}/test` | yes (db only) | Send a one-off "connected" probe to one channel; reports whether the webhook accepted it |
-| `GET` `POST` | `/configs` | yes (db only) | List / save (UPSERT) reusable spawn configs |
+| `GET` `POST` | `/configs` | yes (db only) | List / save (UPSERT) reusable spawn configs (optional self-contained `bot_id`, stored in the `config_json` blob) |
 | `DELETE` | `/configs/{name}` | yes (db only) | Soft-delete a saved config |
+| `POST` | `/configs/{name}/respawn` | yes (db only) | Atomically redeploy a saved config's bot: stop→force-remove the existing `fks-bot-{bot_id}` container (idempotent — skips cleanly if it isn't running) THEN spawn a fresh one through the SAME `/spawn` path, so CURRENT stored secrets are re-injected (rotated keys picked up) and the config's `:latest` image runs (freshly-built code). Body `{ bot_id? }` overrides the config's stored id; bot_id resolves override > config > 400. The remove is awaited BEFORE the spawn (never two live containers for one bot_id); a residual 409 name-conflict is a clear error, not a half-state. Returns `{ bot_id, old_container_id, new_container_id, status, image }`. NOTE: recreates from the current image — it does NOT rebuild the image from source (see follow-up) |
 | `GET` `POST` | `/ui/layouts` | yes (db only) | List (names + updated_at) / save (UPSERT) named WebUI dock layouts |
 | `GET` `DELETE` | `/ui/layouts/{name}` | yes (db only) | Fetch one full layout envelope / hard-delete it |
 | `GET` `POST` | `/transfers` | yes (db only) | Treasury cash-flow ledger: list (`?account_id=` filter, `?limit=` default 500 / cap 5000; oldest→newest like /net-worth) / append one signed row (positive = deposit in, negative = withdrawal out; kind: deposit / withdrawal / payout / sweep; source: manual / bot_detected; optional backfill `ts`) |

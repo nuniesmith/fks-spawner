@@ -26,8 +26,10 @@
 //!
 //! ── Coverage (all via the real `spawner::db` functions) ──────────────────────
 //!   • bot_configs      — upsert_config (insert + update-by-name) + list_configs
-//!                        round-trip (image/mode/cpu_limit/env/secrets via the
-//!                        config_json blob) + deactivate_config soft-delete.
+//!                        / get_config round-trip (image/mode/cpu_limit/env/
+//!                        secrets/bot_id via the config_json blob, incl. the
+//!                        backward-compat bot_id=None path) + deactivate_config
+//!                        soft-delete (get_config skips deleted rows).
 //!   • exchange_secrets — upsert_secret → get_secret round-trip through the
 //!                        ChaCha20-Poly1305 cipher, configured_exchanges status
 //!                        (metadata only, never the secret), delete_secret, and
@@ -307,11 +309,14 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         memory_mb: Some(512),
         env: env.clone(),
         secrets: vec!["kraken".to_string()],
+        // Backward-compat: this template carries NO bot_id (like configs saved
+        // before the field existed) — it must round-trip as None.
+        bot_id: None,
     };
     let id1 = store.upsert_config(&insert).await.expect("insert config");
 
-    // Re-upsert under the same name (the UPSERT key) with changed fields → same
-    // row id, updated values.
+    // Re-upsert under the same name (the UPSERT key) with changed fields (now
+    // WITH a bot_id) → same row id, updated values.
     let update = ConfigRequest {
         name: "alpha".to_string(),
         image: "fks-bot-crypto:latest".to_string(),
@@ -320,6 +325,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         memory_mb: Some(1024),
         env,
         secrets: vec!["kraken".to_string(), "kucoin".to_string()],
+        bot_id: Some("crypto-spot-live".to_string()),
     };
     let id2 = store.upsert_config(&update).await.expect("update config");
     assert_eq!(id1, id2, "upsert by name must reuse the existing row id");
@@ -338,6 +344,58 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         row.secrets,
         vec!["kraken".to_string(), "kucoin".to_string()]
     );
+    assert_eq!(
+        row.bot_id.as_deref(),
+        Some("crypto-spot-live"),
+        "bot_id round-trips via the config_json blob (no schema migration)"
+    );
+
+    // get_config (the respawn lookup) returns the same self-contained row.
+    let one = store
+        .get_config("alpha")
+        .await
+        .expect("get_config")
+        .expect("alpha present via get_config");
+    assert_eq!(one.image, "fks-bot-crypto:latest");
+    assert_eq!(one.bot_id.as_deref(), Some("crypto-spot-live"));
+    assert_eq!(
+        one.secrets,
+        vec!["kraken".to_string(), "kucoin".to_string()]
+    );
+
+    // A config saved without a bot_id loads it back as None (backward compat).
+    store
+        .upsert_config(&ConfigRequest {
+            name: "legacy".to_string(),
+            image: "fks-bot-legacy:latest".to_string(),
+            mode: "paper".to_string(),
+            cpu_limit: None,
+            memory_mb: None,
+            env: HashMap::new(),
+            secrets: vec![],
+            bot_id: None,
+        })
+        .await
+        .expect("insert legacy config");
+    let legacy = store
+        .get_config("legacy")
+        .await
+        .expect("get legacy")
+        .expect("legacy present");
+    assert!(
+        legacy.bot_id.is_none(),
+        "a config with no bot_id loads as None"
+    );
+
+    // get_config misses an unknown / soft-deleted name.
+    assert!(
+        store
+            .get_config("does-not-exist")
+            .await
+            .expect("get missing")
+            .is_none(),
+        "absent config ⇒ None (the respawn handler answers 404)"
+    );
 
     // Soft-delete drops it from the active listing.
     assert!(store.deactivate_config("alpha").await.expect("deactivate"));
@@ -352,6 +410,14 @@ async fn exercise_bot_configs(store: &BotRunStore) {
     assert!(
         !after.iter().any(|c| c.name == "alpha"),
         "soft-deleted config must not appear in list_configs"
+    );
+    assert!(
+        store
+            .get_config("alpha")
+            .await
+            .expect("get after deactivate")
+            .is_none(),
+        "get_config skips soft-deleted rows (respawn of a deleted config 404s)"
     );
 }
 

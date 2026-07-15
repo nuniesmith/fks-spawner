@@ -57,6 +57,21 @@ struct MockState {
     containers: HashMap<String, ContainerInfo>,
 }
 
+impl MockState {
+    /// Resolve a caller-supplied identifier (container id OR `fks-bot-{bot_id}`
+    /// name) to the map key, mirroring real Docker, which accepts both. The
+    /// respawn path inspects/stops/removes by NAME, so the mock must honour it.
+    fn resolve_key(&self, ident: &str) -> Option<String> {
+        if self.containers.contains_key(ident) {
+            return Some(ident.to_string());
+        }
+        self.containers
+            .iter()
+            .find(|(_, c)| c.name == ident)
+            .map(|(k, _)| k.clone())
+    }
+}
+
 impl MockDockerClient {
     fn from_config(cfg: &Config) -> Self {
         Self {
@@ -127,8 +142,12 @@ impl DockerOps for MockDockerClient {
 
     async fn stop(&self, id: &str) -> SpawnerResult<()> {
         let mut state = self.state.lock().expect("MockState mutex poisoned");
-        match state.containers.get_mut(id) {
-            Some(c) => {
+        match state.resolve_key(id) {
+            Some(key) => {
+                let c = state
+                    .containers
+                    .get_mut(&key)
+                    .expect("resolved key present");
                 c.state = "exited".to_string();
                 c.finished_at = Some(Utc::now());
                 Ok(())
@@ -139,8 +158,12 @@ impl DockerOps for MockDockerClient {
 
     async fn restart(&self, id: &str) -> SpawnerResult<()> {
         let mut state = self.state.lock().expect("MockState mutex poisoned");
-        match state.containers.get_mut(id) {
-            Some(c) => {
+        match state.resolve_key(id) {
+            Some(key) => {
+                let c = state
+                    .containers
+                    .get_mut(&key)
+                    .expect("resolved key present");
                 c.state = "running".to_string();
                 c.finished_at = None;
                 Ok(())
@@ -151,19 +174,20 @@ impl DockerOps for MockDockerClient {
 
     async fn remove(&self, id: &str) -> SpawnerResult<()> {
         let mut state = self.state.lock().expect("MockState mutex poisoned");
-        if state.containers.remove(id).is_some() {
-            Ok(())
-        } else {
-            Err(SpawnerError::NotFound(id.to_string()))
+        match state.resolve_key(id) {
+            Some(key) => {
+                state.containers.remove(&key);
+                Ok(())
+            }
+            None => Err(SpawnerError::NotFound(id.to_string())),
         }
     }
 
     async fn inspect(&self, id: &str) -> SpawnerResult<ContainerInfo> {
         let state = self.state.lock().expect("MockState mutex poisoned");
         state
-            .containers
-            .get(id)
-            .cloned()
+            .resolve_key(id)
+            .and_then(|key| state.containers.get(&key).cloned())
             .ok_or_else(|| SpawnerError::NotFound(id.to_string()))
     }
 
@@ -1092,6 +1116,145 @@ async fn config_save_rejects_missing_name() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Atomic respawn (POST /configs/{name}/respawn) — cleanup helper + handler
+// gates. The full happy path (load saved config → cleanup → re-spawn) needs a
+// live Postgres for the config store and is covered by the db_integration
+// harness; here we drive the safety-critical cleanup half against the mock and
+// the no-DB / auth gates through the real router.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn remove_existing_bot_is_idempotent_when_absent() {
+    // The respawn must work even if the bot was already stopped / never
+    // started: no container named fks-bot-{id} → Ok(None), nothing torn down.
+    use spawner::docker_client::remove_existing_bot;
+
+    let config = test_config("");
+    let mock = MockDockerClient::from_config(&config);
+
+    let removed = remove_existing_bot(&mock, "fks-bot-never-existed")
+        .await
+        .expect("absent cleanup is not an error");
+    assert!(removed.is_none(), "no container ⇒ None, not an error");
+}
+
+#[tokio::test]
+async fn remove_existing_bot_stops_and_removes_when_present() {
+    // A running container named fks-bot-{id} is stopped THEN force-removed, and
+    // its id is returned. A second call is a clean no-op (idempotent) — proving
+    // the remove actually completed (no lingering container to race a respawn).
+    use spawner::docker_client::{DockerOps, remove_existing_bot};
+    use spawner::models::SpawnRequest;
+
+    let config = test_config("");
+    let mock = MockDockerClient::from_config(&config);
+
+    mock.spawn(SpawnRequest {
+        image: "fks-bot-example:latest".to_string(),
+        bot_id: Some("crypto-spot-live".to_string()),
+        mode: "live".to_string(),
+        env: HashMap::new(),
+        labels: HashMap::new(),
+        cpu_limit: None,
+        memory_limit_mb: None,
+        cmd: None,
+        entrypoint: None,
+        secrets: vec![],
+    })
+    .await
+    .expect("spawn");
+
+    // One container is live.
+    assert_eq!(mock.list_bots().await.unwrap().len(), 1);
+
+    let removed = remove_existing_bot(&mock, "fks-bot-crypto-spot-live")
+        .await
+        .expect("present cleanup succeeds")
+        .expect("returns the removed container id");
+    assert!(!removed.is_empty(), "removed container id echoed back");
+
+    // The removal completed — no container left to double up with a fresh spawn.
+    assert!(
+        mock.list_bots().await.unwrap().is_empty(),
+        "the old container must be gone before any respawn"
+    );
+
+    // Idempotent: a second cleanup finds nothing.
+    let again = remove_existing_bot(&mock, "fks-bot-crypto-spot-live")
+        .await
+        .expect("second cleanup ok");
+    assert!(again.is_none(), "second cleanup is a clean no-op");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_without_db_returns_503() {
+    // No DATABASE_URL (store: None) — there is no config store to load from, so
+    // the respawn reports an honest 503 rather than a blind spawn.
+    let (app, mock) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::post("/configs/crypto-spot-live/respawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    // Crucially: nothing was spawned without a config to rebuild from.
+    let state = mock.state.lock().unwrap();
+    assert!(state.containers.is_empty(), "no container without a config");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_is_token_gated() {
+    // With a configured token, the respawn route rejects an unauthenticated
+    // request (401) before touching the store — same gate as the other
+    // /configs routes.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    let resp = app
+        .oneshot(
+            Request::post("/configs/crypto-spot-live/respawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_accepts_empty_body() {
+    // A bare POST with NO body (the "use the config's own bot_id" case) must not
+    // be a 400/415 for a missing JSON payload — it should reach the store gate
+    // (503 here, no DB) exactly like an explicit `{}`.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::post("/configs/crypto-spot-live/respawn")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

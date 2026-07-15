@@ -32,6 +32,20 @@ pub enum SpawnerError {
 }
 
 impl SpawnerError {
+    /// True when this is Docker's 409 "container name already in use" conflict.
+    /// The respawn path uses it to turn a still-present old container into a
+    /// clear, actionable error (the old container wasn't fully removed) instead
+    /// of a raw 500 — and to guarantee it never proceeds to a second live bot.
+    pub fn is_name_conflict(&self) -> bool {
+        matches!(
+            self,
+            SpawnerError::Docker(bollard::errors::Error::DockerResponseServerError {
+                status_code: 409,
+                ..
+            })
+        )
+    }
+
     pub fn http_status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode;
         match self {

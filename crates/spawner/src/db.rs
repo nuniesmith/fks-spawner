@@ -478,6 +478,9 @@ impl BotRunStore {
             "memory_mb": req.memory_mb,
             "env": req.env,
             "secrets": req.secrets,
+            // bot_id lives in the JSONB blob so a self-contained respawn
+            // template needs NO schema migration (the column set is unchanged).
+            "bot_id": req.bot_id,
         });
         let row = sqlx::query(
             "INSERT INTO bot_configs (name, image, mode, config_json) \
@@ -516,6 +519,24 @@ impl BotRunStore {
         .map_err(map_sqlx)?;
 
         Ok(rows.into_iter().map(BotConfigRow::from_row).collect())
+    }
+
+    /// Load ONE active saved config by name — the `POST /configs/{name}/respawn`
+    /// lookup. Returns `None` if the name is absent or soft-deleted (so the
+    /// handler answers 404). Unpacks the same `config_json` fields as
+    /// `list_configs` (image/mode/cpu_limit/memory_mb/env/secrets/bot_id).
+    pub async fn get_config(&self, name: &str) -> Result<Option<BotConfigRow>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT id, name, image, mode, config_json \
+             FROM bot_configs \
+             WHERE name = $1 AND is_active = TRUE",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(row.map(BotConfigRow::from_row))
     }
 
     /// Soft-delete a config by name (sets `is_active = FALSE`). Returns whether
@@ -1458,6 +1479,10 @@ pub struct BotConfigRow {
     pub env: HashMap<String, String>,
     /// Exchanges whose stored credentials the template injects at spawn time.
     pub secrets: Vec<String>,
+    /// Bot identity the template respawns as (`fks-bot-{bot_id}`). `None` for
+    /// configs saved before the field existed — surfaced on GET /configs so the
+    /// WebUI can show which templates are respawn-ready.
+    pub bot_id: Option<String>,
 }
 
 impl BotConfigRow {
@@ -1486,6 +1511,10 @@ impl BotConfigRow {
                     .collect()
             })
             .unwrap_or_default();
+        let bot_id = cfg
+            .get("bot_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         Self {
             id: r.try_get("id").unwrap_or_else(|_| Uuid::nil()),
             name: r.try_get("name").unwrap_or_default(),
@@ -1495,6 +1524,7 @@ impl BotConfigRow {
             memory_mb,
             env,
             secrets,
+            bot_id,
         }
     }
 }
