@@ -48,7 +48,9 @@ tracing     = "0.1"
 tokio       = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` for the fill-source
+# driver's deterministic timer test; `time` for the paused-clock helpers.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

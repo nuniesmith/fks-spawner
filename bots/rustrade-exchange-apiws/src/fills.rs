@@ -201,6 +201,37 @@ async fn hydrate(
     }
 }
 
+/// One "check for new fills now" action, abstracted so the driver loop
+/// ([`run_loop`]) can be exercised without a live exchange in tests. The
+/// production implementation is [`HydratePoller`]; both the WS trigger and the
+/// safety poll invoke the exact same action.
+#[async_trait]
+trait Poller: Send {
+    async fn poll(&mut self);
+}
+
+/// Production poller: fetch `/recentFills` and emit any not-yet-seen rows.
+struct HydratePoller {
+    client: KuCoinClient,
+    symbols: Vec<String>,
+    seen: SeenFills,
+    fill_tx: mpsc::UnboundedSender<Fill>,
+}
+
+#[async_trait]
+impl Poller for HydratePoller {
+    async fn poll(&mut self) {
+        hydrate(
+            &self.client,
+            &self.symbols,
+            &mut self.seen,
+            false,
+            &self.fill_tx,
+        )
+        .await;
+    }
+}
+
 /// The background driver: baseline, then loop on (WS trigger | safety poll |
 /// shutdown), hydrating real fills each time.
 async fn drive(
@@ -209,24 +240,54 @@ async fn drive(
     symbols: Vec<String>,
     poll_interval: Duration,
     fill_tx: mpsc::UnboundedSender<Fill>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) {
-    let mut seen = SeenFills::new(SEEN_CAPACITY);
+    let symbol_count = symbols.len();
+    let mut poller = HydratePoller {
+        client: client.clone(),
+        symbols,
+        seen: SeenFills::new(SEEN_CAPACITY),
+        fill_tx,
+    };
 
     // Baseline: don't replay fills that predate this source.
-    hydrate(&client, &symbols, &mut seen, true, &fill_tx).await;
-    info!(
-        symbols = symbols.len(),
-        "kucoin fill source baselined; live"
-    );
+    hydrate(
+        &poller.client,
+        &poller.symbols,
+        &mut poller.seen,
+        true,
+        &poller.fill_tx,
+    )
+    .await;
+    info!(symbols = symbol_count, "kucoin fill source baselined; live");
 
     // Private-WS trigger (graceful: poll-only if it can't start).
-    let (ws_tx, mut ws_rx) = mpsc::channel::<DataMessage>(256);
-    tokio::spawn(run_ws(client.clone(), env, ws_tx, shutdown.clone()));
+    let (ws_tx, ws_rx) = mpsc::channel::<DataMessage>(256);
+    tokio::spawn(run_ws(client, env, ws_tx, shutdown.clone()));
 
     let mut tick = tokio::time::interval(poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    run_loop(ws_rx, tick, shutdown, poller).await;
+}
+
+/// Drive `poller` off the WS trigger and the safety-poll `tick` until shutdown.
+///
+/// The WS branch is a *low-latency trigger* only; the `tick` branch is the
+/// authoritative safety net that must keep firing even when the WS trigger is
+/// down (poll-only mode). Because the trigger is `biased` ahead of `tick`, a
+/// closed `ws_rx` (its sender dropped when `run_ws` degrades to poll-only)
+/// resolves `recv()` to `Ready(None)` *permanently* and would starve `tick`
+/// into a 100%-CPU hot-spin that delivers zero fills. Guard against that: on
+/// the first `None`, disable the trigger branch (`ws_alive = false`) so the
+/// select falls through to `tick` and poll-only delivery continues.
+async fn run_loop<P: Poller>(
+    mut ws_rx: mpsc::Receiver<DataMessage>,
+    mut tick: tokio::time::Interval,
+    mut shutdown: watch::Receiver<bool>,
+    mut poller: P,
+) {
+    let mut ws_alive = true;
     loop {
         tokio::select! {
             biased;
@@ -236,15 +297,21 @@ async fn drive(
                     break;
                 }
             }
-            maybe = ws_rx.recv() => {
-                // `Some` = an order transition ⇒ check for new fills now.
-                // `None` = the WS task ended; the safety poll keeps us going.
-                if maybe.is_some() {
-                    hydrate(&client, &symbols, &mut seen, false, &fill_tx).await;
+            maybe = ws_rx.recv(), if ws_alive => {
+                match maybe {
+                    // An order transition ⇒ check for new fills now.
+                    Some(_) => poller.poll().await,
+                    // The WS task ended (poll-only). Disable this branch so it
+                    // stops resolving Ready(None) and starving the safety poll;
+                    // `tick` now drives delivery until shutdown.
+                    None => {
+                        ws_alive = false;
+                        debug!("kucoin fills: WS trigger closed; safety poll only");
+                    }
                 }
             }
             _ = tick.tick() => {
-                hydrate(&client, &symbols, &mut seen, false, &fill_tx).await;
+                poller.poll().await;
             }
         }
     }
@@ -308,6 +375,66 @@ async fn run_ws(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts `poll()` calls so a test can prove the safety poll keeps firing.
+    struct CountingPoller {
+        count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Poller for CountingPoller {
+        async fn poll(&mut self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Regression for the `biased` select starving the safety poll: when the WS
+    /// trigger dies (its sender is dropped, as `run_ws` does on poll-only
+    /// degrade), `ws_rx.recv()` resolves `Ready(None)` forever. Before the fix
+    /// the `biased` loop hot-spun on that closed branch and `tick.tick()` never
+    /// ran, so ZERO fills were delivered for the rest of the process. After the
+    /// fix the trigger branch is disabled on `None` and the safety poll keeps
+    /// firing — which is what this test asserts.
+    #[tokio::test(start_paused = true)]
+    async fn safety_poll_survives_ws_trigger_death() {
+        let (ws_tx, ws_rx) = mpsc::channel::<DataMessage>(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let poller = CountingPoller {
+            count: Arc::clone(&count),
+        };
+
+        let handle = tokio::spawn(run_loop(ws_rx, tick, shutdown_rx, poller));
+
+        // Simulate the WS trigger dying (poll-only degrade): drop the sender so
+        // ws_rx closes and recv() resolves Ready(None) permanently.
+        drop(ws_tx);
+
+        // With the clock paused, tokio auto-advances to pending timers while the
+        // loop is idle in `select!`. If the fix regressed to a hot-spin the loop
+        // would never go idle, time would not advance, and this sleep would hang
+        // (the test times out) with `count == 0`.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        // Safety poll must have fired repeatedly despite the dead WS trigger.
+        assert!(
+            count.load(Ordering::SeqCst) >= 3,
+            "safety poll starved after WS death (count = {})",
+            count.load(Ordering::SeqCst)
+        );
+
+        // And shutdown still works — the loop is genuinely alive, not wedged.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("driver did not stop on shutdown")
+            .expect("driver task panicked");
+    }
 
     fn ea_fill(trade_id: Option<&str>, side: &str, price: f64, size: u32) -> EaFill {
         EaFill {
