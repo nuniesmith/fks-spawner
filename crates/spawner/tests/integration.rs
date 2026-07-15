@@ -42,6 +42,34 @@ use spawner::models::{ContainerInfo, ContainerStats, SpawnRequest, SpawnResponse
 // MockDockerClient — in-memory implementation of DockerOps
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A forced fault the mock injects on the NEXT `spawn`, so tests can drive the
+/// respawn abort branches without a real Docker daemon. Variants are only
+/// constructed by the `db`-gated respawn tests.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+enum SpawnFault {
+    /// Docker's 409 "container name already in use" — `is_name_conflict()` true.
+    NameConflict,
+    /// Any other Docker failure (500) — propagated raw, not wrapped as an abort.
+    Generic,
+}
+
+impl SpawnFault {
+    fn into_error(self) -> SpawnerError {
+        let (status_code, message) = match self {
+            SpawnFault::NameConflict => (
+                409,
+                "Conflict. The container name \"/fks-bot-x\" is already in use".to_string(),
+            ),
+            SpawnFault::Generic => (500, "kaboom".to_string()),
+        };
+        SpawnerError::Docker(bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message,
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct MockDockerClient {
     state: Arc<Mutex<MockState>>,
@@ -50,6 +78,17 @@ struct MockDockerClient {
     allowed_prefix: String,
     /// Hard cap on concurrent containers, mirrored from `Config`.
     max_concurrent: usize,
+    /// When set, the NEXT `spawn` returns this fault instead of creating a
+    /// container (drives the respawn abort branches). One-shot: cleared on use.
+    spawn_fault: Arc<Mutex<Option<SpawnFault>>>,
+}
+
+impl MockDockerClient {
+    /// Arm a one-shot spawn fault for the next `spawn` call.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    fn fail_next_spawn(&self, fault: SpawnFault) {
+        *self.spawn_fault.lock().expect("fault mutex") = Some(fault);
+    }
 }
 
 #[derive(Default)]
@@ -78,6 +117,7 @@ impl MockDockerClient {
             state: Arc::new(Mutex::new(MockState::default())),
             allowed_prefix: cfg.allowed_image_prefix.clone(),
             max_concurrent: cfg.max_concurrent_bots,
+            spawn_fault: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -85,6 +125,12 @@ impl MockDockerClient {
 #[async_trait]
 impl DockerOps for MockDockerClient {
     async fn spawn(&self, req: SpawnRequest) -> SpawnerResult<SpawnResponse> {
+        // A one-shot armed fault fires here (after any real daemon would have
+        // reached create/start), so the respawn abort branches are exercised
+        // with the old container already removed.
+        if let Some(fault) = self.spawn_fault.lock().expect("fault mutex").take() {
+            return Err(fault.into_error());
+        }
         if !req.image.starts_with(&self.allowed_prefix) {
             return Err(SpawnerError::InvalidImage(req.image));
         }
@@ -253,6 +299,13 @@ fn test_config(internal_token: &str) -> Config {
 }
 
 fn build_app(config: Config) -> (Router, Arc<MockDockerClient>) {
+    let (state, mock) = build_state(config);
+    (build_router(state), mock)
+}
+
+/// Build an `AppState` (with the mock docker + no store) without wrapping it in
+/// a router — for handler-helper tests that call into `spawner::api` directly.
+fn build_state(config: Config) -> (AppState, Arc<MockDockerClient>) {
     let mock = Arc::new(MockDockerClient::from_config(&config));
     let docker: Arc<dyn DockerOps> = mock.clone();
     let state = AppState {
@@ -261,7 +314,7 @@ fn build_app(config: Config) -> (Router, Arc<MockDockerClient>) {
         #[cfg(feature = "db")]
         store: None,
     };
-    (build_router(state), mock)
+    (state, mock)
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
@@ -1255,6 +1308,238 @@ async fn respawn_accepts_empty_body() {
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     let payload = body_string(resp).await;
     assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// respawn_from_config — the pre-flight → remove → spawn core (adversarial
+// review). These drive the safety-critical wiring against the mock without a
+// live config store: the invariant is NO-SILENT-DEAD-BOT — a PREDICTABLE
+// failure (bad image, cap full, unresolved secret) must abort BEFORE the
+// running container is torn down, leaving the live bot up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::BotConfigRow {
+    spawner::db::BotConfigRow {
+        id: uuid::Uuid::nil(),
+        name: "spot-live".to_string(),
+        image: image.to_string(),
+        mode: "live".to_string(),
+        cpu_limit: None,
+        memory_mb: None,
+        env: HashMap::new(),
+        secrets,
+        bot_id: Some(bot_id.to_string()),
+    }
+}
+
+/// Spawn a running `fks-bot-{bot_id}` into the mock (the "already live" bot).
+#[cfg(feature = "db")]
+async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
+    mock.spawn(SpawnRequest {
+        image: image.to_string(),
+        bot_id: Some(bot_id.to_string()),
+        mode: "live".to_string(),
+        env: HashMap::new(),
+        labels: HashMap::new(),
+        cpu_limit: None,
+        memory_limit_mb: None,
+        cmd: None,
+        entrypoint: None,
+        secrets: vec![],
+    })
+    .await
+    .expect("seed spawn");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_from_config_removes_old_and_spawns_new() {
+    // Happy path: an existing live container is torn down and replaced, and both
+    // the old id and the fresh response are returned. Exactly one bot remains.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+
+    let cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    let (old_id, resp) = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect("respawn succeeds");
+
+    assert!(old_id.is_some(), "the removed container id is echoed back");
+    assert_eq!(resp.bot_id, "crypto-spot-live");
+
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(
+        bots.len(),
+        1,
+        "no double: exactly one container after respawn"
+    );
+    assert_eq!(bots[0].state, "running");
+    assert_eq!(bots[0].name, "fks-bot-crypto-spot-live");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_bad_image_prefix_aborts_before_teardown() {
+    // The headline finding: a predictable failure (disallowed image prefix) must
+    // be caught in pre-flight, BEFORE remove_existing_bot — the live spot bot
+    // stays up. Previously the old container was removed first, then the spawn
+    // failed, leaving the real-money bot dead.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+
+    let cfg = config_row("evil-image:latest", "crypto-spot-live", vec![]);
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("disallowed image is rejected");
+    assert!(matches!(err, SpawnerError::InvalidImage(_)), "{err:?}");
+
+    // The live bot MUST still be running — never destroyed for a predictable fail.
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(bots.len(), 1, "live bot untouched");
+    assert_eq!(bots[0].state, "running");
+    assert_eq!(bots[0].name, "fks-bot-crypto-spot-live");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_cap_full_aborts_before_teardown() {
+    // Cap already full with ANOTHER bot and the target not yet running: the
+    // pre-flight cap check refuses before any teardown, and the occupying bot is
+    // left untouched.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let mut config = test_config("");
+    config.max_concurrent_bots = 1;
+    let (state, mock) = build_state(config);
+    seed_running(&mock, "fks-bot-spot:latest", "other-bot").await;
+
+    let cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("cap full is refused");
+    assert!(matches!(err, SpawnerError::TooManyBots(1)), "{err:?}");
+
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(bots.len(), 1);
+    assert_eq!(
+        bots[0].bot_id, "other-bot",
+        "the occupying bot is untouched"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_of_running_target_does_not_false_trip_its_own_cap() {
+    // At cap=1 with the TARGET bot itself occupying the slot, a respawn must
+    // SUCCEED: removing the old container frees the slot, so the cap pre-check
+    // excludes the target. (A naive pre-check would refuse and never redeploy.)
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let mut config = test_config("");
+    config.max_concurrent_bots = 1;
+    let (state, mock) = build_state(config);
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+
+    let cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    let (_old, resp) = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect("respawn of the running target at cap succeeds");
+    assert_eq!(resp.bot_id, "crypto-spot-live");
+    assert_eq!(mock.list_bots().await.unwrap().len(), 1);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_secret_unresolved_aborts_before_teardown() {
+    // The rotate-then-respawn footgun: a config requests exchange secrets that
+    // cannot be resolved (here: no store configured). The secret check lives in
+    // pre-flight, so it aborts BEFORE teardown — the live bot survives rather
+    // than being killed and left unable to restart keyless.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+
+    let cfg = config_row(
+        "fks-bot-spot:latest",
+        "crypto-spot-live",
+        vec!["kraken".to_string()],
+    );
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("unresolved secret is rejected");
+    assert!(matches!(err, SpawnerError::InvalidRequest(_)), "{err:?}");
+
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(
+        bots.len(),
+        1,
+        "live bot untouched by a pre-flight secret failure"
+    );
+    assert_eq!(bots[0].state, "running");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_409_after_removal_reports_clear_abort() {
+    // Pre-flight passes but Docker still 409s on create (the old name lingers):
+    // the handler must return the clear "respawn aborted" message, NOT a raw
+    // Docker error — and never a second live bot.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+    mock.fail_next_spawn(SpawnFault::NameConflict);
+
+    let cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("409 surfaces as an abort");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("respawn aborted"),
+        "expected clear abort, got: {msg}"
+    );
+    assert!(!err.is_name_conflict(), "wrapped, not the raw 409");
+    // The old container was removed first — no second live bot; the operator
+    // must act on the abort (documents the current behaviour).
+    assert!(mock.list_bots().await.unwrap().is_empty());
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawn_non_conflict_spawn_error_propagates_raw() {
+    // A non-409 spawn failure after teardown is propagated as-is (NOT wrapped in
+    // the name-conflict abort message), so the operator sees the real cause.
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+    mock.fail_next_spawn(SpawnFault::Generic);
+
+    let cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("generic spawn failure propagates");
+    let msg = err.to_string();
+    assert!(msg.contains("kaboom"), "raw cause preserved, got: {msg}");
+    assert!(
+        !msg.contains("respawn aborted"),
+        "not the 409 wrapper: {msg}"
+    );
+    assert!(mock.list_bots().await.unwrap().is_empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
