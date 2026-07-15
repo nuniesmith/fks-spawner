@@ -138,6 +138,49 @@ pub fn count_running_bots(bots: &[ContainerInfo]) -> usize {
     bots.iter().filter(|b| b.state == "running").count()
 }
 
+/// Remove any existing bot container named `container_name` so a fresh one can
+/// take that identity — with NO window where two containers share it. The
+/// atomic core of `POST /configs/{name}/respawn`:
+///
+///   1. inspect by name; if it doesn't exist, return `Ok(None)` (respawn stays
+///      idempotent when the bot was never started / was already stopped+removed);
+///   2. graceful stop (best-effort — an already-exited container isn't an
+///      error; the forced remove below finishes the job regardless);
+///   3. force-remove, AWAITED — this MUST complete before the caller spawns, so
+///      there is never a moment with two live containers and never a silently
+///      skipped removal. A remove failure propagates (the caller must NOT
+///      spawn).
+///
+/// Reuses the same `DockerOps::stop` / `DockerOps::remove` paths that
+/// `POST /container/{id}/stop` and `DELETE /container/{id}` use — no Docker
+/// calls are reimplemented. Returns the removed container's id (for the respawn
+/// response) or `None` when nothing was there.
+pub async fn remove_existing_bot(
+    docker: &dyn DockerOps,
+    container_name: &str,
+) -> SpawnerResult<Option<String>> {
+    match docker.inspect(container_name).await {
+        Ok(info) => {
+            // Graceful SIGTERM + the existing 30s timeout. Best-effort: a
+            // container that is already stopped (or races to exit) must not
+            // block the forced removal that actually guarantees it is gone.
+            if let Err(e) = docker.stop(container_name).await {
+                warn!(
+                    container = %container_name,
+                    error = %e,
+                    "graceful stop before respawn failed; forcing removal anyway"
+                );
+            }
+            // Force-remove MUST complete before the caller spawns.
+            docker.remove(container_name).await?;
+            Ok(Some(info.id))
+        }
+        // No such container — nothing to tear down; respawn proceeds cleanly.
+        Err(SpawnerError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Validate the operator-controlled fields of a spawn request before any Docker
 /// call: identifier charset (`bot_id`/`mode`), resource-limit bounds, and
 /// env/label cardinality. The image-prefix + concurrency guards stay in

@@ -150,6 +150,29 @@ pub struct ConfigRequest {
     /// self-contained: image + env + which keys the bot needs.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Optional bot identity this template respawns as — the container-name
+    /// suffix (`fks-bot-{bot_id}`) `POST /configs/{name}/respawn` targets.
+    /// Persisted inside the row's JSONB `config_json` blob (no schema
+    /// migration). Backward compatible: configs saved before this field
+    /// existed carry no `bot_id` and load as `None`; a respawn then requires
+    /// the id in its request body. Making a template self-contained (image +
+    /// env + secrets + which bot it is) is the whole point — a rotate-and-
+    /// redeploy is then one call with no hand-reconstruction.
+    #[serde(default)]
+    pub bot_id: Option<String>,
+}
+
+/// Request body for `POST /configs/{name}/respawn` — an OPTIONAL override of
+/// the saved config's stored `bot_id`. An empty request body (or `{}`) means
+/// "use the config's own `bot_id`". Kept tiny on purpose: respawn rebuilds the
+/// ENTIRE `SpawnRequest` from the saved config (image, mode, env, secrets,
+/// limits), so the only thing a caller might need to supply is which bot
+/// identity to (re)spawn as when the config didn't store one.
+#[derive(Debug, Deserialize)]
+pub struct RespawnRequest {
+    /// Overrides the config's stored `bot_id` when present + non-blank.
+    #[serde(default)]
+    pub bot_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -600,6 +623,42 @@ mod tests {
         let req: NotificationChannelRequest = serde_json::from_str(raw).expect("valid JSON");
         assert_eq!(req.events.len(), 3);
         assert_eq!(req.events[2], "pnl_digest");
+    }
+
+    #[test]
+    fn config_request_bot_id_deserializes_when_present() {
+        let raw = r#"{
+            "name":"crypto-spot-live",
+            "image":"fks-bot-crypto-spot:latest",
+            "mode":"live",
+            "bot_id":"crypto-spot-live"
+        }"#;
+        let req: ConfigRequest = serde_json::from_str(raw).expect("valid JSON");
+        assert_eq!(req.bot_id.as_deref(), Some("crypto-spot-live"));
+        assert_eq!(req.name, "crypto-spot-live");
+    }
+
+    #[test]
+    fn config_request_bot_id_defaults_none_backward_compatible() {
+        // A config saved before bot_id existed (no field) must still load, with
+        // bot_id = None (the respawn then needs the id in its request body).
+        let raw = r#"{"name":"crypto-funding-paper","image":"fks-bot-funding:latest"}"#;
+        let req: ConfigRequest = serde_json::from_str(raw).expect("valid JSON");
+        assert!(req.bot_id.is_none(), "absent bot_id defaults to None");
+        assert_eq!(req.mode, "paper", "mode still defaults");
+        assert!(req.secrets.is_empty());
+    }
+
+    #[test]
+    fn respawn_request_bot_id_override_and_default() {
+        // Explicit override present.
+        let with = serde_json::from_str::<RespawnRequest>(r#"{"bot_id":"other-bot"}"#)
+            .expect("valid JSON");
+        assert_eq!(with.bot_id.as_deref(), Some("other-bot"));
+
+        // Empty object → no override (use the config's own bot_id).
+        let empty = serde_json::from_str::<RespawnRequest>("{}").expect("valid JSON");
+        assert!(empty.bot_id.is_none());
     }
 
     #[test]

@@ -11,6 +11,14 @@
 //   POST   /container/{id}/stop        → ActionResponse (JSON)
 //   POST   /container/{id}/restart     → ActionResponse (JSON)
 //   GET    /container/{id}/logs        → SSE stream (text/event-stream)
+//   POST   /configs/{name}/respawn     → { bot_id, old_container_id,
+//                                          new_container_id, status, image }
+//                                        (db only) — atomic stop→remove→spawn of
+//                                        a saved config: re-injects CURRENT
+//                                        secrets (rotated keys) and runs the
+//                                        config's :latest image; idempotent when
+//                                        the bot isn't running; body
+//                                        { bot_id? } overrides the stored id.
 // =============================================================================
 
 use std::{
@@ -47,7 +55,7 @@ use crate::{
 #[cfg(feature = "db")]
 use crate::db::{BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
-use crate::docker_client::count_running_bots;
+use crate::docker_client::{count_running_bots, remove_existing_bot};
 #[cfg(feature = "db")]
 use crate::edges::{
     backtest_bot_id, backtests_query_plan, build_backtest_spawn_request, resolve_backtest_db_url,
@@ -56,7 +64,8 @@ use crate::edges::{
 #[cfg(feature = "db")]
 use crate::models::{
     AccountRequest, BacktestRequest, ConfigRequest, EdgeRequest, LayoutRequest,
-    NetWorthManualRequest, NotificationChannelRequest, SecretRequest, TransferRequest,
+    NetWorthManualRequest, NotificationChannelRequest, RespawnRequest, SecretRequest,
+    TransferRequest,
 };
 #[cfg(feature = "db")]
 use crate::notifications::{NotificationDispatcher, NotificationEvent, TestOutcome};
@@ -156,6 +165,7 @@ pub fn build_router(state: AppState) -> Router {
             get(list_configs_handler).post(save_config_handler),
         )
         .route("/configs/{name}", delete(delete_config_handler))
+        .route("/configs/{name}/respawn", post(respawn_config_handler))
         .route(
             "/ui/layouts",
             get(list_layouts_handler).post(save_layout_handler),
@@ -226,6 +236,18 @@ async fn spawn_handler(
     State(state): State<AppState>,
     Json(req): Json<SpawnRequest>,
 ) -> Result<(StatusCode, Json<SpawnResponse>), SpawnerError> {
+    let resp = spawn_bot(&state, req).await?;
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// The shared internal spawn path used by BOTH `POST /spawn` and
+/// `POST /configs/{name}/respawn`. It injects any requested stored secrets into
+/// the env (so a rotate-then-respawn picks up the CURRENT keys), spawns through
+/// the SAME `DockerOps::spawn` every guard lives behind (image-prefix, bot cap,
+/// forced network, cap_drop ALL, no-new-privileges), then does the identical
+/// off-path bookkeeping (`bot_runs` record, notify, Prometheus SD refresh).
+/// Returns the `SpawnResponse`; the HTTP handlers wrap it in their status code.
+async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse, SpawnerError> {
     let t = Instant::now();
     let image_prefix = req
         .image
@@ -316,7 +338,7 @@ async fn spawn_handler(
             // A failed spawn is a bot_error event (best-effort, off-path).
             #[cfg(feature = "db")]
             spawn_dispatch(
-                &state,
+                state,
                 NotificationEvent::error(&bot_id_hint, &image_hint, &mode_hint, &e.to_string()),
             );
             return Err(e);
@@ -357,7 +379,7 @@ async fn spawn_handler(
 
     // Notify configured channels of the successful spawn (best-effort, off-path).
     #[cfg(feature = "db")]
-    spawn_dispatch(&state, NotificationEvent::spawned(&resp));
+    spawn_dispatch(state, NotificationEvent::spawned(&resp));
 
     // Update Prometheus SD file asynchronously — don't block the response.
     let docker = state.docker.clone();
@@ -366,7 +388,7 @@ async fn spawn_handler(
         prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
     });
 
-    Ok((StatusCode::CREATED, Json(resp)))
+    Ok(resp)
 }
 
 /// Owned snapshot of a `SpawnResponse` for use inside `tokio::spawn` futures
@@ -1049,6 +1071,145 @@ async fn delete_config_handler(
 
     let removed = store.deactivate_config(&name).await?;
     Ok(Json(serde_json::json!({ "ok": removed, "name": name })))
+}
+
+/// Resolve the effective `bot_id` for a respawn. An explicit request-body
+/// override wins over the config's stored `bot_id`; a value that is blank after
+/// trimming counts as absent on either side. When neither yields a non-blank
+/// id the respawn cannot name a container, so this is an error the handler maps
+/// to a 400. Pure (no I/O) so the precedence is unit-tested directly.
+pub fn resolve_respawn_bot_id(
+    override_bot_id: Option<&str>,
+    config_bot_id: Option<&str>,
+) -> Result<String, &'static str> {
+    override_bot_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| config_bot_id.map(str::trim).filter(|s| !s.is_empty()))
+        .map(str::to_string)
+        .ok_or("bot_id required (config has none)")
+}
+
+/// POST /configs/{name}/respawn — atomically redeploy a spawner-managed bot
+/// from its saved config. One server-side call replaces the fragile manual
+/// stop → delete → reconstruct-SpawnRequest → spawn chain (which risks dropping
+/// critical env and races two live bots).
+///
+/// Optional JSON body `{ "bot_id": "..." }` overrides the config's stored
+/// bot_id (an empty body / `{}` uses the config's own). Behaviour:
+///
+///   1. load the saved config by name (404 if absent);
+///   2. resolve bot_id: body override > config.bot_id > 400;
+///   3. stop+remove the existing `fks-bot-{bot_id}` container if present, ELSE
+///      skip cleanly (idempotent — respawn works even if the bot was already
+///      stopped / never started);
+///   4. spawn a fresh container from the config through the SAME spawn path
+///      `/spawn` uses — so CURRENT stored secrets are re-injected (rotated keys
+///      picked up) and the config's `:latest` image runs (freshly-built code).
+///
+/// SAFETY (this manages the real-money spot bot): the remove in step 3 is
+/// awaited and MUST complete before the spawn in step 4 — there is never a
+/// window with two live containers for one bot_id, and never a silently-skipped
+/// removal followed by a spawn. If the spawn still hits Docker's 409 name
+/// conflict, the handler returns a clear error (old container not fully removed)
+/// rather than leaving a broken half-state.
+#[cfg(feature = "db")]
+async fn respawn_config_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    // Optional body: empty = no override. Parse leniently so a bare POST works.
+    let override_bot_id: Option<String> = if body.is_empty() {
+        None
+    } else {
+        let parsed: RespawnRequest = serde_json::from_slice(&body)
+            .map_err(|e| SpawnerError::InvalidRequest(format!("invalid respawn body: {e}")))?;
+        parsed.bot_id
+    };
+
+    let Some(store) = state.store.as_ref() else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "db_enabled": false,
+                "error": "respawn requires the spawner Postgres DB",
+            })),
+        ));
+    };
+
+    // (a) Load the saved config by name — 404 if absent/soft-deleted.
+    let Some(cfg) = store.get_config(&name).await? else {
+        return Err(SpawnerError::NotFound(format!("config '{name}'")));
+    };
+
+    // (a) Resolve bot_id: body override > config.bot_id > 400.
+    let bot_id = match resolve_respawn_bot_id(override_bot_id.as_deref(), cfg.bot_id.as_deref()) {
+        Ok(id) => id,
+        Err(error) => {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            ));
+        }
+    };
+
+    let container_name = format!("fks-bot-{bot_id}");
+
+    // (b) + (d) Stop+remove any existing container FIRST (awaited), so there is
+    // never a window with two live containers for this bot_id. Absent = None.
+    let old_container_id = remove_existing_bot(state.docker.as_ref(), &container_name).await?;
+
+    // (c) Rebuild the SpawnRequest from the saved config and spawn through the
+    // shared path — CURRENT secrets re-injected, config's :latest image used,
+    // same mandatory security posture.
+    let spawn_req = SpawnRequest {
+        image: cfg.image.clone(),
+        bot_id: Some(bot_id.clone()),
+        mode: cfg.mode.clone(),
+        env: cfg.env.clone(),
+        labels: std::collections::HashMap::new(),
+        cpu_limit: cfg.cpu_limit,
+        memory_limit_mb: cfg.memory_mb.map(i64::from),
+        cmd: None,
+        entrypoint: None,
+        secrets: cfg.secrets.clone(),
+    };
+
+    let resp = match spawn_bot(&state, spawn_req).await {
+        Ok(resp) => resp,
+        // (d) The remove reported success but Docker still holds the name. Do
+        // NOT leave a half-state or risk a second live bot — surface it clearly.
+        Err(e) if e.is_name_conflict() => {
+            return Err(SpawnerError::Other(format!(
+                "respawn aborted: container '{container_name}' still exists after removal — \
+                 the old container was not fully removed; no new container was started"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+
+    info!(
+        bot_id = %bot_id,
+        config = %name,
+        old_container_id = ?old_container_id,
+        new_container_id = %resp.container_id,
+        image = %resp.image,
+        "respawned bot from saved config"
+    );
+
+    // (e) Echo old + new container ids so the caller can confirm the swap.
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "bot_id": resp.bot_id,
+            "old_container_id": old_container_id,
+            "new_container_id": resp.container_id,
+            "status": "respawned",
+            "image": resp.image,
+        })),
+    ))
 }
 
 // ── ui_layouts: named WebUI dock layouts (see src/sql/spawner/005_ui_layouts.sql).
@@ -1879,4 +2040,53 @@ async fn logs_sse_handler(
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     )
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Tests — pure handler-adjacent logic (no HTTP, no DB, no Docker)
+// ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_respawn_bot_id;
+
+    #[test]
+    fn respawn_bot_id_prefers_body_override() {
+        // Body override wins over the config's stored bot_id.
+        let id = resolve_respawn_bot_id(Some("override-bot"), Some("config-bot"))
+            .expect("override resolves");
+        assert_eq!(id, "override-bot");
+    }
+
+    #[test]
+    fn respawn_bot_id_falls_back_to_config() {
+        // No override → the config's stored bot_id is used.
+        let id = resolve_respawn_bot_id(None, Some("crypto-spot-live")).expect("config resolves");
+        assert_eq!(id, "crypto-spot-live");
+
+        // A blank/whitespace override is treated as absent → still falls back.
+        let id = resolve_respawn_bot_id(Some("   "), Some("crypto-spot-live"))
+            .expect("blank override ignored");
+        assert_eq!(id, "crypto-spot-live");
+    }
+
+    #[test]
+    fn respawn_bot_id_trims_whitespace() {
+        let id = resolve_respawn_bot_id(Some("  padded-bot  "), None).expect("trimmed");
+        assert_eq!(id, "padded-bot");
+    }
+
+    #[test]
+    fn respawn_bot_id_missing_on_both_sides_is_error() {
+        // Neither override nor config has a usable id → 400-worthy error.
+        assert_eq!(
+            resolve_respawn_bot_id(None, None),
+            Err("bot_id required (config has none)")
+        );
+        // Blank on both sides is the same as absent.
+        assert_eq!(
+            resolve_respawn_bot_id(Some(""), Some("  ")),
+            Err("bot_id required (config has none)")
+        );
+    }
 }
