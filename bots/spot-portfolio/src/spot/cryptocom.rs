@@ -1,23 +1,23 @@
 //! Crypto.com [`SpotExchange`] adapter.
 //!
 //! Wraps exchange-apiws's `CryptocomRestClient` (public ticker) +
-//! `CryptocomPrivateClient` (get-account-summary + create-order). Crypto.com
-//! returns raw JSON for balances/orders, so those are parsed defensively; the
-//! typed public ticker drives `price`. Instrument names are `"{ASSET}_{CASH}"`
-//! (e.g. `BTC_USDT`), so the configured cash currency selects the quote pair.
+//! `CryptocomPrivateClient` (user-balance + create-order). Balances come back
+//! typed (`CryptocomUserBalance` as of exchange-apiws 0.10); the typed public
+//! ticker drives `price`; orders return raw JSON and are parsed defensively.
+//! Instrument names are `"{ASSET}_{CASH}"` (e.g. `BTC_USDT`), so the configured
+//! cash currency selects the quote pair.
 //!
 //! NB: only `price` (public) is exercised by the paper dry-run. Balances +
 //! orders should be verified against a real Crypto.com account before trusting
-//! them live (the JSON shapes are parsed defensively but untested live here).
+//! them live (untested against a live account here).
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use exchange_apiws::cryptocom::{
-    CryptocomCredentials, CryptocomPrivateClient, CryptocomRestClient,
+    CryptocomCredentials, CryptocomPrivateClient, CryptocomRestClient, CryptocomUserBalance,
 };
-use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::warn;
 
@@ -76,10 +76,35 @@ impl CryptocomSpot {
     }
 }
 
-/// Parse a JSON value that may be a number or a numeric string into f64.
-fn json_f64(v: &Value) -> Option<f64> {
-    v.as_f64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+/// Flatten Crypto.com per-account `position_balances` into free/tradeable
+/// [`Balance`]s: `free = max(quantity - reserved_qty, 0)`, skipping unnamed
+/// assets and zero-free holdings. Pure over the typed `get_user_balance`
+/// response so the mapping can be unit-tested without a live account.
+fn free_balances(accounts: &[CryptocomUserBalance]) -> Vec<Balance> {
+    let mut out = Vec::new();
+    for acct in accounts {
+        for p in &acct.position_balances {
+            if p.instrument_name.is_empty() {
+                continue;
+            }
+            // quantity = total holding; subtract reserved (in open orders) for
+            // the free/tradeable amount.
+            let qty = p.quantity_f64();
+            let reserved = p
+                .reserved_qty
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let free = (qty - reserved).max(0.0);
+            if free > 0.0 {
+                out.push(Balance {
+                    asset: p.instrument_name.clone(),
+                    free,
+                });
+            }
+        }
+    }
+    out
 }
 
 #[async_trait]
@@ -99,42 +124,16 @@ impl SpotExchange for CryptocomSpot {
             .private
             .as_ref()
             .context("Crypto.com: balances need API keys")?;
-        let resp = pc
+        // Typed as of exchange-apiws 0.10: `get_user_balance` returns one
+        // `CryptocomUserBalance` per account (the endpoint's `data[]`, typically
+        // a single element), each carrying a `position_balances[]` per-asset
+        // breakdown of {instrument_name, quantity, reserved_qty, ...}. The
+        // `result`/`data` envelope is unwrapped by the client.
+        let accounts = pc
             .get_user_balance()
             .await
             .context("Crypto.com get_user_balance")?;
-        // user-balance shape: result.data[0].position_balances[] of
-        // {instrument_name, quantity, reserved_qty, ...}. The `result` envelope is
-        // already unwrapped, so `data` may sit at the top level or under `result`.
-        let data = resp
-            .get("result")
-            .and_then(|r| r.get("data"))
-            .or_else(|| resp.get("data"))
-            .and_then(Value::as_array)
-            .context("Crypto.com: no `data` in user-balance response")?;
-        let mut out = Vec::new();
-        for acct in data {
-            let Some(positions) = acct.get("position_balances").and_then(Value::as_array) else {
-                continue;
-            };
-            for p in positions {
-                let Some(inst) = p.get("instrument_name").and_then(Value::as_str) else {
-                    continue;
-                };
-                // quantity = total holding; subtract reserved (in open orders) for
-                // the free/tradeable amount.
-                let qty = p.get("quantity").and_then(json_f64).unwrap_or(0.0);
-                let reserved = p.get("reserved_qty").and_then(json_f64).unwrap_or(0.0);
-                let free = (qty - reserved).max(0.0);
-                if free > 0.0 {
-                    out.push(Balance {
-                        asset: inst.to_string(),
-                        free,
-                    });
-                }
-            }
-        }
-        Ok(out)
+        Ok(free_balances(&accounts))
     }
 
     async fn price(&self, asset: &str) -> Result<f64> {
@@ -198,5 +197,64 @@ impl SpotExchange for CryptocomSpot {
             avg_price: price,
             quote_usd: base * price,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Representative `data[0]` snapshot from `private/user-balance` (the shape the
+    // live rebalancer reads for Crypto.com holdings). Two named positions plus a
+    // zero-free and an unnamed entry that must be dropped.
+    fn snapshot() -> Vec<CryptocomUserBalance> {
+        let raw = r#"[{
+            "instrument_name": "USD",
+            "position_balances": [
+                { "instrument_name": "BTC", "quantity": "0.5",  "reserved_qty": "0.1" },
+                { "instrument_name": "USD", "quantity": "100.0" },
+                { "instrument_name": "ETH", "quantity": "2.0",  "reserved_qty": "2.0" },
+                { "instrument_name": "",    "quantity": "9.9" }
+            ]
+        }]"#;
+        serde_json::from_str(raw).expect("deserialize user-balance snapshot")
+    }
+
+    #[test]
+    fn free_balances_subtracts_reserved_and_drops_empty() {
+        let out = free_balances(&snapshot());
+        // BTC: 0.5 - 0.1 = 0.4 free; USD: 100.0 (no reserved). ETH nets to 0 and
+        // the unnamed asset is skipped, so neither appears.
+        assert_eq!(out.len(), 2);
+        let btc = out.iter().find(|b| b.asset == "BTC").expect("BTC present");
+        assert!((btc.free - 0.4).abs() < 1e-9);
+        let usd = out.iter().find(|b| b.asset == "USD").expect("USD present");
+        assert!((usd.free - 100.0).abs() < 1e-9);
+        assert!(
+            out.iter().all(|b| b.asset != "ETH"),
+            "fully-reserved ETH dropped"
+        );
+        assert!(
+            out.iter().all(|b| !b.asset.is_empty()),
+            "unnamed asset dropped"
+        );
+    }
+
+    #[test]
+    fn free_balances_tolerates_numeric_wire_amounts() {
+        // The `flex` deserializer accepts JSON numbers as well as strings.
+        let accounts: Vec<CryptocomUserBalance> = serde_json::from_str(
+            r#"[{"position_balances":[{"instrument_name":"SOL","quantity":3.5,"reserved_qty":0.5}]}]"#,
+        )
+        .expect("deserialize numeric amounts");
+        let out = free_balances(&accounts);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].asset, "SOL");
+        assert!((out[0].free - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn free_balances_empty_when_no_accounts() {
+        assert!(free_balances(&[]).is_empty());
     }
 }
