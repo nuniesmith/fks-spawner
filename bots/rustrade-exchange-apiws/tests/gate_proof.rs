@@ -20,12 +20,17 @@
 //!
 //! The gates proven here map onto `crates/rustrade/src/execution.rs`:
 //!
-//! - Gate 1 — session-PnL halt (`SessionPnl::is_session_halted`, :191)
-//! - Gate 2 — circuit breaker (`CircuitBreaker::is_tripped`, :205)
-//! - Gate 3 — portfolio risk (`PortfolioRisk::check_entry`, :428)
-//! - build_order structural blocks (sizer=0 :370, min-notional :389, capability :407)
+//! - Gate 1 — session-PnL halt (`SessionPnl::is_session_halted`, :227)
+//! - Gate 2 — circuit breaker (`CircuitBreaker::is_tripped`, :241)
+//! - Gate 3 — portfolio risk (`PortfolioRisk::check_entry`, :361)
+//! - build_order structural blocks (sizer=0 :421, min-notional :432, capability :451)
 //! - kill switch (supervisor cancel / `BotHandle::shutdown`)
-//! - exits are exempt from the portfolio gate (the `Close` arm, :339)
+//! - exits are exempt from *every* de-risking gate: a reduce-only `Close`
+//!   against a non-flat position bypasses Gates 1 & 2 via the
+//!   `is_reduce_only_exit` predicate (:221) and never reaches the portfolio
+//!   (Gate 3) check, which only runs in `build_order`'s Buy/Sell arm (the
+//!   `Close` arm at :382 builds a reduce-only order and returns). This is the
+//!   rustrade 0.5.1 fix — 0.5.0 ran Gates 1 & 2 for Close too, blocking exits.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -812,26 +817,33 @@ async fn kill_switch_halts_further_placement() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Exits are exempt from the portfolio gate — a Close de-risks under a halt
+// Exit exemption (rustrade 0.5.1) — a reduce-only Close de-risks even under an
+// active session halt AND a tripped circuit breaker AND a portfolio halt
 // ─────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exit_is_never_blocked_by_portfolio_halt() {
-    // The account-wide portfolio daily-loss halt is active (account net −200 ≤
-    // −10), so a *new entry* on ENTRY is blocked by Gate 3
-    // (PortfolioRisk::check_entry). A *Close* on the same symbol must still
-    // reach the exchange, because the portfolio gate lives inside build_order's
-    // Buy|Sell arm and never runs for the Close arm — the bot must always be
-    // able to de-risk.
+async fn exit_reaches_exchange_under_session_halt_and_circuit_breaker() {
+    // Every de-risking gate on ENTRY is armed by a single realised loss of
+    // −200:
+    //   • Gate 1 — session-PnL halt: net −200 ≤ the −10 cap → halted.
+    //   • Gate 2 — circuit breaker: 1 recorded loss ≥ the 1-loss limit → tripped.
+    //   • Gate 3 — portfolio daily-loss halt: account net −200 ≤ the −10 cap.
     //
-    // IMPORTANT framework note (rustrade 0.5.0): the *portfolio* gate exempts
-    // exits, but Gates 1 (session-PnL halt) and 2 (circuit breaker) run for
-    // *every* non-Hold signal, Close included (execution.rs :191/:205 sit
-    // before build_order). So exits are NOT universally halt-exempt — a
-    // session-PnL halt or a tripped breaker would also block a Close. This
-    // test therefore keeps the per-symbol session halt disabled (−∞) and the
-    // breaker slack, isolating the portfolio-gate exemption, and the caveat is
-    // called out in the PR.
+    // Under all three, a *new entry* Buy stays fully gated — blocked by Gate 1,
+    // the first check. But a reduce-only *Close* against the open position must
+    // still REACH place_order, because the bot must always be able to de-risk:
+    //   • Gates 1 & 2 exempt it — rustrade 0.5.1 skips both checks when the
+    //     signal is a `Close` against a non-flat position (execution.rs :221,
+    //     `is_reduce_only_exit`; the :227/:241 checks sit inside `if
+    //     !is_reduce_only_exit`).
+    //   • Gate 3 never runs for it — the portfolio check lives in build_order's
+    //     Buy/Sell arm; the Close arm (:382) just builds a reduce-only order.
+    //
+    // This is the 0.5.1 de-risking fix. In 0.5.0 Gates 1 & 2 ran for *every*
+    // non-Hold signal, Close included, so this exact Close would have been
+    // blocked under the session halt — the bug this test now pins shut. (On
+    // 0.5.0 the assertion below would fail: no order would reach the exchange
+    // and `await_placement` would time out.)
     let mut h = Harness::start(
         HarnessSpec::new(&["ENTRY"])
             .decider(|ev, _pos| {
@@ -843,38 +855,38 @@ async fn exit_is_never_blocked_by_portfolio_halt() {
             })
             .open("ENTRY", 4.0, 100.0)
             .configure(|b| {
-                b.session_pnl_config(SessionPnlConfig {
-                    loss_limit: f64::NEG_INFINITY,
-                })
-                .circuit_breaker_config(CircuitBreakerConfig {
-                    loss_limit: 1_000,
-                    window_secs: 86_400,
-                    cooldown_secs: 86_400,
-                })
-                .portfolio_config(PortfolioRiskConfig {
-                    max_daily_loss: -10.0,
-                    max_concurrent_positions: 0,
-                    max_gross_exposure: f64::INFINITY,
-                })
+                b.session_pnl_config(SessionPnlConfig { loss_limit: -10.0 })
+                    .circuit_breaker_config(CircuitBreakerConfig {
+                        loss_limit: 1,
+                        window_secs: 86_400,
+                        cooldown_secs: 86_400,
+                    })
+                    .portfolio_config(PortfolioRiskConfig {
+                        max_daily_loss: -10.0,
+                        max_concurrent_positions: 0,
+                        max_gross_exposure: f64::INFINITY,
+                    })
             }),
     )
     .await;
 
-    // Book a realised loss so the account net PnL trips the portfolio daily
-    // loss halt (but not the disabled session halt / slack breaker).
+    // One realised loss arms all three de-risking gates on ENTRY at once:
+    // session halt (net −200 ≤ −10), circuit breaker (1 loss ≥ 1), and the
+    // portfolio daily-loss halt (account net −200 ≤ −10).
     h.handle
         .record_trade_outcome(&Symbol::from("ENTRY"), -200.0, 0.0)
         .await;
 
-    // First a Buy (blocked by the portfolio halt), then a Close (must go
-    // through and serves as the fence proving both events were processed).
-    h.publish_candle("ENTRY", 100.0); // → Buy, blocked by Gate 3
+    // First a Buy (blocked by the session halt), then a Close (exempt — it must
+    // go through, and serves as the fence proving both events were processed).
+    h.publish_candle("ENTRY", 100.0); // → Buy, blocked by Gate 1
     h.publish_candle("ENTRY", 200.0); // → Close, exempt and placed
     let close = h.await_placement("ENTRY").await;
 
     assert!(
         close.reduce_only && close.side == Side::Sell,
-        "the exit must reach the exchange as a reduce-only sell under the portfolio halt"
+        "the reduce-only exit must reach the exchange as a sell even under an \
+         active session halt AND a tripped circuit breaker"
     );
     let orders = h.orders_for("ENTRY").await;
     assert_eq!(
