@@ -33,7 +33,7 @@ path = "src/lib.rs"
 # Provides the `ExchangeClient` trait + the `Order`/`Position`/`Capability` types.
 # 0.5 adds the funding model, honest fills, and per-class risk; the adapter
 # advertises a real `InstrumentSpec`/`AssetClass` below.
-rustrade       = { package = "rustrade-framework", version = "0.5.0" }
+rustrade       = { package = "rustrade-framework", version = "0.5.1" }
 # Exchange REST/WS clients. KuCoin REST is always-on, so drop the other
 # exchanges' code we don't touch here.
 # Exchange REST/WS clients. KuCoin REST is always-on; enable `kraken` for the
