@@ -53,7 +53,7 @@ use crate::{
 };
 
 #[cfg(feature = "db")]
-use crate::db::{BotRunStore, RecordSpawn};
+use crate::db::{BotConfigRow, BotRunStore, RecordSpawn};
 #[cfg(feature = "db")]
 use crate::docker_client::{count_running_bots, remove_existing_bot};
 #[cfg(feature = "db")]
@@ -240,6 +240,61 @@ async fn spawn_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+/// Resolve each requested exchange's stored credentials and inject them into
+/// `env` as `{EXCHANGE}_API_KEY` / `_API_SECRET` (+ `_API_PASSPHRASE` when
+/// stored). Shared by the `/spawn` path and the respawn PRE-FLIGHT so both
+/// resolve secrets through the identical validation + store lookup.
+///
+/// Fails loudly (never silently starts a keyless bot that asked for keys) when
+/// an exchange name is malformed, more than 10 are requested, or an exchange
+/// has no stored credentials — the exact rotate-then-respawn footgun: keys
+/// stored under a mismatched name MUST surface as an error here, before the
+/// respawn tears down the running container. Existing `env` entries win
+/// (`or_insert`). Logs only the exchange name — never the credential values.
+#[cfg(feature = "db")]
+async fn inject_secrets(
+    store: &BotRunStore,
+    secrets: &[String],
+    env: &mut std::collections::HashMap<String, String>,
+) -> Result<(), SpawnerError> {
+    if secrets.len() > 10 {
+        return Err(SpawnerError::InvalidRequest(
+            "too many secrets requested (max 10 exchanges)".to_string(),
+        ));
+    }
+    for exchange in secrets {
+        let ex = exchange.trim().to_lowercase();
+        if ex.is_empty()
+            || ex.len() > 32
+            || !ex
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(SpawnerError::InvalidRequest(format!(
+                "invalid exchange name in secrets: '{exchange}'"
+            )));
+        }
+        let Some(creds) = store.get_secret(&ex).await? else {
+            return Err(SpawnerError::InvalidRequest(format!(
+                "no stored credentials for exchange '{ex}' — submit them via \
+                 POST /secrets first"
+            )));
+        };
+        let prefix = ex.to_uppercase().replace('-', "_");
+        env.entry(format!("{prefix}_API_KEY"))
+            .or_insert(creds.api_key);
+        env.entry(format!("{prefix}_API_SECRET"))
+            .or_insert(creds.api_secret);
+        if let Some(passphrase) = creds.api_passphrase {
+            env.entry(format!("{prefix}_API_PASSPHRASE"))
+                .or_insert(passphrase);
+        }
+        // Log only the exchange — never the credential values.
+        info!(exchange = %ex, "injecting stored exchange credentials into spawn env");
+    }
+    Ok(())
+}
+
 /// The shared internal spawn path used by BOTH `POST /spawn` and
 /// `POST /configs/{name}/respawn`. It injects any requested stored secrets into
 /// the env (so a rotate-then-respawn picks up the CURRENT keys), spawns through
@@ -282,50 +337,16 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     let req = {
         let mut req = req;
         if !req.secrets.is_empty() {
-            if req.secrets.len() > 10 {
-                return Err(SpawnerError::InvalidRequest(
-                    "too many secrets requested (max 10 exchanges)".to_string(),
-                ));
-            }
             let Some(store) = state.store.as_ref() else {
                 return Err(SpawnerError::InvalidRequest(
                     "secrets injection requires the spawner Postgres DB (not configured)"
                         .to_string(),
                 ));
             };
-            for exchange in &req.secrets {
-                let ex = exchange.trim().to_lowercase();
-                if ex.is_empty()
-                    || ex.len() > 32
-                    || !ex
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-                {
-                    return Err(SpawnerError::InvalidRequest(format!(
-                        "invalid exchange name in secrets: '{exchange}'"
-                    )));
-                }
-                let Some(creds) = store.get_secret(&ex).await? else {
-                    return Err(SpawnerError::InvalidRequest(format!(
-                        "no stored credentials for exchange '{ex}' — submit them via \
-                         POST /secrets first"
-                    )));
-                };
-                let prefix = ex.to_uppercase().replace('-', "_");
-                req.env
-                    .entry(format!("{prefix}_API_KEY"))
-                    .or_insert(creds.api_key);
-                req.env
-                    .entry(format!("{prefix}_API_SECRET"))
-                    .or_insert(creds.api_secret);
-                if let Some(passphrase) = creds.api_passphrase {
-                    req.env
-                        .entry(format!("{prefix}_API_PASSPHRASE"))
-                        .or_insert(passphrase);
-                }
-                // Log only the exchange — never the credential values.
-                info!(exchange = %ex, "injecting stored exchange credentials into spawn env");
-            }
+            // `mem::take` splits the borrow (secrets list vs. env map) and leaves
+            // the request's `secrets` empty — it has now been resolved+injected.
+            let secrets = std::mem::take(&mut req.secrets);
+            inject_secrets(store, &secrets, &mut req.env).await?;
         }
         req
     };
@@ -1100,19 +1121,25 @@ pub fn resolve_respawn_bot_id(
 ///
 ///   1. load the saved config by name (404 if absent);
 ///   2. resolve bot_id: body override > config.bot_id > 400;
-///   3. stop+remove the existing `fks-bot-{bot_id}` container if present, ELSE
+///   3. PRE-FLIGHT the whole spawn with NO side effects (image prefix, input
+///      validation, secrets resolve in the store, concurrency cap) — a
+///      predictable failure aborts HERE, with the running bot still up;
+///   4. stop+remove the existing `fks-bot-{bot_id}` container if present, ELSE
 ///      skip cleanly (idempotent — respawn works even if the bot was already
 ///      stopped / never started);
-///   4. spawn a fresh container from the config through the SAME spawn path
+///   5. spawn a fresh container from the config through the SAME spawn path
 ///      `/spawn` uses — so CURRENT stored secrets are re-injected (rotated keys
 ///      picked up) and the config's `:latest` image runs (freshly-built code).
 ///
-/// SAFETY (this manages the real-money spot bot): the remove in step 3 is
-/// awaited and MUST complete before the spawn in step 4 — there is never a
-/// window with two live containers for one bot_id, and never a silently-skipped
-/// removal followed by a spawn. If the spawn still hits Docker's 409 name
-/// conflict, the handler returns a clear error (old container not fully removed)
-/// rather than leaving a broken half-state.
+/// SAFETY (this manages the real-money spot bot): steps 3–5 live in
+/// [`respawn_from_config`]. Every PREDICTABLE failure is caught in the step-3
+/// pre-flight, BEFORE the step-4 teardown, so the live bot is never destroyed
+/// only to discover its replacement can't start. The remove in step 4 is
+/// awaited and MUST complete before the spawn in step 5 — never a window with
+/// two live containers for one bot_id, never a silently-skipped removal
+/// followed by a spawn. If the spawn still hits Docker's 409 name conflict, a
+/// clear error is returned (old container not fully removed) rather than a
+/// broken half-state.
 #[cfg(feature = "db")]
 async fn respawn_config_handler(
     State(state): State<AppState>,
@@ -1155,40 +1182,9 @@ async fn respawn_config_handler(
         }
     };
 
-    let container_name = format!("fks-bot-{bot_id}");
-
-    // (b) + (d) Stop+remove any existing container FIRST (awaited), so there is
-    // never a window with two live containers for this bot_id. Absent = None.
-    let old_container_id = remove_existing_bot(state.docker.as_ref(), &container_name).await?;
-
-    // (c) Rebuild the SpawnRequest from the saved config and spawn through the
-    // shared path — CURRENT secrets re-injected, config's :latest image used,
-    // same mandatory security posture.
-    let spawn_req = SpawnRequest {
-        image: cfg.image.clone(),
-        bot_id: Some(bot_id.clone()),
-        mode: cfg.mode.clone(),
-        env: cfg.env.clone(),
-        labels: std::collections::HashMap::new(),
-        cpu_limit: cfg.cpu_limit,
-        memory_limit_mb: cfg.memory_mb.map(i64::from),
-        cmd: None,
-        entrypoint: None,
-        secrets: cfg.secrets.clone(),
-    };
-
-    let resp = match spawn_bot(&state, spawn_req).await {
-        Ok(resp) => resp,
-        // (d) The remove reported success but Docker still holds the name. Do
-        // NOT leave a half-state or risk a second live bot — surface it clearly.
-        Err(e) if e.is_name_conflict() => {
-            return Err(SpawnerError::Other(format!(
-                "respawn aborted: container '{container_name}' still exists after removal — \
-                 the old container was not fully removed; no new container was started"
-            )));
-        }
-        Err(e) => return Err(e),
-    };
+    // (b)+(c)+(d) Pre-flight validate → remove → spawn, all in the extracted
+    // helper so the safety-critical wiring is testable against the mock.
+    let (old_container_id, resp) = respawn_from_config(&state, &cfg, bot_id.clone()).await?;
 
     info!(
         bot_id = %bot_id,
@@ -1210,6 +1206,109 @@ async fn respawn_config_handler(
             "image": resp.image,
         })),
     ))
+}
+
+/// The safety-critical core of a respawn once the config is loaded and the
+/// `bot_id` resolved: **pre-flight validate (no side effects) → remove the
+/// existing container → spawn the replacement**. Split out of the HTTP handler
+/// so this wiring is exercised against the mock without a live config store.
+///
+/// SAFETY (this manages the real-money spot bot): every failure that is
+/// PREDICTABLE without touching Docker — a disallowed image prefix, a malformed
+/// bot_id/mode or out-of-range resource limit, a requested secret that does not
+/// resolve in the store (the rotate-then-respawn footgun), or the concurrency
+/// cap already being full — is caught in the pre-flight block BELOW, which runs
+/// **before** `remove_existing_bot`. So a predictable failure aborts with the
+/// old container still running, never leaving the live bot dead. Only after
+/// pre-flight passes is the old container removed (awaited — no two-live-bot
+/// window) and the replacement spawned. A residual `create_container` failure
+/// (e.g. the image tag isn't present locally — the spawn path does not pull) is
+/// the one class that can still land after teardown; it surfaces as a clear
+/// error + a `bot_error` notification (fired inside `spawn_bot`).
+#[cfg(feature = "db")]
+pub async fn respawn_from_config(
+    state: &AppState,
+    cfg: &BotConfigRow,
+    bot_id: String,
+) -> Result<(Option<String>, SpawnResponse), SpawnerError> {
+    let container_name = format!("fks-bot-{bot_id}");
+
+    // (c) Rebuild the SpawnRequest from the saved config. Spawned through the
+    // shared path — config's :latest image, same mandatory security posture.
+    let mut spawn_req = SpawnRequest {
+        image: cfg.image.clone(),
+        bot_id: Some(bot_id),
+        mode: cfg.mode.clone(),
+        env: cfg.env.clone(),
+        labels: std::collections::HashMap::new(),
+        cpu_limit: cfg.cpu_limit,
+        memory_limit_mb: cfg.memory_mb.map(i64::from),
+        cmd: None,
+        entrypoint: None,
+        secrets: cfg.secrets.clone(),
+    };
+
+    // ── PRE-FLIGHT (no side effects) — fail predictably BEFORE teardown ───────
+    // 1. Image prefix (same guard DockerClient::spawn enforces).
+    if !spawn_req
+        .image
+        .starts_with(&state.config.allowed_image_prefix)
+    {
+        return Err(SpawnerError::InvalidImage(spawn_req.image));
+    }
+    // 2. Operator-controlled input (bot_id/mode charset, resource bounds,
+    //    env/label cardinality). Also validates a body-supplied bot_id override
+    //    BEFORE we target `fks-bot-{override}` for removal.
+    crate::docker_client::validate_spawn_request(
+        &spawn_req,
+        state.config.max_cpu_limit,
+        state.config.max_memory_mb,
+    )?;
+    // 3. Secrets must resolve NOW (and are injected here, once), so a key stored
+    //    under a mismatched name fails with the live bot still up.
+    if !spawn_req.secrets.is_empty() {
+        let Some(store) = state.store.as_ref() else {
+            return Err(SpawnerError::InvalidRequest(
+                "secrets injection requires the spawner Postgres DB (not configured)".to_string(),
+            ));
+        };
+        let secrets = std::mem::take(&mut spawn_req.secrets);
+        inject_secrets(store, &secrets, &mut spawn_req.env).await?;
+    }
+    // 4. Concurrency cap — count RUNNING bots EXCLUDING the container we are
+    //    about to remove (removing it frees its slot), matching exactly what
+    //    `DockerClient::spawn` will see after the removal. A respawn of a
+    //    running bot therefore never false-trips its own cap.
+    let running = state
+        .docker
+        .list_bots()
+        .await?
+        .iter()
+        .filter(|b| b.state == "running" && b.name != container_name)
+        .count();
+    if running >= state.config.max_concurrent_bots {
+        return Err(SpawnerError::TooManyBots(running));
+    }
+
+    // ── (b)+(d) Teardown then spawn ───────────────────────────────────────────
+    // Stop+remove any existing container FIRST (awaited), so there is never a
+    // window with two live containers for this bot_id. Absent = None.
+    let old_container_id = remove_existing_bot(state.docker.as_ref(), &container_name).await?;
+
+    let resp = match spawn_bot(state, spawn_req).await {
+        Ok(resp) => resp,
+        // (d) The remove reported success but Docker still holds the name. Do
+        // NOT leave a half-state or risk a second live bot — surface it clearly.
+        Err(e) if e.is_name_conflict() => {
+            return Err(SpawnerError::Other(format!(
+                "respawn aborted: container '{container_name}' still exists after removal — \
+                 the old container was not fully removed; no new container was started"
+            )));
+        }
+        Err(e) => return Err(e),
+    };
+
+    Ok((old_container_id, resp))
 }
 
 // ── ui_layouts: named WebUI dock layouts (see src/sql/spawner/005_ui_layouts.sql).

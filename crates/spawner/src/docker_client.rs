@@ -187,7 +187,11 @@ pub async fn remove_existing_bot(
 /// [`DockerClient::spawn`]; this rejects malformed or abusive *input* — forged
 /// names, absurd CPU/RAM requests that could starve the host, oversized
 /// env/label maps. Kept pure so it's unit-tested without a Docker daemon.
-fn validate_spawn_request(req: &SpawnRequest, max_cpu: f64, max_mem_mb: i64) -> SpawnerResult<()> {
+pub(crate) fn validate_spawn_request(
+    req: &SpawnRequest,
+    max_cpu: f64,
+    max_mem_mb: i64,
+) -> SpawnerResult<()> {
     // An empty/omitted bot_id is replaced by a generated UUID in `spawn`, so
     // only validate a caller-supplied non-empty one.
     if let Some(bot_id) = req.bot_id.as_deref()
@@ -345,13 +349,32 @@ impl DockerClient {
         let container_id = created.id.clone();
 
         // ── Start ─────────────────────────────────────────────────────────────
-        self.docker
-            .start_container(&container_id, None::<bollard::query_parameters::StartContainerOptions>)
+        // If the start fails, the container was still CREATED and now occupies
+        // `container_name` in the "created" state. Left behind it would 409 the
+        // NEXT spawn/respawn of this bot_id (a name conflict the caller can't
+        // distinguish from "old container still present"). Force-remove it
+        // (best-effort) so a failed spawn leaves no orphan holding the name.
+        if let Err(e) = self
+            .docker
+            .start_container(
+                &container_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
             .await
-            .map_err(|e| {
-                warn!(container_id = %container_id, error = %e, "failed to start container — will try to remove");
-                SpawnerError::Docker(e)
-            })?;
+        {
+            warn!(container_id = %container_id, error = %e, "failed to start container — removing the created-but-unstarted orphan");
+            if let Err(rm) = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
+                )
+                .await
+            {
+                warn!(container_id = %container_id, error = %rm, "failed to remove unstarted container — it may linger under its name");
+            }
+            return Err(SpawnerError::Docker(e));
+        }
 
         info!(container_id = %&container_id[..12], "bot container started");
 
