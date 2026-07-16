@@ -31,13 +31,14 @@ path = "src/lib.rs"
 # ── The published FKS stack (crates.io) ───────────────────────────────────────
 # Framework facade — published as `rustrade-framework`, imported as `rustrade`.
 # Provides the `ExchangeClient` trait + the `Order`/`Position`/`Capability` types.
-# 0.3 adds `InstrumentSpec`/`AssetClass` (the adapter advertises a real spec below).
-rustrade       = { package = "rustrade-framework", version = "0.4" }
+# 0.5 adds the funding model, honest fills, and per-class risk; the adapter
+# advertises a real `InstrumentSpec`/`AssetClass` below.
+rustrade       = { package = "rustrade-framework", version = "0.5.0" }
 # Exchange REST/WS clients. KuCoin REST is always-on, so drop the other
 # exchanges' code we don't touch here.
 # Exchange REST/WS clients. KuCoin REST is always-on; enable `kraken` for the
 # spot adapter. The other exchanges' code stays out of the build.
-exchange-apiws = { version = "0.9.0", default-features = false, features = ["kraken"] }
+exchange-apiws = { version = "0.10.0", default-features = false, features = ["kraken"] }
 
 # ── Async / glue ──────────────────────────────────────────────────────────────
 async-trait = "0.1"
@@ -51,6 +52,9 @@ tokio       = { version = "1", features = ["rt", "sync", "time", "macros"] }
 # `test-util` enables `#[tokio::test(start_paused = true)]` for the fill-source
 # driver's deterministic timer test; `time` for the paused-clock helpers.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+# `Bot::run_until_shutdown` returns `anyhow::Result<()>`; the gate-proof harness
+# spawns it and inspects that result.
+anyhow = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
