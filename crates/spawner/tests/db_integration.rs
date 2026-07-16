@@ -96,33 +96,82 @@ struct DockerPostgres {
     port: u16,
 }
 
-/// Poll `pg_isready` inside the container until the server accepts connections
-/// (the postgres image restarts once after initdb, so an early TCP connect
-/// would race — pg_isready gates on the real readiness). Free function so it can
-/// run before the `DockerPostgres` (whose Drop tears the container down) exists.
+/// Wait until the container's Postgres is *stably* ready, then return `Some(())`
+/// (or `None` ⇒ the test SKIPs). Free function so it can run before the
+/// `DockerPostgres` (whose Drop tears the container down) exists.
+///
+/// The `postgres:16` image DOUBLE-STARTS on first boot: `initdb` brings up a
+/// temporary local server that briefly accepts connections, then the entrypoint
+/// RESTARTS it to listen for real. A single readiness check (`pg_isready`, or
+/// one probe) can succeed DURING that init phase — and then the unix socket
+/// vanishes across the restart, which is exactly the
+/// `.s.PGSQL.5432: No such file or directory` race that broke this test on a
+/// cold CI runner (locally the warm image initialised fast enough to miss it).
+///
+/// To land firmly AFTER the final restart we (a) probe with a REAL query over
+/// the SAME `docker exec … psql` path the rest of the harness uses — which
+/// proves that exact mechanism works, a guarantee `pg_isready` does not give —
+/// and (b) require the probe to succeed CONSECUTIVELY, resetting the streak on
+/// any failure, so the transient init-phase server (torn down at the restart)
+/// can never satisfy it.
 fn wait_ready(container_id: &str) -> Option<()> {
-    for _ in 0..60 {
-        let ok = Command::new("docker")
-            .args([
-                "exec",
-                container_id,
-                "pg_isready",
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-            ])
-            .output()
-            .ok()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
-            return Some(());
+    // 3 successes in a row ~500ms apart ⇒ ~1s of uninterrupted availability,
+    // which the restart window cannot span. 60 attempts preserves the old ~30s
+    // budget (a cold `initdb` can take 10-20s) with room for the streak.
+    const NEEDED_IN_A_ROW: u32 = 3;
+    const MAX_ATTEMPTS: u32 = 60;
+    let mut streak = 0u32;
+    for _ in 0..MAX_ATTEMPTS {
+        if psql_select_1(container_id) {
+            streak += 1;
+            if streak >= NEEDED_IN_A_ROW {
+                return Some(());
+            }
+        } else {
+            // Any blip (incl. the double-start restart) restarts the count, so
+            // readiness only ever returns from a window strictly after it.
+            streak = 0;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    eprintln!("SKIP: Postgres never became ready");
+    eprintln!("SKIP: Postgres never became stably ready");
     None
+}
+
+/// Readiness probe: run `SELECT 1` through the very same `docker exec … psql`
+/// mechanism `apply_schema` / `psql_scalar` rely on, and require it to print
+/// `1`. This proves the exec + psql + socket path works end to end — the thing
+/// that actually raced — which `pg_isready` cannot vouch for.
+fn psql_select_1(container_id: &str) -> bool {
+    Command::new("docker")
+        .args([
+            "exec",
+            container_id,
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-tAc",
+            "SELECT 1",
+        ])
+        .output()
+        .ok()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Heuristic: does this psql stderr look like a transient connection/socket
+/// failure (the double-start restart window) rather than a genuine SQL error?
+/// Used to decide whether a `docker exec psql` invocation is worth retrying.
+fn is_transient_conn_error(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("no such file or directory")
+        || s.contains("connection to server")
+        || s.contains("could not connect")
+        || s.contains("server closed the connection")
+        || s.contains("connection refused")
+        || s.contains("the database system is") // starting up / shutting down / in recovery
 }
 
 impl DockerPostgres {
@@ -194,63 +243,88 @@ impl DockerPostgres {
     }
 
     /// Apply the schema by piping it into `psql` inside the container.
+    ///
+    /// Belt-and-suspenders over `wait_ready`: on a *transient* connection/socket
+    /// failure (any residual double-start restart blip) retry a few times with a
+    /// short backoff. A genuine SQL error fails fast; the final failure still
+    /// panics with the psql stderr.
     fn apply_schema(&self) {
-        let mut child = Command::new("docker")
-            .args([
-                "exec",
-                "-i",
-                &self.container_id,
-                "psql",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn psql for schema apply");
-        child
-            .stdin
-            .take()
-            .expect("psql stdin")
-            .write_all(SCHEMA.as_bytes())
-            .expect("write schema to psql stdin");
-        let out = child.wait_with_output().expect("psql schema apply");
-        assert!(
-            out.status.success(),
-            "schema apply failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        const ATTEMPTS: u32 = 5;
+        let mut last_stderr = String::new();
+        for attempt in 0..ATTEMPTS {
+            let mut child = Command::new("docker")
+                .args([
+                    "exec",
+                    "-i",
+                    &self.container_id,
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn psql for schema apply");
+            child
+                .stdin
+                .take()
+                .expect("psql stdin")
+                .write_all(SCHEMA.as_bytes())
+                .expect("write schema to psql stdin");
+            let out = child.wait_with_output().expect("psql schema apply");
+            if out.status.success() {
+                return;
+            }
+            last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if attempt + 1 < ATTEMPTS && is_transient_conn_error(&last_stderr) {
+                std::thread::sleep(Duration::from_millis(500 * u64::from(attempt + 1)));
+                continue;
+            }
+            break;
+        }
+        panic!("schema apply failed: {last_stderr}");
     }
 
     /// Run a single-value query with psql (`-tA` = tuples-only, unaligned) and
     /// return the trimmed scalar. Used only for the raw encryption-at-rest
     /// assertion (reading a column the store deliberately never returns).
+    ///
+    /// Same belt-and-suspenders as `apply_schema`: retry a transient
+    /// connection/socket blip a few times before panicking with the stderr.
     fn psql_scalar(&self, sql: &str) -> String {
-        let out = Command::new("docker")
-            .args([
-                "exec",
-                &self.container_id,
-                "psql",
-                "-tAc",
-                sql,
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-            ])
-            .output()
-            .expect("psql scalar query");
-        assert!(
-            out.status.success(),
-            "psql query failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        const ATTEMPTS: u32 = 5;
+        let mut last_stderr = String::new();
+        for attempt in 0..ATTEMPTS {
+            let out = Command::new("docker")
+                .args([
+                    "exec",
+                    &self.container_id,
+                    "psql",
+                    "-tAc",
+                    sql,
+                    "-U",
+                    "postgres",
+                    "-d",
+                    "postgres",
+                ])
+                .output()
+                .expect("psql scalar query");
+            if out.status.success() {
+                return String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+            last_stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            if attempt + 1 < ATTEMPTS && is_transient_conn_error(&last_stderr) {
+                std::thread::sleep(Duration::from_millis(500 * u64::from(attempt + 1)));
+                continue;
+            }
+            break;
+        }
+        panic!("psql query failed: {last_stderr}");
     }
 }
 
