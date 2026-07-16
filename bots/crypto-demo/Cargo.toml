@@ -31,15 +31,17 @@ path = "src/main.rs"
 [dependencies]
 # ── The published FKS stack (crates.io) ───────────────────────────────────────
 # Framework facade — published as `rustrade-framework`, imported as `rustrade`.
-# 0.3 adds account-level PortfolioRisk, per-asset-class presets, and JsonFileStore.
-rustrade       = { package = "rustrade-framework", version = "0.4" }
+# 0.5 adds the funding model, honest fills, per-class risk, and the exit-exemption
+# (Close orders bypass the entry gate under a halt). Kept in lockstep with the
+# `rustrade-exchange-apiws` adapter below, which pins rustrade 0.5.1.
+rustrade       = { package = "rustrade-framework", version = "0.5" }
 # TA math — crate `indicators-ta`, library imports as `indicators`.
 indicators-ta  = "0.2"        # 0.2.2 on crates.io
 # Exchange REST/WS clients (KuCoin kline polling for market data).
 # >=0.8.1 ships its own rustls TLS backend + ring provider (self-contained HTTPS).
 # Kept in lockstep with rustrade-exchange-apiws (below): both pin chrono exactly,
 # so the demo and the adapter must resolve to the same exchange-apiws version.
-exchange-apiws = { version = "0.9.0", default-features = false }
+exchange-apiws = { version = "0.10.0", default-features = false }
 # rustrade `ExchangeClient` over exchange-apiws — the live KuCoin order path,
 # selected with DEMO_EXCHANGE=kucoin (default is the paper MockExchange).
 rustrade-exchange-apiws = { path = "../rustrade-exchange-apiws" }
