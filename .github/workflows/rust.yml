@@ -128,6 +128,47 @@ jobs:
               run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
     # -------------------------------------------------------------------------
+    # spawner DB integration — the real-SQL money-adjacent path.
+    #
+    # tests/db_integration.rs is `#[ignore]`d so the matrix's plain
+    # `cargo test` compiles but skips it (dev boxes / CI without a Docker
+    # daemon stay green). This job opts in with `-- --ignored`: it boots an
+    # ephemeral Postgres via the Docker CLI (GitHub-hosted ubuntu runners ship
+    # a working Docker daemon + socket for the runner user, so no `services:`
+    # block is needed — the test manages its own container's lifecycle and
+    # tears it down on Drop). If the daemon were ever absent the test would log
+    # a skip and pass, so this can never flake red on infra.
+    # -------------------------------------------------------------------------
+    db-integration:
+        name: spawner db-integration
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        steps:
+            - name: 📥 Checkout
+              uses: actions/checkout@v4
+
+            - name: 🦀 Install Rust toolchain (stable)
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: 🗄️ Cargo cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  workspaces: crates/spawner
+                  prefix-key: spawner-db-integration
+
+            - name: 🐘 Pre-pull the Postgres image
+              # The test boots `postgres:16`; pull it up front so the run
+              # itself isn't racing the registry inside its readiness window.
+              run: docker pull postgres:16
+
+            - name: 🧪 cargo test --test db_integration -- --ignored
+              working-directory: crates/spawner
+              # `db` is the default feature, so the store's SQL path is built in.
+              # `--ignored` forces the otherwise-skipped ephemeral-Postgres test
+              # to actually execute against a live database.
+              run: cargo test --test db_integration --locked -- --ignored --nocapture
+
+    # -------------------------------------------------------------------------
     # cargo fmt — runs per workspace using --manifest-path so the formatter
     # doesn't follow path deps into sibling workspaces (`cargo fmt --all`
     # follows path-based dependencies, which would otherwise make this job
