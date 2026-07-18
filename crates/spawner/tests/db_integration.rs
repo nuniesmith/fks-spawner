@@ -68,6 +68,7 @@ use std::time::Duration;
 use spawner::db::{BotRunStore, RecordSpawn};
 use spawner::models::{AccountRequest, ConfigRequest, EdgeRequest};
 use spawner::net_worth::NetWorthSnapshot;
+use spawner::supervisor::RestartPolicy;
 use spawner::treasury::NewTransfer;
 
 /// Faithful transcription of the production spawner schema (fks
@@ -386,6 +387,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         // Backward-compat: this template carries NO bot_id (like configs saved
         // before the field existed) — it must round-trip as None.
         bot_id: None,
+        restart_policy: None,
     };
     let id1 = store.upsert_config(&insert).await.expect("insert config");
 
@@ -400,6 +402,13 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         env,
         secrets: vec!["kraken".to_string(), "kucoin".to_string()],
         bot_id: Some("crypto-spot-live".to_string()),
+        restart_policy: Some(RestartPolicy {
+            enabled: true,
+            max_restarts: 5,
+            window_secs: 1800,
+            backoff_base_secs: 15,
+            backoff_max_secs: 240,
+        }),
     };
     let id2 = store.upsert_config(&update).await.expect("update config");
     assert_eq!(id1, id2, "upsert by name must reuse the existing row id");
@@ -436,6 +445,32 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         one.secrets,
         vec!["kraken".to_string(), "kucoin".to_string()]
     );
+    // The opt-in restart policy round-trips via the config_json blob.
+    let policy = one
+        .restart_policy
+        .as_ref()
+        .expect("restart_policy round-trips");
+    assert!(policy.enabled);
+    assert_eq!(policy.max_restarts, 5);
+    assert_eq!(policy.window_secs, 1800);
+    assert_eq!(policy.backoff_base_secs, 15);
+
+    // The supervisor's crash-restart lookup finds this config by its bot_id.
+    let by_bot = store
+        .get_config_by_bot_id("crypto-spot-live")
+        .await
+        .expect("get_config_by_bot_id")
+        .expect("config found by bot_id");
+    assert_eq!(by_bot.name, "alpha");
+    assert!(by_bot.restart_policy.map(|p| p.enabled).unwrap_or(false));
+    assert!(
+        store
+            .get_config_by_bot_id("no-such-bot")
+            .await
+            .expect("get_config_by_bot_id miss")
+            .is_none(),
+        "unknown bot_id ⇒ None"
+    );
 
     // A config saved without a bot_id loads it back as None (backward compat).
     store
@@ -448,6 +483,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
             env: HashMap::new(),
             secrets: vec![],
             bot_id: None,
+            restart_policy: None,
         })
         .await
         .expect("insert legacy config");
@@ -615,6 +651,69 @@ async fn exercise_bot_runs(store: &BotRunStore) {
         run.runtime_secs.unwrap_or(0) >= 25,
         "trigger should compute runtime_secs (~30s), got {:?}",
         run.runtime_secs
+    );
+
+    // ── Crash path (supervisor): run_status discriminates open-vs-closed, and
+    // record_error closes ONLY an open row (a clean stop is never reopened). ──
+    let crash_started = chrono::Utc::now() - chrono::Duration::seconds(5);
+    store
+        .record_spawn(RecordSpawn {
+            container_id: "crash0000cid",
+            container_name: "fks-bot-crypto-spot",
+            image: "fks-bot-crypto-spot:latest",
+            mode: "live",
+            started_at: crash_started,
+        })
+        .await
+        .expect("record crash-bot spawn");
+
+    // While running, the ledger row is OPEN → run_status = 'running'. This is
+    // exactly the signal the supervisor reads as "exited without an API stop".
+    assert_eq!(
+        store
+            .run_status("crash0000cid")
+            .await
+            .expect("run_status open"),
+        Some("running".to_string()),
+    );
+
+    // The supervisor records the crash → status 'error'.
+    store
+        .record_error("crash0000cid", "unexpected exit (crash), exit_code=139")
+        .await
+        .expect("record_error");
+    assert_eq!(
+        store
+            .run_status("crash0000cid")
+            .await
+            .expect("run_status after crash"),
+        Some("error".to_string()),
+    );
+
+    // record_error is idempotent-safe: it only closes an OPEN row, so re-running
+    // it against the already-closed crash (or a clean stop) does not clobber the
+    // recorded state.
+    store
+        .record_error("abc123456789", "should be ignored — already stopped")
+        .await
+        .expect("record_error on closed row is a no-op");
+    let runs = store.recent_runs(50).await.expect("recent runs final");
+    let stopped = runs
+        .iter()
+        .find(|r| r.container_id == "abc123456789")
+        .expect("clean-stopped run present");
+    assert_eq!(
+        stopped.status, "stopped",
+        "record_error must not reopen/overwrite a cleanly-stopped run"
+    );
+
+    // Unknown container ⇒ None.
+    assert!(
+        store
+            .run_status("no-such-container")
+            .await
+            .expect("run_status miss")
+            .is_none()
     );
 }
 

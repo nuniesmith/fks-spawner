@@ -52,9 +52,16 @@ pub struct Config {
     pub bot_metrics_port: u16,
 
     /// Seconds a stopped container is kept before auto-prune removes it.
+    /// Keyed on the container's FINISHED time (via inspect), not created time.
     pub prune_after_secs: i64,
 
-    /// How often (in seconds) the background auto-prune task runs.
+    /// Longer retention (seconds) for QUARANTINED containers: live-mode bots and
+    /// any bot that exited unexpectedly (crashed). These are kept for forensics
+    /// instead of being fast-pruned like one-shot backtests. Env:
+    /// PRUNE_LIVE_AFTER_SECS (default 604800 = 7 days).
+    pub prune_live_after_secs: i64,
+
+    /// How often (in seconds) the background reconcile/prune task runs.
     pub prune_interval_secs: u64,
 
     /// How often (in seconds) the net-worth sampler polls each running bot's
@@ -135,6 +142,7 @@ impl Config {
                 .unwrap_or_else(|_| "/prometheus-sd/bots.json".to_string()),
             bot_metrics_port: env_parse("BOT_METRICS_PORT", 9091),
             prune_after_secs: env_parse("PRUNE_AFTER_SECS", 300),
+            prune_live_after_secs: env_parse("PRUNE_LIVE_AFTER_SECS", 604_800),
             prune_interval_secs: env_parse("PRUNE_INTERVAL_SECS", 60),
             net_worth_sample_interval_secs: env_parse(
                 "NET_WORTH_SAMPLE_INTERVAL_SECS",
@@ -211,6 +219,7 @@ mod tests {
             prometheus_sd_path: "/prometheus-sd/bots.json".to_string(),
             bot_metrics_port: 9091,
             prune_after_secs: 300,
+            prune_live_after_secs: 604_800,
             prune_interval_secs: 60,
             net_worth_sample_interval_secs: 300,
             database_url: String::new(),
@@ -246,6 +255,7 @@ mod tests {
             prometheus_sd_path: "/x".into(),
             bot_metrics_port: 9091,
             prune_after_secs: 0,
+            prune_live_after_secs: 604_800,
             prune_interval_secs: 0,
             net_worth_sample_interval_secs: 0,
             database_url: String::new(),

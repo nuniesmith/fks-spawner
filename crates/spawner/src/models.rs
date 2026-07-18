@@ -160,6 +160,12 @@ pub struct ConfigRequest {
     /// redeploy is then one call with no hand-reconstruction.
     #[serde(default)]
     pub bot_id: Option<String>,
+    /// Opt-in auto-restart policy for the supervisor. Absent = OFF (a crashed
+    /// bot is recorded + alerted but never respawned — the current behaviour).
+    /// Stored inside the row's `config_json` blob (no schema migration). See
+    /// `crate::supervisor::RestartPolicy`.
+    #[serde(default)]
+    pub restart_policy: Option<crate::supervisor::RestartPolicy>,
 }
 
 /// Request body for `POST /configs/{name}/respawn` — an OPTIONAL override of
@@ -449,6 +455,9 @@ pub struct ContainerInfo {
     pub memory_bytes: Option<i64>,
     /// Memory limit in bytes, if the container has one.
     pub memory_limit_bytes: Option<i64>,
+    /// Process exit code for an exited container (from inspect). `None` for a
+    /// running container or when read from the list summary (which omits it).
+    pub exit_code: Option<i64>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

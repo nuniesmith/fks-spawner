@@ -98,7 +98,7 @@ pub struct AppState {
 /// dispatcher and NEVER propagated, so this can never affect the lifecycle
 /// response. `tokio::spawn` detaches it so we don't await it on the request.
 #[cfg(feature = "db")]
-fn spawn_dispatch(state: &AppState, ev: NotificationEvent) {
+pub(crate) fn spawn_dispatch(state: &AppState, ev: NotificationEvent) {
     if !state.config.notify_enabled {
         return;
     }
