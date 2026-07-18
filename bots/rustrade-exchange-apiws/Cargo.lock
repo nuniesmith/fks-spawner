@@ -230,14 +230,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "exchange-apiws"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "134df278abd5966f4fe81572a4fb450fe80819ac01ecd2da1b822c184d95cd0e"
+checksum = "cce7a2fed4a25a8cda0d156daf91dd44f5834c5b99b9fee94d15660a9d8cbbc3"
 dependencies = [
  "anyhow",
  "base64",
@@ -996,7 +996,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1018,9 +1018,9 @@ dependencies = [
 
 [[package]]
 name = "rustrade-core"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0e12bef9b9cd1d8e6b4cd9f57414e627f0f34717f059e2722e04615669a8e37"
+checksum = "293c73874692cbd074037cb150011997ab50129be382f5207617214994fe7a97"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1047,9 +1047,9 @@ dependencies = [
 
 [[package]]
 name = "rustrade-framework"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e327c920f6a9e7650281fe1a6cb6b4ba32ee1fdbf98a25964062301fc75fc41"
+checksum = "32cc58aef3473046a36fa441ae47bca2a8e64556870695cab883256b94a32055"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1068,9 +1068,9 @@ dependencies = [
 
 [[package]]
 name = "rustrade-risk"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13cd877a1d8208dfd7a16d427662faf1785ed61b4d5f8619f49d59b5941d6bdb"
+checksum = "5be5bb58834120b3f2b85ccaf91fc13573bcfef85e7bde43760082339162a170"
 dependencies = [
  "rustrade-core",
  "serde",
@@ -1080,9 +1080,9 @@ dependencies = [
 
 [[package]]
 name = "rustrade-supervisor"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4caf96abab7d42c9658b7b1ff5bed7105b1878622508377c327129a20a4f4bf0"
+checksum = "d3495daadfe739398fcf6156b87f683d733e5e0d1fdc1ee96ecd4d96e4c7708a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1770,7 +1770,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
