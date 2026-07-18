@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "exchange-apiws"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "134df278abd5966f4fe81572a4fb450fe80819ac01ecd2da1b822c184d95cd0e"
+checksum = "cce7a2fed4a25a8cda0d156daf91dd44f5834c5b99b9fee94d15660a9d8cbbc3"
 dependencies = [
  "anyhow",
  "base64",
