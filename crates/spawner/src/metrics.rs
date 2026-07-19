@@ -92,6 +92,22 @@ pub static RUNNING_BOTS: Lazy<Gauge> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+pub static LIVE_BOTS_RUNNING: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "fks_spawner_live_bots_running",
+        "Number of live-mode (fks.mode=live) bot containers currently running"
+    )
+    .expect("metric registration failed")
+});
+
+pub static CRASHED_BOTS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "fks_spawner_crashed_bots",
+        "Number of long-lived bot containers currently retained after an unexpected exit (crash)"
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Histograms
 // ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +137,8 @@ pub fn render() -> String {
     let _ = &*NOTIFY_FAILED_TOTAL;
     let _ = &*NET_WORTH_SNAPSHOTS_TOTAL;
     let _ = &*RUNNING_BOTS;
+    let _ = &*LIVE_BOTS_RUNNING;
+    let _ = &*CRASHED_BOTS;
     let _ = &*SPAWN_DURATION;
 
     let encoder = TextEncoder::new();

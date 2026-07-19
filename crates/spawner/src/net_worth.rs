@@ -430,6 +430,7 @@ mod tests {
             cpu_percent: None,
             memory_bytes: None,
             memory_limit_bytes: None,
+            exit_code: None,
         }
     }
 

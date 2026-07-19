@@ -173,6 +173,7 @@ impl DockerOps for MockDockerClient {
             cpu_percent: None,
             memory_bytes: None,
             memory_limit_bytes: None,
+            exit_code: None,
         };
         state.containers.insert(container_id.clone(), info);
 
@@ -260,10 +261,6 @@ impl DockerOps for MockDockerClient {
         let stream: Pin<Box<dyn Stream<Item = String> + Send>> = Box::pin(tokio_stream::empty());
         stream
     }
-
-    async fn auto_prune(&self) -> SpawnerResult<usize> {
-        Ok(0)
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,6 +282,7 @@ fn test_config(internal_token: &str) -> Config {
         prometheus_sd_path: "/tmp/spawner-test-sd.json".to_string(),
         bot_metrics_port: 9091,
         prune_after_secs: 300,
+        prune_live_after_secs: 604_800,
         prune_interval_secs: 60,
         net_worth_sample_interval_secs: 300,
         database_url: String::new(),
@@ -1330,6 +1328,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
         env: HashMap::new(),
         secrets,
         bot_id: Some(bot_id.to_string()),
+        restart_policy: None,
     }
 }
 
@@ -2416,4 +2415,59 @@ async fn treasury_routes_are_token_gated() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route: {uri}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Supervisor — prune exemption wiring (via the mock docker, no DB)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn supervisor_prunes_one_shot_but_quarantines_live_and_keeps_running() {
+    // prune_after_secs = 0 → an exited one-shot is immediately prune-eligible;
+    // live-mode containers get the long quarantine window instead.
+    let mut cfg = test_config("");
+    cfg.prune_after_secs = 0;
+    cfg.prune_live_after_secs = 604_800;
+    let (state, mock) = build_state(cfg);
+
+    let req = |bot_id: &str, mode: &str| -> SpawnRequest {
+        serde_json::from_value(serde_json::json!({
+            "image": "fks-bot-x:latest",
+            "bot_id": bot_id,
+            "mode": mode,
+        }))
+        .unwrap()
+    };
+
+    // Running live bot (must survive), a finished one-shot backtest (must be
+    // pruned), and a stopped live bot (must be quarantined, NOT fast-pruned).
+    state.docker.spawn(req("live-run", "live")).await.unwrap();
+    let bt = state.docker.spawn(req("bt-1", "backtest")).await.unwrap();
+    let stopped_live = state
+        .docker
+        .spawn(req("live-stopped", "live"))
+        .await
+        .unwrap();
+    state.docker.stop(&bt.container_id).await.unwrap();
+    state.docker.stop(&stopped_live.container_id).await.unwrap();
+
+    let mut tracker = spawner::supervisor::RestartTracker::default();
+    spawner::supervisor::tick(&state, &mut tracker).await;
+
+    let bot_ids: Vec<String> = {
+        let s = mock.state.lock().unwrap();
+        s.containers.values().map(|c| c.bot_id.clone()).collect()
+    };
+    assert!(
+        bot_ids.contains(&"live-run".to_string()),
+        "a running live bot is never a prune candidate"
+    );
+    assert!(
+        bot_ids.contains(&"live-stopped".to_string()),
+        "an exited live bot is quarantined for forensics, not fast-pruned"
+    );
+    assert!(
+        !bot_ids.contains(&"bt-1".to_string()),
+        "a finished one-shot backtest is pruned on the short retention"
+    );
 }

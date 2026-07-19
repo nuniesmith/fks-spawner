@@ -9,7 +9,8 @@
 //   inspect()      — container details as ContainerInfo
 //   list_bots()    — all containers with fks.bot=true label
 //   stream_logs()  — streaming log output (used for SSE endpoint)
-//   auto_prune()   — remove exited bot containers older than threshold
+//   (prune/reconcile now lives in crate::supervisor — crash-aware, keyed on
+//    finished-time, quarantines live + crashed containers)
 // =============================================================================
 
 use std::{collections::HashMap, pin::Pin, sync::Arc};
@@ -82,10 +83,6 @@ pub trait DockerOps: Send + Sync + 'static {
     /// Returns a stream of log lines for `id`, optionally tailing the
     /// last `tail` lines first.
     fn stream_logs(&self, id: &str, tail: Option<String>) -> LogStream;
-
-    /// Remove exited/dead bot containers older than the configured
-    /// `prune_after_secs`. Returns the number removed.
-    async fn auto_prune(&self) -> SpawnerResult<usize>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -556,62 +553,9 @@ impl DockerClient {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // auto_prune — remove exited bot containers older than `prune_after_secs`
-    // ─────────────────────────────────────────────────────────────────────────
-
-    pub async fn auto_prune(&self) -> SpawnerResult<usize> {
-        let filters: HashMap<String, Vec<String>> = HashMap::from([
-            ("label".to_string(), vec!["fks.bot=true".to_string()]),
-            (
-                "status".to_string(),
-                vec!["exited".to_string(), "dead".to_string()],
-            ),
-        ]);
-
-        let opts = ListContainersOptionsBuilder::new()
-            .all(true)
-            .filters(&filters)
-            .build();
-        let stopped = self
-            .docker
-            .list_containers(Some(opts))
-            .await
-            .map_err(SpawnerError::Docker)?;
-
-        let threshold = chrono::Duration::seconds(self.config.prune_after_secs);
-        let cutoff = Utc::now() - threshold;
-
-        let mut pruned = 0usize;
-
-        for c in stopped {
-            let id = c.id.as_deref().unwrap_or("");
-            if id.is_empty() {
-                continue;
-            }
-
-            // Use the Created timestamp from the summary as a proxy for
-            // "finished_at" (good enough for prune purposes).
-            let created_ts = c.created.unwrap_or(0);
-            let created_at = DateTime::from_timestamp(created_ts, 0).unwrap_or(Utc::now());
-
-            if created_at < cutoff {
-                match self.remove(id).await {
-                    Ok(_) => {
-                        info!(container = %&id[..12.min(id.len())], "auto-pruned stopped bot container");
-                        pruned += 1;
-                    }
-                    Err(e) => warn!(container = %id, error = %e, "auto-prune remove failed"),
-                }
-            }
-        }
-
-        if pruned > 0 {
-            info!(count = pruned, "auto-prune complete");
-        }
-
-        Ok(pruned)
-    }
+    // Prune is now crash-aware and lives in `crate::supervisor`, which keys on
+    // the container's FINISHED time (not created time) and quarantines
+    // live-mode + crashed containers for forensics. See that module.
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -652,10 +596,6 @@ impl DockerOps for DockerClient {
     fn stream_logs(&self, id: &str, tail: Option<String>) -> LogStream {
         Box::pin(DockerClient::stream_logs(self, id, tail))
     }
-
-    async fn auto_prune(&self) -> SpawnerResult<usize> {
-        DockerClient::auto_prune(self).await
-    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -695,6 +635,8 @@ fn container_info_from_summary(s: bollard::models::ContainerSummary) -> Containe
         cpu_percent: None,
         memory_bytes: None,
         memory_limit_bytes: None,
+        // The list summary carries no exit code; inspect fills it in.
+        exit_code: None,
     }
 }
 
@@ -735,6 +677,7 @@ fn container_info_from_inspect(d: bollard::models::ContainerInspectResponse) -> 
 
     let started_at = state.and_then(|s| parse_dt(s.started_at.as_ref()));
     let finished_at = state.and_then(|s| parse_dt(s.finished_at.as_ref()));
+    let exit_code = state.and_then(|s| s.exit_code);
 
     let created_at = d
         .created
@@ -762,6 +705,7 @@ fn container_info_from_inspect(d: bollard::models::ContainerInspectResponse) -> 
         cpu_percent: None,
         memory_bytes: None,
         memory_limit_bytes: None,
+        exit_code,
     }
 }
 
@@ -901,6 +845,7 @@ mod tests {
             cpu_percent: None,
             memory_bytes: None,
             memory_limit_bytes: None,
+            exit_code: None,
         }
     }
 

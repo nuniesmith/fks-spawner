@@ -39,7 +39,6 @@
 // =============================================================================
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -49,7 +48,7 @@ use spawner::config::Config;
 #[cfg(feature = "db")]
 use spawner::db;
 use spawner::docker_client::{DockerClient, DockerOps};
-use spawner::{metrics, prometheus_sd};
+use spawner::prometheus_sd;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -114,44 +113,6 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Initial SD file write ──────────────────────────────────────────────────
     prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
-
-    // ── Background: auto-prune task ────────────────────────────────────────────────
-    {
-        let docker_prune: Arc<dyn DockerOps> = docker.clone();
-        let config_prune = config.clone();
-        // The prune sweep emits a best-effort bot_removed notification per
-        // sweep (a count summary — auto_prune returns a count, not ids).
-        #[cfg(feature = "db")]
-        let store_prune = store.clone();
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(config_prune.prune_interval_secs);
-            loop {
-                tokio::time::sleep(interval).await;
-                match docker_prune.auto_prune().await {
-                    Ok(n) if n > 0 => {
-                        metrics::PRUNE_TOTAL.inc_by(n as f64);
-                        prometheus_sd::update_sd_file(docker_prune.as_ref(), &config_prune).await;
-                        // Notify configured channels (best-effort, detached).
-                        #[cfg(feature = "db")]
-                        if config_prune.notify_enabled
-                            && let Some(store) = store_prune.clone()
-                        {
-                            use spawner::notifications::{
-                                NotificationDispatcher, NotificationEvent,
-                            };
-                            tokio::spawn(async move {
-                                NotificationDispatcher::new(store)
-                                    .dispatch(NotificationEvent::pruned(n))
-                                    .await;
-                            });
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "auto-prune error"),
-                }
-            }
-        });
-    }
 
     // ── Background: net-worth sampler task ─────────────────────────────────────
     // Polls each running bot's /status endpoint on an interval and appends
@@ -240,6 +201,30 @@ async fn main() -> anyhow::Result<()> {
         docker,
         config: config.clone(),
     };
+
+    // ── Background: crash-aware reconcile + prune supervisor ────────────────────
+    // Replaces the old naive auto-prune. Every `prune_interval_secs` it:
+    //   • detects crashes (a long-lived bot found exited while its bot_runs row
+    //     is still open → close the row as 'error', emit a red bot_crashed
+    //     notification, and — opt-in per config — bounded auto-restart),
+    //   • prunes finished one-shots by their FINISHED time while QUARANTINING
+    //     live-mode + crashed containers for forensics, and
+    //   • refreshes the running/live/crashed gauges + Prometheus SD file.
+    // A healthy running bot is never a prune/crash candidate, so the live money
+    // bots are untouched while up. See crate::supervisor.
+    {
+        let sup_state = state.clone();
+        let interval = config.prune_interval_secs;
+        tokio::spawn(async move {
+            spawner::supervisor::run(sup_state, interval).await;
+        });
+        info!(
+            interval_secs = %config.prune_interval_secs,
+            prune_after_secs = %config.prune_after_secs,
+            prune_live_after_secs = %config.prune_live_after_secs,
+            "crash-supervisor + prune task started"
+        );
+    }
 
     // ── Background: weekly edge-backtest scheduler (EDGE-DECAY DETECTION) ────────
     // On a weekly cadence (default Sun 16:00 UTC — before the advisor's Sun

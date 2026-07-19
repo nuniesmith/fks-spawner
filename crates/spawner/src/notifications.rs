@@ -42,6 +42,11 @@ pub const EVENT_BOT_STOPPED: &str = "bot_stopped";
 pub const EVENT_BOT_REMOVED: &str = "bot_removed";
 /// A bot lifecycle operation failed (e.g. a spawn that never started).
 pub const EVENT_BOT_ERROR: &str = "bot_error";
+/// A RUNNING bot exited unexpectedly (crash) — the supervisor detected an
+/// exited container whose `bot_runs` row was never closed via the API. Distinct
+/// from `bot_error` (a failed spawn) so a live-money crash can be routed/paged
+/// on its own, and page-worthy: this is the 3am-panic signal.
+pub const EVENT_BOT_CRASHED: &str = "bot_crashed";
 
 /// All known event kinds, in emission-priority order. Handy for docs/tests.
 pub const ALL_EVENT_KINDS: &[&str] = &[
@@ -49,6 +54,7 @@ pub const ALL_EVENT_KINDS: &[&str] = &[
     EVENT_BOT_STOPPED,
     EVENT_BOT_REMOVED,
     EVENT_BOT_ERROR,
+    EVENT_BOT_CRASHED,
 ];
 
 /// Discord caps embed field values at 1024 chars and titles at 256; we stay
@@ -128,6 +134,20 @@ impl NotificationEvent {
         }
     }
 
+    /// `bot_crashed` — a running bot exited unexpectedly. Full context is known
+    /// (the supervisor holds the container's labels), so bot_id/image/mode are
+    /// populated and `detail` carries the exit code.
+    pub fn crashed(bot_id: &str, image: &str, mode: &str, detail: &str) -> Self {
+        Self {
+            event: EVENT_BOT_CRASHED.to_string(),
+            bot_id: bot_id.to_string(),
+            image: image.to_string(),
+            mode: mode.to_string(),
+            timestamp: Utc::now(),
+            detail: Some(detail.to_string()),
+        }
+    }
+
     fn from_container_id(event: &str, container_id: &str, detail: Option<String>) -> Self {
         Self {
             event: event.to_string(),
@@ -144,13 +164,24 @@ impl NotificationEvent {
 // Events-filter matching
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Page-worthy event kinds that MUST reach every channel regardless of its
+/// `events` filter. `bot_crashed` is a brand-new kind; a channel configured
+/// (before this kind existed) with an explicit allowlist like
+/// `["bot_error","bot_stopped"]` would otherwise SILENTLY drop the 3am
+/// live-money crash page. A page you cannot afford to lose to a stale filter is
+/// always delivered.
+pub const ALWAYS_DELIVERED_KINDS: &[&str] = &[EVENT_BOT_CRASHED];
+
 /// Whether a channel whose subscription filter is `events` should receive an
 /// event of kind `event`.
 ///
-/// An EMPTY filter is the catch-all — it receives every event. A non-empty
-/// filter only matches when it contains the event kind verbatim.
+/// A page-worthy kind (`ALWAYS_DELIVERED_KINDS`) is delivered unconditionally.
+/// Otherwise: an EMPTY filter is the catch-all — it receives every event; a
+/// non-empty filter only matches when it contains the event kind verbatim.
 pub fn channel_wants(events: &[String], event: &str) -> bool {
-    events.is_empty() || events.iter().any(|e| e == event)
+    ALWAYS_DELIVERED_KINDS.contains(&event)
+        || events.is_empty()
+        || events.iter().any(|e| e == event)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +199,7 @@ pub fn discord_payload(ev: &NotificationEvent) -> serde_json::Value {
         EVENT_BOT_STOPPED => 0xE6_7E22, // orange
         EVENT_BOT_REMOVED => 0x95_A5A6, // grey
         EVENT_BOT_ERROR => 0xE7_4C3C,   // red
+        EVENT_BOT_CRASHED => 0xE7_4C3C, // red (page-worthy)
         _ => 0x34_98DB,                 // blue (unknown)
     };
 
@@ -417,6 +449,25 @@ mod tests {
         assert!(!channel_wants(&filter, "totally_made_up"));
     }
 
+    #[test]
+    fn page_worthy_kind_bypasses_explicit_filter() {
+        // Finding-4 regression: a pre-existing channel with an explicit allowlist
+        // that predates `bot_crashed` must STILL receive the crash page — a
+        // page-worthy kind is never silently dropped by a stale filter.
+        let filter = vec![EVENT_BOT_ERROR.to_string(), EVENT_BOT_STOPPED.to_string()];
+        assert!(!filter.iter().any(|e| e == EVENT_BOT_CRASHED));
+        assert!(
+            channel_wants(&filter, EVENT_BOT_CRASHED),
+            "bot_crashed must be delivered despite an allowlist that omits it"
+        );
+        // Non-page kinds are still filtered normally.
+        assert!(!channel_wants(&filter, EVENT_BOT_SPAWNED));
+        // And every always-delivered kind bypasses the filter.
+        for kind in ALWAYS_DELIVERED_KINDS {
+            assert!(channel_wants(&filter, kind));
+        }
+    }
+
     // ── payload shape ──────────────────────────────────────────────────────
 
     #[test]
@@ -458,6 +509,28 @@ mod tests {
             .expect("detail field present");
         assert_eq!(detail["value"], "boom: OOM");
         assert_eq!(detail["inline"], false);
+    }
+
+    #[test]
+    fn crashed_payload_is_red_with_exit_detail() {
+        let e = NotificationEvent::crashed(
+            "crypto-spot-live",
+            "fks-bot-crypto-spot:latest",
+            "live",
+            "unexpected exit (crash), exit_code=139",
+        );
+        assert_eq!(e.event, EVENT_BOT_CRASHED);
+        let p = discord_payload(&e);
+        let embed = &p["embeds"][0];
+        assert_eq!(embed["color"], 0xE7_4C3C, "crash is a red page");
+        let fields = embed["fields"].as_array().unwrap();
+        let detail = fields
+            .iter()
+            .find(|f| f["name"] == "detail")
+            .expect("detail field present");
+        assert_eq!(detail["value"], "unexpected exit (crash), exit_code=139");
+        // A catch-all channel (empty filter) receives it.
+        assert!(channel_wants(&[], EVENT_BOT_CRASHED));
     }
 
     #[test]

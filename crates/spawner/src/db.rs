@@ -211,9 +211,10 @@ impl BotRunStore {
         Ok(())
     }
 
-    /// Record a failure — used when spawn fails AFTER container creation
-    /// (e.g. start_container failed).
-    #[allow(dead_code)] // exposed for future use; spawn() currently rolls back via remove()
+    /// Record a failure — used when a spawn fails after container creation, and
+    /// by the supervisor to close the ledger row of a bot that exited
+    /// unexpectedly (crash). Only closes rows that are still OPEN
+    /// (`stopped_at IS NULL`) so a later prune/remove can't reopen a clean stop.
     pub async fn record_error(
         &self,
         container_id: &str,
@@ -222,7 +223,7 @@ impl BotRunStore {
         sqlx::query(
             "UPDATE bot_runs \
              SET status = 'error', error_message = $2, stopped_at = NOW() \
-             WHERE container_id = $1",
+             WHERE container_id = $1 AND stopped_at IS NULL",
         )
         .bind(container_id)
         .bind(message)
@@ -230,6 +231,23 @@ impl BotRunStore {
         .await
         .map_err(map_sqlx)?;
         Ok(())
+    }
+
+    /// Latest `bot_runs` status for a container id (newest row wins). `None`
+    /// when no row exists. Used by the supervisor to tell an operator-stopped
+    /// container ('stopped'/'pruned') from a crash (row still 'running').
+    pub async fn run_status(&self, container_id: &str) -> Result<Option<String>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT status FROM bot_runs \
+             WHERE container_id = $1 \
+             ORDER BY started_at DESC \
+             LIMIT 1",
+        )
+        .bind(container_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|r| r.get::<String, _>("status")))
     }
 
     /// Recent run history — newest first. Limit is clamped to 1..=500.
@@ -481,6 +499,9 @@ impl BotRunStore {
             // bot_id lives in the JSONB blob so a self-contained respawn
             // template needs NO schema migration (the column set is unchanged).
             "bot_id": req.bot_id,
+            // restart_policy likewise rides in the blob (opt-in supervisor
+            // auto-restart); omitted when None so old configs are unchanged.
+            "restart_policy": req.restart_policy,
         });
         let row = sqlx::query(
             "INSERT INTO bot_configs (name, image, mode, config_json) \
@@ -532,6 +553,30 @@ impl BotRunStore {
              WHERE name = $1 AND is_active = TRUE",
         )
         .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        Ok(row.map(BotConfigRow::from_row))
+    }
+
+    /// Load ONE active saved config whose stored `bot_id` (in the config_json
+    /// blob) matches — the supervisor's lookup when deciding whether a crashed
+    /// bot has an opt-in restart policy. Newest updated_at wins if two active
+    /// configs share a bot_id (they shouldn't). `None` when no active config
+    /// names this bot.
+    pub async fn get_config_by_bot_id(
+        &self,
+        bot_id: &str,
+    ) -> Result<Option<BotConfigRow>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT id, name, image, mode, config_json \
+             FROM bot_configs \
+             WHERE is_active = TRUE AND config_json->>'bot_id' = $1 \
+             ORDER BY updated_at DESC \
+             LIMIT 1",
+        )
+        .bind(bot_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -1483,6 +1528,10 @@ pub struct BotConfigRow {
     /// configs saved before the field existed — surfaced on GET /configs so the
     /// WebUI can show which templates are respawn-ready.
     pub bot_id: Option<String>,
+    /// Opt-in auto-restart policy (in the config_json blob). `None` = OFF (the
+    /// current behaviour): a crashed bot is recorded + alerted but never
+    /// respawned. See `crate::supervisor::RestartPolicy`.
+    pub restart_policy: Option<crate::supervisor::RestartPolicy>,
 }
 
 impl BotConfigRow {
@@ -1515,6 +1564,11 @@ impl BotConfigRow {
             .get("bot_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // Tolerant parse: a malformed restart_policy blob loads as None (OFF)
+        // rather than poisoning the whole config row.
+        let restart_policy = cfg
+            .get("restart_policy")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         Self {
             id: r.try_get("id").unwrap_or_else(|_| Uuid::nil()),
             name: r.try_get("name").unwrap_or_default(),
@@ -1525,6 +1579,7 @@ impl BotConfigRow {
             env,
             secrets,
             bot_id,
+            restart_policy,
         }
     }
 }
