@@ -538,14 +538,16 @@ async fn stop_handler(
     state.docker.stop(&id).await?;
     metrics::STOPS_TOTAL.inc();
 
+    // Close the ledger row INLINE (awaited), not in a detached task: the
+    // supervisor classifies an exited container with a still-open row as a
+    // crash, so the row must be 'stopped' before the container's exit can be
+    // observed by a supervisor tick. A DB failure is logged but never fails the
+    // stop (the container is already stopped).
     #[cfg(feature = "db")]
-    if let Some(store) = state.store.clone() {
-        let id_owned = id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = store.record_stop(&id_owned).await {
-                warn!(error = %e, container_id = %id_owned, "record_stop failed");
-            }
-        });
+    if let Some(store) = state.store.as_ref()
+        && let Err(e) = store.record_stop(&id).await
+    {
+        warn!(error = %e, container_id = %id, "record_stop failed");
     }
 
     // Notify configured channels of the stop (best-effort, off-path).

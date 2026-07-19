@@ -164,13 +164,24 @@ impl NotificationEvent {
 // Events-filter matching
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Page-worthy event kinds that MUST reach every channel regardless of its
+/// `events` filter. `bot_crashed` is a brand-new kind; a channel configured
+/// (before this kind existed) with an explicit allowlist like
+/// `["bot_error","bot_stopped"]` would otherwise SILENTLY drop the 3am
+/// live-money crash page. A page you cannot afford to lose to a stale filter is
+/// always delivered.
+pub const ALWAYS_DELIVERED_KINDS: &[&str] = &[EVENT_BOT_CRASHED];
+
 /// Whether a channel whose subscription filter is `events` should receive an
 /// event of kind `event`.
 ///
-/// An EMPTY filter is the catch-all — it receives every event. A non-empty
-/// filter only matches when it contains the event kind verbatim.
+/// A page-worthy kind (`ALWAYS_DELIVERED_KINDS`) is delivered unconditionally.
+/// Otherwise: an EMPTY filter is the catch-all — it receives every event; a
+/// non-empty filter only matches when it contains the event kind verbatim.
 pub fn channel_wants(events: &[String], event: &str) -> bool {
-    events.is_empty() || events.iter().any(|e| e == event)
+    ALWAYS_DELIVERED_KINDS.contains(&event)
+        || events.is_empty()
+        || events.iter().any(|e| e == event)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -436,6 +447,25 @@ mod tests {
     fn specific_filter_rejects_unknown_kind() {
         let filter = vec![EVENT_BOT_SPAWNED.to_string()];
         assert!(!channel_wants(&filter, "totally_made_up"));
+    }
+
+    #[test]
+    fn page_worthy_kind_bypasses_explicit_filter() {
+        // Finding-4 regression: a pre-existing channel with an explicit allowlist
+        // that predates `bot_crashed` must STILL receive the crash page — a
+        // page-worthy kind is never silently dropped by a stale filter.
+        let filter = vec![EVENT_BOT_ERROR.to_string(), EVENT_BOT_STOPPED.to_string()];
+        assert!(!filter.iter().any(|e| e == EVENT_BOT_CRASHED));
+        assert!(
+            channel_wants(&filter, EVENT_BOT_CRASHED),
+            "bot_crashed must be delivered despite an allowlist that omits it"
+        );
+        // Non-page kinds are still filtered normally.
+        assert!(!channel_wants(&filter, EVENT_BOT_SPAWNED));
+        // And every always-delivered kind bypasses the filter.
+        for kind in ALWAYS_DELIVERED_KINDS {
+            assert!(channel_wants(&filter, kind));
+        }
     }
 
     // ── payload shape ──────────────────────────────────────────────────────

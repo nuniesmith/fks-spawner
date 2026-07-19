@@ -15,10 +15,15 @@
 //      keep the fast short-window prune — they are MEANT to exit and be reaped.
 //
 //   2. CRASH DETECTION — a long-lived bot (not a one-shot backtest) found
-//      exited/dead while its `bot_runs` row is still OPEN (status still
-//      'spawning'/'running', i.e. it was never stopped via the API) exited
-//      WITHOUT an operator stop → a crash. We close the ledger row
-//      (status='error'), emit a red `bot_crashed` notification, and keep the
+//      exited/dead with a NON-ZERO exit code while its `bot_runs` row is still
+//      OPEN (status still 'spawning'/'running', i.e. it was never stopped via
+//      the API) → a crash. Exit code 0 is a clean shutdown (graceful stop or a
+//      self-requested exit) and is NEVER a crash, even with an open row — so an
+//      out-of-band `docker stop`/`compose down` or a not-yet-committed
+//      `record_stop` cannot masquerade as one. A bot that has since come back
+//      up (running sibling) is RECOVERED and no longer counts. For a real
+//      crash we close the ledger row (status='error'), emit a red `bot_crashed`
+//      notification (exactly once per crashed container), and keep the
 //      container for the forensics window.
 //
 //   3. BOUNDED RESTART — opt-in per config (`restart_policy` in the config's
@@ -190,6 +195,18 @@ pub fn decide(
 ) -> SweepPlan {
     let mut plan = SweepPlan::default();
 
+    // Pre-pass: bot_ids that currently have a RUNNING container. A retained
+    // crashed container whose bot has since come back up — an operator respawn
+    // or a successful bounded auto-restart — is RECOVERED: the outage is over,
+    // so it must not keep the crash gauge pinned >0 (and the LiveBotCrashed page
+    // firing) for the whole 7-day forensics window. The container stays retained
+    // for forensics; it just no longer counts as an active crash.
+    let running_bot_ids: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|(c, _)| c.state == "running" && !c.bot_id.is_empty())
+        .map(|(c, _)| c.bot_id.as_str())
+        .collect();
+
     for (c, status) in items {
         match c.state.as_str() {
             "running" => {
@@ -204,10 +221,24 @@ pub fn decide(
                 let open = run_is_open(status);
                 let is_error = run_is_error(status);
 
-                // CRASH: a long-lived bot exited while its ledger row is still
-                // open (never stopped via the API). Record it and retain the
-                // container this tick — never prune a just-detected crash.
-                if !one_shot && open {
+                // A container that exited 0 shut down CLEANLY — a graceful stop
+                // (SIGTERM trapped) or a self-requested exit — never a crash,
+                // even if its ledger row was never closed via the API. That
+                // covers an out-of-band `docker stop` / `compose down`, a clean
+                // self-exit, and the window before a best-effort `record_stop`
+                // has committed. A genuine crash (panic, OOM-kill, segfault, any
+                // fatal signal) always exits NON-ZERO, so this never masks one.
+                let clean_exit = c.exit_code == Some(0);
+
+                // Bot already back up (see `running_bot_ids`): don't page,
+                // don't restart, don't count — just let normal prune retention
+                // apply below.
+                let recovered = !c.bot_id.is_empty() && running_bot_ids.contains(c.bot_id.as_str());
+
+                // CRASH: a long-lived bot exited NON-ZERO while its ledger row is
+                // still open (never stopped via the API). Record it and retain
+                // the container this tick — never prune a just-detected crash.
+                if !one_shot && open && !clean_exit && !recovered {
                     plan.crashes.push(CrashedBot {
                         container_id: c.id.clone(),
                         bot_id: c.bot_id.clone(),
@@ -218,7 +249,7 @@ pub fn decide(
                     plan.crashed_present += 1;
                     continue;
                 }
-                if !one_shot && is_error {
+                if !one_shot && is_error && !recovered {
                     plan.crashed_present += 1;
                 }
 
@@ -263,6 +294,14 @@ pub fn decide(
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub struct RestartTracker {
     attempts: std::collections::HashMap<String, Vec<DateTime<Utc>>>,
+    /// Container ids whose crash has already been handled (notified + restart
+    /// evaluated) this process-lifetime. Crash handling keys on the ledger row
+    /// being OPEN, so if `record_error` fails to CLOSE the row (a DB blip — and
+    /// a host OOM/reboot that kills the bot is exactly the event that also
+    /// stresses Postgres), `decide` would re-detect the SAME container as a
+    /// crash on every 60s tick and re-page + re-restart it. This set makes crash
+    /// handling idempotent per container independent of the DB write succeeding.
+    handled: std::collections::HashSet<String>,
 }
 
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
@@ -279,6 +318,17 @@ impl RestartTracker {
             .entry(bot_id.to_string())
             .or_default()
             .push(now);
+    }
+    /// Mark a crashed container as handled. Returns `true` the FIRST time (do
+    /// the work), `false` on every subsequent call (already notified/restarted
+    /// — skip so a re-detected-but-unclosed crash cannot spam).
+    fn mark_handled(&mut self, container_id: &str) -> bool {
+        self.handled.insert(container_id.to_string())
+    }
+    /// Drop handled entries for containers no longer present (pruned/removed) so
+    /// the set cannot grow unbounded across the process lifetime.
+    fn retain_handled(&mut self, present: &std::collections::HashSet<String>) {
+        self.handled.retain(|id| present.contains(id));
     }
 }
 
@@ -339,6 +389,12 @@ pub async fn tick(state: &crate::api::AppState, tracker: &mut RestartTracker) {
         handle_crash(state, crash, tracker).await;
     }
 
+    // Forget handled crashes whose container is gone, so the dedup set cannot
+    // grow without bound. `items` is every bot container this sweep saw.
+    let present: std::collections::HashSet<String> =
+        items.iter().map(|(c, _)| c.id.clone()).collect();
+    tracker.retain_handled(&present);
+
     // Prune eligible containers.
     let mut pruned = 0usize;
     for id in &plan.prune {
@@ -384,6 +440,14 @@ async fn handle_crash(
     crash: &CrashedBot,
     tracker: &mut RestartTracker,
 ) {
+    // Idempotency guard: notify + restart AT MOST once per crashed container.
+    // `decide` re-adds a crash every tick while its ledger row stays open, so if
+    // the close below (`record_error`) fails, without this gate every subsequent
+    // 60s tick would re-page and re-restart the same crash.
+    if !tracker.mark_handled(&crash.container_id) {
+        return;
+    }
+
     warn!(
         container_id = %crash.container_id,
         bot_id = %crash.bot_id,
@@ -671,6 +735,100 @@ mod tests {
     }
 
     #[test]
+    fn clean_exit_zero_with_open_row_is_not_a_crash() {
+        // A long-lived bot that exited 0 (graceful stop / self-exit) while its
+        // ledger row was never closed via the API (out-of-band `docker stop`,
+        // or a record_stop that hasn't committed). Exit 0 ⇒ clean, NOT a crash.
+        let mut c = container("spot", "exited", "live", 86_400, Some(30));
+        c.exit_code = Some(0);
+        let items = vec![(c, Some("running".to_string()))];
+        let plan = decide(&items, Utc::now(), 300, 604_800);
+        assert!(
+            plan.crashes.is_empty(),
+            "exit 0 is a clean shutdown, never a crash"
+        );
+        assert_eq!(plan.crashed_present, 0, "clean exit does not pin the gauge");
+        assert!(
+            plan.prune.is_empty(),
+            "a live container is still quarantined (not fast-pruned) after a clean exit"
+        );
+    }
+
+    #[test]
+    fn clean_exit_zero_paper_bot_prunes_on_short_window() {
+        // A non-live bot that self-exited 0 long ago: clean, so it takes the
+        // SHORT retention (not the crash quarantine).
+        let mut c = container("p", "exited", "paper", 4000, Some(3600));
+        c.exit_code = Some(0);
+        let items = vec![(c, Some("running".to_string()))];
+        let plan = decide(&items, Utc::now(), 300, 604_800);
+        assert!(plan.crashes.is_empty());
+        assert_eq!(plan.prune, vec!["p".to_string()]);
+    }
+
+    #[test]
+    fn nonzero_exit_with_open_row_is_still_a_crash() {
+        // Guard the fix: exit 0 exemption must not swallow a real crash. A
+        // SIGTERM-not-trapped kill (143) or OOM (137) is non-zero ⇒ crash.
+        for code in [1, 101, 134, 137, 139, 143] {
+            let mut c = container("spot", "exited", "live", 86_400, Some(30));
+            c.exit_code = Some(code);
+            let items = vec![(c, Some("running".to_string()))];
+            let plan = decide(&items, Utc::now(), 300, 604_800);
+            assert_eq!(plan.crashes.len(), 1, "exit {code} must be a crash");
+        }
+    }
+
+    #[test]
+    fn recovered_bot_clears_crash_gauge() {
+        // Finding-2 regression: a crashed container (row closed to 'error') whose
+        // bot has come back up (a NEW running container with the same bot_id,
+        // e.g. after a successful auto-restart or an operator respawn) must NOT
+        // keep the LiveBotCrashed page firing for the 7-day forensics window.
+        let mut old = container("old_ctr", "exited", "live", 86_400, Some(60));
+        old.bot_id = "spot".to_string();
+        let mut new = container("new_ctr", "running", "live", 30, None);
+        new.bot_id = "spot".to_string();
+        let items = vec![(old, Some("error".to_string())), (new, None)];
+        let plan = decide(&items, Utc::now(), 300, 604_800);
+        assert_eq!(
+            plan.crashed_present, 0,
+            "recovered bot must not pin the crash gauge"
+        );
+        assert_eq!(plan.running_live, 1);
+    }
+
+    #[test]
+    fn recovered_fresh_crash_is_not_repaged_or_restarted() {
+        // Same, for a still-OPEN row (crash detected the same tick the bot is
+        // already back up): it must not be pushed as a fresh crash (no re-page,
+        // no double auto-restart).
+        let mut old = container("old_ctr", "exited", "live", 86_400, Some(30));
+        old.bot_id = "spot".to_string();
+        old.exit_code = Some(139);
+        let mut new = container("new_ctr", "running", "live", 5, None);
+        new.bot_id = "spot".to_string();
+        let items = vec![(old, Some("running".to_string())), (new, None)];
+        let plan = decide(&items, Utc::now(), 300, 604_800);
+        assert!(
+            plan.crashes.is_empty(),
+            "a recovered crash must not be re-paged/restarted"
+        );
+        assert_eq!(plan.crashed_present, 0);
+    }
+
+    #[test]
+    fn unrecovered_crash_still_pins_gauge() {
+        // Control for the two tests above: no running sibling ⇒ still a crash.
+        let mut old = container("old_ctr", "exited", "live", 86_400, Some(30));
+        old.bot_id = "spot".to_string();
+        old.exit_code = Some(139);
+        let items = vec![(old, Some("error".to_string()))];
+        let plan = decide(&items, Utc::now(), 300, 604_800);
+        assert_eq!(plan.crashed_present, 1);
+    }
+
+    #[test]
     fn finished_backtest_with_open_row_is_not_a_crash() {
         // The critical false-positive guard: a finished backtest's bot_runs row
         // is never closed (stays 'running'), but it must NOT be a crash.
@@ -785,6 +943,36 @@ mod tests {
             ],
         );
         assert_eq!(t.count_in_window("bot", 3600, now), 1);
+    }
+
+    #[test]
+    fn mark_handled_is_idempotent_per_container() {
+        // Finding-3 regression: crash handling must fire once per container even
+        // if the ledger close keeps failing and decide re-emits it every tick.
+        let mut t = RestartTracker::default();
+        assert!(t.mark_handled("ctr_a"), "first handling does the work");
+        assert!(!t.mark_handled("ctr_a"), "re-detected crash is skipped");
+        assert!(!t.mark_handled("ctr_a"));
+        assert!(
+            t.mark_handled("ctr_b"),
+            "a different crash is handled fresh"
+        );
+    }
+
+    #[test]
+    fn retain_handled_drops_gone_containers() {
+        let mut t = RestartTracker::default();
+        t.mark_handled("ctr_a");
+        t.mark_handled("ctr_b");
+        let present: std::collections::HashSet<String> =
+            ["ctr_b".to_string()].into_iter().collect();
+        t.retain_handled(&present);
+        // ctr_a was pruned → forgotten, so if its id is ever reused it handles fresh.
+        assert!(t.mark_handled("ctr_a"), "gone container is forgotten");
+        assert!(
+            !t.mark_handled("ctr_b"),
+            "still-present container stays handled"
+        );
     }
 
     #[test]
