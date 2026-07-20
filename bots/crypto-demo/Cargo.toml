@@ -42,7 +42,7 @@ indicators-ta  = "0.2"        # 0.2.2 on crates.io
 # Kept in lockstep with rustrade-exchange-apiws (below) so the demo and the
 # adapter resolve to the same exchange-apiws copy (0.10.1 loosened the exact
 # chrono pin to a compatible 0.4 range, but version alignment is still the deal).
-exchange-apiws = { version = "0.10.1", default-features = false }
+exchange-apiws = { version = "0.11.0", default-features = false }
 # rustrade `ExchangeClient` over exchange-apiws — the live KuCoin order path,
 # selected with DEMO_EXCHANGE=kucoin (default is the paper MockExchange).
 rustrade-exchange-apiws = { path = "../rustrade-exchange-apiws" }
