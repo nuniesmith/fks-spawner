@@ -391,6 +391,14 @@ impl StatusState {
     }
 }
 
+/// True if `action` is a trade-CLOSING ledger action (`exit`, `stop_exit`, or
+/// `kill_exit`). Mirrors fks-state's `funding_brain::is_close_action`: the
+/// kill-switch close (`kill_exit`) MUST be recognised here too, or after a kill
+/// drill `/status` keeps a phantom open position and never books the round trip.
+pub fn is_close_action(action: &str) -> bool {
+    matches!(action, "exit" | "stop_exit" | "kill_exit")
+}
+
 /// Hook for the funding brain's self-contained paper-trade records: parse the
 /// `action` and keep counters + the open-position snapshot in sync. A no-op
 /// when [`init`] hasn't run (backtests, research bins).
@@ -422,7 +430,7 @@ pub fn observe_paper_event(v: &Value) {
                 }),
             );
         }
-        Some("exit") | Some("stop_exit") => {
+        Some(a) if is_close_action(a) => {
             if !live {
                 status.record_trade();
             }
@@ -684,5 +692,43 @@ mod tests {
         let ev = s.events.read().unwrap();
         assert_eq!(ev.len(), MAX_EVENTS);
         assert_eq!(ev[0]["n"], 10_u64); // oldest were dropped
+    }
+
+    #[test]
+    fn is_close_action_recognizes_kill_exit() {
+        assert!(is_close_action("exit"));
+        assert!(is_close_action("stop_exit"));
+        assert!(is_close_action("kill_exit"));
+        assert!(!is_close_action("entry"));
+        assert!(!is_close_action(""));
+    }
+
+    #[test]
+    fn observe_paper_event_kill_exit_clears_phantom_position_and_books_the_round_trip() {
+        // The H1 symptom on the spawner side: after a kill drill `/status` kept a
+        // phantom open position and skipped the round-trip counters because
+        // `kill_exit` was not in the close-action match. init() is the process
+        // global; assert on the specific symbol so parallel tests can't perturb.
+        let s = init("kill-exit-status-test", "futures", 1);
+        observe_paper_event(&json!({
+            "sym": "KEXITUSDTM", "action": "entry", "dir": 1, "entry_px": 100.0, "t": 1
+        }));
+        assert!(
+            s.positions.read().unwrap().contains_key("KEXITUSDTM"),
+            "entry opened the position"
+        );
+        let trades_before = s.trades.load(Ordering::Relaxed);
+        observe_paper_event(&json!({
+            "sym": "KEXITUSDTM", "action": "kill_exit", "ret_pct": -1.0, "net_pnl_usdt": -5.0
+        }));
+        assert!(
+            !s.positions.read().unwrap().contains_key("KEXITUSDTM"),
+            "kill_exit clears the position (no phantom open)"
+        );
+        assert_eq!(
+            s.trades.load(Ordering::Relaxed),
+            trades_before + 1,
+            "kill_exit books the round trip (paper mode)"
+        );
     }
 }
