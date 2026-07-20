@@ -47,6 +47,8 @@ async-trait = "0.1"
 chrono      = "0.4"
 serde_json  = "1"
 tracing     = "0.1"
+# Caller-owned `clientOid` idempotency key for ambiguous-fill recovery (A.7).
+uuid        = { version = "1", features = ["v4"] }
 # Runtime for the fill source's background task (spawn + channels + interval).
 tokio       = { version = "1", features = ["rt", "sync", "time", "macros"] }
 
@@ -57,6 +59,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-
 # `Bot::run_until_shutdown` returns `anyhow::Result<()>`; the gate-proof harness
 # spawns it and inspects that result.
 anyhow = "1"
+# Mock KuCoin REST endpoint for the ambiguous-fill recovery branch tests.
+wiremock = "0.6"
 
 [lints.rust]
 unsafe_code = "forbid"
