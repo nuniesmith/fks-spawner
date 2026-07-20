@@ -691,9 +691,9 @@ impl StopResolve {
             && it.size == self.size
             && it.stop.as_deref() == Some(self.direction)
             && it.reduce_only.unwrap_or(false) == self.reduce_only
-            && it
-                .stop_price
-                .is_some_and(|p| (p - self.stop_price).abs() <= 1e-6 * self.stop_price.abs().max(1.0))
+            && it.stop_price.is_some_and(|p| {
+                (p - self.stop_price).abs() <= 1e-6 * self.stop_price.abs().max(1.0)
+            })
     }
 }
 
