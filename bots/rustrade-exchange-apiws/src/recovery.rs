@@ -64,20 +64,29 @@ impl RecoveryPolicy {
 /// opposed to a transient query failure.
 ///
 /// KuCoin surfaces an unknown `clientOid` as an [`ExchangeError::Api`] whose
-/// message says the order does not exist. We match on the message rather than a
-/// single code because KuCoin has used several codes for this over time; the
+/// code is `100004` and/or whose message says the *order* does not exist. We
+/// accept the canonical code and a small set of **order-scoped** phrases — the
 /// "already exists" duplicate message (handled separately as *ambiguous*) can
-/// never match these substrings.
+/// never match these, and, critically, an unrelated gateway/routing envelope
+/// (`"service not found"`, `"symbol not found"`) must NOT be misread as "the
+/// order is absent" → that would wrongly re-place a possibly-landed order. So a
+/// bare `"not found"` no longer qualifies; the phrase must name the order.
 #[must_use]
 pub(crate) fn is_order_not_found(e: &ExchangeError) -> bool {
     match e {
-        ExchangeError::Api { message, .. } => {
+        ExchangeError::Api { code, message } => {
+            // KuCoin Futures' canonical "order does not exist" code.
+            if code == "100004" {
+                return true;
+            }
             let m = message.to_ascii_lowercase();
-            m.contains("not exist")
-                || m.contains("does not exist")
-                || m.contains("not found")
-                || m.contains("no such order")
+            m.contains("order does not exist")
+                || m.contains("order not exist")
                 || m.contains("order_not_exist")
+                || m.contains("no such order")
+                // "The order does not exist." — order-scoped, unlike a bare
+                // "not found"/"not exist" that a non-order envelope could carry.
+                || m.contains("does not exist")
         }
         _ => false,
     }
@@ -118,6 +127,8 @@ mod tests {
         )));
         assert!(is_order_not_found(&api("100004", "order not exist")));
         assert!(is_order_not_found(&api("400100", "no such order")));
+        // Matched by the canonical code even if the message is opaque.
+        assert!(is_order_not_found(&api("100004", "")));
         // A duplicate-clientOid rejection (the ambiguous case) must NOT read as
         // not-found — "already exists" contains neither "not exist" nor friends.
         assert!(!is_order_not_found(&api(
@@ -125,6 +136,12 @@ mod tests {
             "clientOid already exists"
         )));
         assert!(!is_order_not_found(&api("400100", "clientOid duplicate")));
+        // A NON-order-scoped gateway/routing "not found" must NOT masquerade as
+        // "the order is absent" — otherwise a live order could be wrongly
+        // re-placed. Bare "not found"/"not exist" no longer qualify.
+        assert!(!is_order_not_found(&api("500000", "service not found")));
+        assert!(!is_order_not_found(&api("404000", "not found")));
+        assert!(!is_order_not_found(&api("400100", "symbol not found")));
         // Transport errors are never "not found" (outcome unknown).
         assert!(!is_order_not_found(&ExchangeError::Auth("x".into())));
     }

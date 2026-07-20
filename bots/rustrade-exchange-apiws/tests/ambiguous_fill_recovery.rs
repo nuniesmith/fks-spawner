@@ -20,7 +20,7 @@
 
 use std::time::Duration;
 
-use rustrade::{ExchangeClient, Order, Position, Side, Symbol, Volume};
+use rustrade::{ExchangeClient, Order, Position, Price, Side, StopAttachment, Symbol, Volume};
 use rustrade_exchange_apiws::{KucoinExchangeAdapter, RecoveryPolicy};
 use serde_json::Value;
 use wiremock::matchers::{method, path};
@@ -30,7 +30,9 @@ use exchange_apiws::{Credentials, KuCoinClient};
 
 const ORDERS: &str = "/api/v1/orders";
 const BY_CLIENT_OID: &str = "/api/v1/orders/byClientOid";
+const STOP_ORDERS: &str = "/api/v1/stopOrders";
 const SYM: &str = "ETHUSDTM";
+const STOP_TRIGGER: f64 = 1000.0;
 
 /// Adapter pointed at the mock server, with a fast (still-exponential) recovery
 /// policy so tests exercise the backoff path without waiting.
@@ -75,6 +77,37 @@ fn order_detail(id: &str, status: &str, size: u32, filled: u32, active: bool) ->
 
 fn entry() -> Order {
     Order::market(Symbol::from(SYM), Side::Buy, Volume(1.0))
+}
+
+/// A reduce-only protective stop leg (bracket case A) — the path that places an
+/// UNTRIGGERED stop, which KuCoin holds in a bucket `byClientOid` can't see.
+/// Sell-to-close a long ⇒ trigger direction `"down"`.
+fn stop_leg() -> Order {
+    Order::market(Symbol::from(SYM), Side::Sell, Volume(1.0))
+        .with_stop(StopAttachment::stop_market(Price(STOP_TRIGGER)))
+        .with_reduce_only(true)
+}
+
+/// One entry in the `/api/v1/stopOrders` bucket, shaped to match `stop_leg()`
+/// (same symbol/side/size/direction/reduceOnly) at `stop_price`. Carries NO
+/// `clientOid` — exactly as KuCoin's `StopOrderDetail` — so recovery must match
+/// on attributes.
+fn stop_item(id: &str, stop_price: f64) -> Value {
+    serde_json::json!({
+        "id": id,
+        "symbol": SYM,
+        "side": "sell",
+        "type": "market",
+        "stop": "down",
+        "stopPrice": stop_price,
+        "size": 1,
+        "reduceOnly": true,
+    })
+}
+
+/// Body for a `GET /api/v1/stopOrders` page.
+fn stop_page(items: Vec<Value>) -> Value {
+    ok_envelope(serde_json::json!({ "items": items }))
 }
 
 /// Collect the `clientOid` from every POST /api/v1/orders the server received.
@@ -372,4 +405,185 @@ async fn close_position_recovers_ambiguous_fill() {
         .await
         .expect("ambiguous close is reconciled");
     assert_eq!(id, "venue-close-done", "adopts the real closed-order id");
+}
+
+// ── HIGH: a landed UNTRIGGERED stop is resolved via the stop bucket, not ───────
+//         misclassified as never-reached and re-placed.
+
+#[tokio::test]
+async fn stop_ambiguous_resolves_via_stop_bucket_not_never_reached() {
+    let server = MockServer::start().await;
+    // The stop submit comes back ambiguous (dup).
+    Mock::given(method("POST"))
+        .and(path(ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(dup_body()))
+        .mount(&server)
+        .await;
+    // The regular-orders bucket has NO record — expected for an untriggered
+    // stop. On its own this would (wrongly) read as "never reached".
+    Mock::given(method("GET"))
+        .and(path(BY_CLIENT_OID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(err_envelope("400100", "The order does not exist.")),
+        )
+        .mount(&server)
+        .await;
+    // ... but the stop IS resting in the SEPARATE stop bucket.
+    Mock::given(method("GET"))
+        .and(path(STOP_ORDERS))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(stop_page(vec![stop_item("resting-stop-7", STOP_TRIGGER)])),
+        )
+        .mount(&server)
+        .await;
+
+    let id = adapter(&server.uri(), 4)
+        .place_order(&stop_leg())
+        .await
+        .expect("landed stop is adopted from the stop bucket");
+    assert_eq!(
+        id, "resting-stop-7",
+        "adopts the real stop id from the stopOrders bucket"
+    );
+    // Exactly ONE submit — the landed protective stop was adopted, never
+    // re-placed (no duplicate/second resting stop).
+    assert_eq!(
+        posted_client_oids(&server).await.len(),
+        1,
+        "no double protective stop"
+    );
+}
+
+// ── stop absent from BOTH buckets ⇒ genuinely never reached ⇒ re-place same oid.
+
+#[tokio::test]
+async fn stop_ambiguous_absent_from_both_buckets_replaces_same_oid() {
+    let server = MockServer::start().await;
+    // First submit ambiguous (dup); second submit succeeds.
+    Mock::given(method("POST"))
+        .and(path(ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(dup_body()))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_envelope(
+            serde_json::json!({ "orderId": "stop-fresh-2" }),
+        )))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    // Neither bucket knows the clientOid.
+    Mock::given(method("GET"))
+        .and(path(BY_CLIENT_OID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(err_envelope("400100", "The order does not exist.")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(STOP_ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stop_page(vec![])))
+        .mount(&server)
+        .await;
+
+    let id = adapter(&server.uri(), 4)
+        .place_order(&stop_leg())
+        .await
+        .expect("re-placed after confirmed-never-reached");
+    assert_eq!(id, "stop-fresh-2");
+
+    let oids = posted_client_oids(&server).await;
+    assert_eq!(oids.len(), 2, "re-placed exactly once");
+    assert_eq!(
+        oids[0], oids[1],
+        "SAME clientOid reused on the stop re-place (idempotency key)"
+    );
+}
+
+// ── stop bucket ambiguous (>1 indistinguishable match) ⇒ surface, never guess.
+
+#[tokio::test]
+async fn stop_ambiguous_multiple_bucket_matches_surface_unknown() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(dup_body()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(BY_CLIENT_OID))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(err_envelope("400100", "The order does not exist.")),
+        )
+        .mount(&server)
+        .await;
+    // Two indistinguishable matching stops — the resolver must NOT guess an id.
+    Mock::given(method("GET"))
+        .and(path(STOP_ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(stop_page(vec![
+            stop_item("dup-stop-a", STOP_TRIGGER),
+            stop_item("dup-stop-b", STOP_TRIGGER),
+        ])))
+        .mount(&server)
+        .await;
+
+    let err = adapter(&server.uri(), 2)
+        .place_order(&stop_leg())
+        .await
+        .expect_err("ambiguous stop bucket must surface, not adopt a wrong id");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("UNKNOWN") || msg.to_lowercase().contains("reconcile"),
+        "surfaced reason should flag operator reconcile: {msg}"
+    );
+}
+
+// ── MEDIUM: an ambiguous entry that PARTIALLY filled then went terminal is ─────
+//           adopted as a (partial) landed position — not "no position".
+
+#[tokio::test]
+async fn ambiguous_then_partial_fill_adopts_partial_position() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(ORDERS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(dup_body()))
+        .mount(&server)
+        .await;
+    // Filled 3 of 5, then the remainder cancelled (a real thin-book IOC-style
+    // market outcome): terminal + not fully filled, yet 3 contracts are LIVE.
+    Mock::given(method("GET"))
+        .and(path(BY_CLIENT_OID))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(ok_envelope(serde_json::json!({
+                "id": "venue-partial",
+                "symbol": SYM,
+                "side": "buy",
+                "type": "market",
+                "status": "done",
+                "size": 5,
+                "filledSize": 3,
+                "isActive": false,
+                "cancelExist": true,
+            }))),
+        )
+        .mount(&server)
+        .await;
+
+    let id = adapter(&server.uri(), 4)
+        .place_order(&entry())
+        .await
+        .expect("partial fill is a landed position, not a failure");
+    assert_eq!(
+        id, "venue-partial",
+        "adopts the real venue id for the partial position"
+    );
+    // No futile re-place of a consumed clientOid.
+    assert_eq!(posted_client_oids(&server).await.len(), 1);
 }
