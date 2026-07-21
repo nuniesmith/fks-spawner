@@ -88,15 +88,19 @@ use rustrade::{
     AssetClass, Capability, Error, ExchangeClient, InstrumentSpec, OpenOrder, Order, OrderKind,
     OrderStatus, Position, Price, Result, Side, StopAttachment, StopKind, Symbol, Volume,
 };
+use uuid::Uuid;
 
-use exchange_apiws::rest::orders::CancelledOrders;
+use exchange_apiws::rest::orders::{CancelledOrders, OrderDetail, StopOrderDetail, SubmittedOrder};
 use exchange_apiws::{
-    Credentials, KuCoinClient, KucoinEnv, OrderType as EaOrderType, Side as EaSide,
+    Credentials, ErrorClass, KuCoinClient, KucoinEnv, OrderType as EaOrderType, Side as EaSide,
     TimeInForce as EaTif,
 };
 
 mod fills;
 pub use fills::KucoinFillSource;
+
+mod recovery;
+pub use recovery::RecoveryPolicy;
 
 mod kraken;
 pub use kraken::{KrakenFillSource, KrakenSpotAdapter};
@@ -224,6 +228,8 @@ pub struct KucoinExchangeAdapter {
     leverage: u32,
     /// symbol → base-asset units per contract (`get_contract().multiplier`).
     contract_values: HashMap<String, f64>,
+    /// Bounded retry/reconcile policy for ambiguous-fill recovery (A.7).
+    recovery: RecoveryPolicy,
 }
 
 impl KucoinExchangeAdapter {
@@ -239,7 +245,17 @@ impl KucoinExchangeAdapter {
             client,
             leverage: leverage.max(1),
             contract_values: HashMap::new(),
+            recovery: RecoveryPolicy::default(),
         }
+    }
+
+    /// Override the bounded ambiguous-fill [`RecoveryPolicy`] (builder style).
+    /// The default is a few seconds of tightly-bounded recovery; tests use a
+    /// near-zero backoff to stay fast.
+    #[must_use]
+    pub fn with_recovery_policy(mut self, policy: RecoveryPolicy) -> Self {
+        self.recovery = policy;
+        self
     }
 
     /// Register a known contract multiplier for `symbol` (builder style).
@@ -330,21 +346,41 @@ impl KucoinExchangeAdapter {
     ) -> Result<String> {
         let direction = stop_trigger_direction(side, stop.kind)?;
         let limit = stop_limit_price(stop.kind)?;
-        let resp = self
-            .client
-            .place_stop_order(
-                symbol,
-                ea_side(side),
-                size,
-                self.leverage,
-                stop.trigger_price.value(),
-                direction,
-                limit,
-                reduce_only,
-            )
-            .await
-            .map_err(ex)?;
-        Ok(resp.order_id)
+        let ea = ea_side(side);
+        let trigger = stop.trigger_price.value();
+        let leverage = self.leverage;
+        let client = &self.client;
+        // An untriggered stop lives in KuCoin's SEPARATE stopOrders bucket, which
+        // `byClientOid` on the regular-orders endpoint cannot see. Carry the
+        // stop's own attributes so an ambiguous submit is reconciled against
+        // that bucket (not misread as never-reached → double protective order).
+        let resolve = ResolveTarget::Stop(StopResolve {
+            symbol: symbol.to_string(),
+            side: match side {
+                Side::Buy => "buy",
+                Side::Sell => "sell",
+            },
+            size,
+            direction,
+            stop_price: trigger,
+            reduce_only,
+        });
+        self.submit_with_recovery("stop", symbol, resolve, |oid| async move {
+            client
+                .place_stop_order_with_client_oid(
+                    &oid,
+                    symbol,
+                    ea,
+                    size,
+                    leverage,
+                    trigger,
+                    direction,
+                    limit,
+                    reduce_only,
+                )
+                .await
+        })
+        .await
     }
 
     /// Place a plain (non-trigger) order and return its id.
@@ -356,23 +392,323 @@ impl KucoinExchangeAdapter {
         } else {
             None
         };
-        let resp = self
-            .client
-            .place_order(
-                order.symbol.as_str(),
-                ea_side(order.side),
-                size,
-                self.leverage,
-                order_type,
-                price,
-                tif,
-                order.reduce_only,
-                None,
-            )
-            .await
-            .map_err(ex)?;
-        Ok(resp.order_id)
+        let symbol = order.symbol.as_str();
+        let side = ea_side(order.side);
+        let reduce_only = order.reduce_only;
+        let leverage = self.leverage;
+        let client = &self.client;
+        self.submit_with_recovery("entry", symbol, ResolveTarget::Regular, |oid| async move {
+            client
+                .place_order_with_client_oid(
+                    &oid,
+                    symbol,
+                    side,
+                    size,
+                    leverage,
+                    order_type,
+                    price,
+                    tif,
+                    reduce_only,
+                    None,
+                )
+                .await
+        })
+        .await
     }
+
+    /// Submit an order with bounded **ambiguous-fill recovery** (A.7).
+    ///
+    /// One `clientOid` is minted per logical submit and **reused** across every
+    /// retry and re-query (the idempotency key), so no path double-submits. The
+    /// `submit` closure places the order given that `clientOid`; on error the
+    /// outcome is triaged with [`ExchangeError::classify_submit`]:
+    ///
+    /// - [`ErrorClass::Fatal`] → surface immediately (no retry).
+    /// - [`ErrorClass::Retriable`] → bounded backoff retry (same `clientOid`).
+    /// - [`ErrorClass::Ambiguous`] → resolve the *true* state via
+    ///   [`get_order_by_client_oid`](KuCoinClient::get_order_by_client_oid) and
+    ///   reconcile (adopt a landed order / re-place a never-reached one / surface
+    ///   a venue-side failure / retry on a transient resolve error).
+    ///
+    /// Never assumes filled-or-unfilled; never loops unbounded. On success it
+    /// returns the venue order id (the *real* one when an ambiguous submit is
+    /// discovered to have landed) — which the caller feeds into the bot's
+    /// existing venue-truth fill-confirmation path exactly as a clean placement.
+    async fn submit_with_recovery<F, Fut>(
+        &self,
+        what: &'static str,
+        symbol: &str,
+        resolve: ResolveTarget,
+        submit: F,
+    ) -> Result<String>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = exchange_apiws::Result<SubmittedOrder>>,
+    {
+        let client_oid = Uuid::new_v4().to_string();
+        let max = self.recovery.max_attempts.max(1);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let last = attempt >= max;
+            match submit(client_oid.clone()).await {
+                Ok(s) => {
+                    if attempt > 1 {
+                        tracing::warn!(
+                            target: "order_recovery",
+                            what, symbol, client_oid, order_id = %s.order_id, attempt,
+                            "order-submit recovered: placed on retry (clientOid reused)"
+                        );
+                    }
+                    return Ok(s.order_id);
+                }
+                Err(e) => match e.classify_submit(&client_oid) {
+                    ErrorClass::Fatal => {
+                        tracing::error!(
+                            target: "order_recovery",
+                            what, symbol, client_oid, attempt, error = %e,
+                            "order-submit FATAL — surfacing, no retry"
+                        );
+                        return Err(ex(e));
+                    }
+                    ErrorClass::Retriable => {
+                        if last {
+                            tracing::error!(
+                                target: "order_recovery",
+                                what, symbol, client_oid, attempt, error = %e,
+                                "order-submit retriable but attempts exhausted — surfacing"
+                            );
+                            return Err(ex(e));
+                        }
+                        let wait = self.recovery.backoff_after(attempt);
+                        tracing::warn!(
+                            target: "order_recovery",
+                            what, symbol, client_oid, attempt, error = %e,
+                            wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                            "order-submit retriable — backing off, reusing clientOid"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    ErrorClass::Ambiguous { .. } => {
+                        tracing::warn!(
+                            target: "order_recovery",
+                            what, symbol, client_oid, attempt, error = %e,
+                            "order-submit AMBIGUOUS — resolving true state via byClientOid"
+                        );
+                        match self.resolve(&resolve, &client_oid).await {
+                            Resolved::Landed(order_id) => {
+                                tracing::warn!(
+                                    target: "order_recovery",
+                                    what, symbol, client_oid, order_id = %order_id, attempt,
+                                    "ambiguous submit RESOLVED: order landed at venue — adopting real order id"
+                                );
+                                return Ok(order_id);
+                            }
+                            Resolved::NeverReached => {
+                                if last {
+                                    return Err(Error::exchange(format!(
+                                        "{what} {symbol}: ambiguous submit never reached the venue \
+                                         and attempts exhausted (clientOid={client_oid})"
+                                    )));
+                                }
+                                let wait = self.recovery.backoff_after(attempt);
+                                tracing::warn!(
+                                    target: "order_recovery",
+                                    what, symbol, client_oid, attempt,
+                                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                                    "ambiguous submit RESOLVED: never reached the engine — re-placing SAME clientOid"
+                                );
+                                tokio::time::sleep(wait).await;
+                            }
+                            Resolved::Unknown => {
+                                if last {
+                                    return Err(Error::exchange(format!(
+                                        "{what} {symbol}: submit outcome remained UNKNOWN after \
+                                         {attempt} attempts — operator must reconcile clientOid={client_oid}"
+                                    )));
+                                }
+                                let wait = self.recovery.backoff_after(attempt);
+                                tracing::warn!(
+                                    target: "order_recovery",
+                                    what, symbol, client_oid, attempt,
+                                    wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                                    "ambiguous submit resolve transient/UNKNOWN — retrying (clientOid reused, idempotent)"
+                                );
+                                tokio::time::sleep(wait).await;
+                            }
+                            Resolved::Failed(reason) => {
+                                tracing::error!(
+                                    target: "order_recovery",
+                                    what, symbol, client_oid, attempt, reason,
+                                    "ambiguous submit RESOLVED: order failed at venue (no position) — surfacing"
+                                );
+                                return Err(Error::exchange(format!("{what} {symbol}: {reason}")));
+                            }
+                        }
+                    }
+                    // `ErrorClass` is `#[non_exhaustive]`: an unknown future
+                    // class is surfaced conservatively rather than silently
+                    // dropped or retried.
+                    _ => return Err(ex(e)),
+                },
+            }
+        }
+    }
+
+    /// Re-query an ambiguous submit and classify its true state, routing to the
+    /// venue bucket that actually holds the order.
+    async fn resolve(&self, target: &ResolveTarget, client_oid: &str) -> Resolved {
+        match target {
+            ResolveTarget::Regular => self.resolve_client_oid(client_oid).await,
+            ResolveTarget::Stop(want) => self.resolve_stop_client_oid(want, client_oid).await,
+        }
+    }
+
+    /// Re-query an ambiguous **regular** submit's `clientOid` (the
+    /// `/api/v1/orders` bucket) and classify its true state.
+    async fn resolve_client_oid(&self, client_oid: &str) -> Resolved {
+        match self.client.get_order_by_client_oid(client_oid).await {
+            Ok(d) => classify_order_detail(client_oid, d),
+            // The venue has no record of this clientOid → the order never
+            // reached the engine → safe to treat as unsubmitted and re-place.
+            Err(e) if recovery::is_order_not_found(&e) => Resolved::NeverReached,
+            // Transient query failure → outcome still unknown; retry.
+            Err(e) if e.is_retriable() => Resolved::Unknown,
+            // Fatal query failure (auth/params) → surface.
+            Err(e) => Resolved::Failed(format!("byClientOid resolve failed fatally: {e}")),
+        }
+    }
+
+    /// Re-query an ambiguous **stop** submit and classify its true state.
+    ///
+    /// A stop can be in either of two venue buckets, so both are checked:
+    /// 1. If it already **triggered**, it became a regular order under the same
+    ///    `clientOid` — visible via `byClientOid` on `/api/v1/orders`.
+    /// 2. While **untriggered**, KuCoin holds it in a *separate* bucket
+    ///    (`/api/v1/stopOrders`) that `byClientOid` cannot see — so a not-found
+    ///    there is **expected**, not proof the order never reached the engine.
+    ///
+    /// Only after the order is absent from **both** buckets do we conclude
+    /// `NeverReached` (safe to re-place). Because `StopOrderDetail` carries no
+    /// `clientOid`, the stop bucket is matched on the order's own attributes and
+    /// a match is adopted **only when it is unique** — an ambiguous (0-vs-many)
+    /// bucket is reported `Unknown` rather than guessing a wrong order id.
+    async fn resolve_stop_client_oid(&self, want: &StopResolve, client_oid: &str) -> Resolved {
+        // (1) Did it trigger into the regular bucket?
+        match self.client.get_order_by_client_oid(client_oid).await {
+            Ok(d) => return classify_order_detail(client_oid, d),
+            // Absent from the regular bucket — expected while untriggered; fall
+            // through to the stop bucket rather than concluding NeverReached.
+            Err(e) if recovery::is_order_not_found(&e) => {}
+            Err(e) if e.is_retriable() => return Resolved::Unknown,
+            Err(e) => {
+                return Resolved::Failed(format!("stop byClientOid resolve failed fatally: {e}"));
+            }
+        }
+        // (2) Is it resting untriggered in the separate stop bucket?
+        match self.client.get_open_stop_orders(&want.symbol).await {
+            Ok(items) => {
+                let mut hits = items.into_iter().filter(|it| want.matches(it));
+                match (hits.next(), hits.next()) {
+                    // Exactly one matching untriggered stop → it landed; adopt it.
+                    (Some(hit), None) => Resolved::Landed(hit.id),
+                    // Absent from BOTH buckets → the stop never reached the
+                    // engine → safe to re-place the same clientOid.
+                    (None, _) => Resolved::NeverReached,
+                    // Multiple indistinguishable matches → cannot safely pick one
+                    // (guessing risks adopting the wrong order id); surface/retry.
+                    (Some(_), Some(_)) => Resolved::Unknown,
+                }
+            }
+            Err(e) if e.is_retriable() => Resolved::Unknown,
+            Err(e) => Resolved::Failed(format!("stop-bucket resolve failed fatally: {e}")),
+        }
+    }
+}
+
+/// Classify a resolved [`OrderDetail`] (regular bucket) into a [`Resolved`].
+///
+/// A fully-filled order, one still resting/active, **or one that is terminal but
+/// partially filled** all mean the submit LANDED with real (possibly leveraged)
+/// exposure — adopt the real venue id and let the caller's fill-confirmation
+/// path reconcile the actual fill from venue truth. Only a terminal order with
+/// **zero** fill is a true no-position outcome (the `clientOid` is consumed, so a
+/// re-place is futile) and surfaces for the caller to re-decide.
+fn classify_order_detail(client_oid: &str, d: OrderDetail) -> Resolved {
+    let filled = d.filled_size.unwrap_or(0);
+    if d.is_filled() || d.is_active() {
+        Resolved::Landed(d.id)
+    } else if filled > 0 {
+        // Terminal (done/cancelled) yet PARTIALLY filled: a live position exists
+        // even though the order left the book. Adopting it as landed prevents an
+        // untracked partial position being reported as "no position established".
+        tracing::warn!(
+            target: "order_recovery",
+            client_oid, order_id = %d.id, filled, size = d.size,
+            "ambiguous submit RESOLVED: terminal but PARTIALLY filled — adopting partial position"
+        );
+        Resolved::Landed(d.id)
+    } else {
+        Resolved::Failed(format!(
+            "clientOid {client_oid} resolved terminal-unfilled at the venue \
+             (status={}, cancelExist={:?}) — no position established",
+            d.status, d.cancel_exist
+        ))
+    }
+}
+
+/// Which venue bucket an ambiguous submit must be reconciled against.
+enum ResolveTarget {
+    /// A regular order (market / limit / close) — the `/api/v1/orders` bucket,
+    /// reconciled by `byClientOid`.
+    Regular,
+    /// A stop/trigger order — may be in the regular bucket (if triggered) or the
+    /// separate untriggered-stop bucket; matched by [`StopResolve`].
+    Stop(StopResolve),
+}
+
+/// The identifying attributes of a stop submit, used to find it in the
+/// `/api/v1/stopOrders` bucket (which carries no `clientOid` to match on).
+struct StopResolve {
+    symbol: String,
+    /// Order side as KuCoin reports it — `"buy"` / `"sell"`.
+    side: &'static str,
+    size: u32,
+    /// Trigger direction — `"up"` / `"down"`.
+    direction: &'static str,
+    stop_price: f64,
+    reduce_only: bool,
+}
+
+impl StopResolve {
+    /// Whether an untriggered stop in the venue bucket is *this* submit. Every
+    /// discriminating attribute must agree; the trigger price is compared with a
+    /// tight relative tolerance to absorb float round-tripping without matching a
+    /// neighbouring stop at a different price.
+    fn matches(&self, it: &StopOrderDetail) -> bool {
+        it.symbol == self.symbol
+            && it.side == self.side
+            && it.size == self.size
+            && it.stop.as_deref() == Some(self.direction)
+            && it.reduce_only.unwrap_or(false) == self.reduce_only
+            && it.stop_price.is_some_and(|p| {
+                (p - self.stop_price).abs() <= 1e-6 * self.stop_price.abs().max(1.0)
+            })
+    }
+}
+
+/// Outcome of resolving an ambiguous submit's `clientOid` against the venue.
+enum Resolved {
+    /// The order reached the engine and lives (filled or resting) — adopt this
+    /// real venue order id.
+    Landed(String),
+    /// The order never reached the engine — safe to re-place the same clientOid.
+    NeverReached,
+    /// The order reached the engine but established no position (cancelled /
+    /// expired), or the resolve failed fatally — surface; do not blindly retry.
+    Failed(String),
+    /// The resolve query failed transiently — the true outcome is still unknown.
+    Unknown,
 }
 
 #[async_trait]
@@ -435,12 +771,15 @@ impl ExchangeClient for KucoinExchangeAdapter {
         }
         // KuCoin wants signed contracts: positive = long (it sells to close).
         let qty = position.qty.round() as i32;
-        let resp = self
-            .client
-            .close_position(symbol.as_str(), qty, self.leverage)
-            .await
-            .map_err(ex)?;
-        Ok(resp.order_id)
+        let sym = symbol.as_str();
+        let leverage = self.leverage;
+        let client = &self.client;
+        self.submit_with_recovery("close", sym, ResolveTarget::Regular, |oid| async move {
+            client
+                .close_position_with_client_oid(&oid, sym, qty, leverage)
+                .await
+        })
+        .await
     }
 
     async fn get_position(&self, symbol: &Symbol) -> Result<Position> {
