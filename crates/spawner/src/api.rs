@@ -155,11 +155,13 @@ pub fn build_router(state: AppState) -> Router {
             "/notifications",
             get(list_notifications_handler).post(save_notification_handler),
         )
+        .route("/notifications/history", get(notification_history_handler))
         .route("/notifications/{name}", delete(delete_notification_handler))
         .route(
             "/notifications/{name}/test",
             post(test_notification_handler),
         )
+        .route("/events", post(ingest_event_handler))
         .route(
             "/configs",
             get(list_configs_handler).post(save_config_handler),
@@ -401,6 +403,16 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     // Notify configured channels of the successful spawn (best-effort, off-path).
     #[cfg(feature = "db")]
     spawn_dispatch(state, NotificationEvent::spawned(&resp));
+
+    // A live-mode spawn means real money is now moving — emit `live_flip` IN
+    // ADDITION to `bot_spawned` (always-delivered). Every live start funnels
+    // through here (`/spawn`, `/configs/{name}/respawn`, supervisor restarts),
+    // so this one emission covers them all. OD-4: every live spawn, no
+    // previous-mode DB lookup on the hot path.
+    #[cfg(feature = "db")]
+    if resp.mode == "live" {
+        spawn_dispatch(state, NotificationEvent::live_flip(&resp));
+    }
 
     // Update Prometheus SD file asynchronously — don't block the response.
     let docker = state.docker.clone();
@@ -766,6 +778,11 @@ async fn secrets_handler(
     // Log only the exchange — never the key or secret.
     info!(exchange = %exchange, "stored exchange API credentials");
 
+    // Notify configured channels that credentials rotated — the reminder that
+    // running bots need a respawn to pick up the change IS the point (best-effort,
+    // off-path; the constructor carries the exchange NAME only, never key material).
+    spawn_dispatch(&state, NotificationEvent::key_rotation(&exchange));
+
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({ "ok": true, "exchange": exchange })),
@@ -1018,6 +1035,115 @@ async fn test_notification_handler(
         ),
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /notifications/history  (db feature only) — the delivery ledger
+//
+// Reads back `notification_log` (see fks 013_notification_log.sql), one row per
+// webhook send ATTEMPT (real events + test probes), so the WebUI can answer
+// "did the 3am crash page actually send?". `?limit=` (default 100, cap 1000)
+// and `?event=` filter; the response NEVER contains a webhook URL (the table
+// doesn't hold one). Degrades to `db_enabled:false` + empty entries without a DB.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[derive(Deserialize)]
+struct NotificationHistoryQuery {
+    /// Max rows to return (clamped to 1..=1000). Default: 100.
+    limit: Option<i64>,
+    /// Optional exact-match filter on the wire event kind. Blank = all events.
+    event: Option<String>,
+}
+
+#[cfg(feature = "db")]
+async fn notification_history_handler(
+    State(state): State<AppState>,
+    Query(params): Query<NotificationHistoryQuery>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        // DB not configured — graceful empty shape so the WebUI panel just
+        // shows "no history" rather than erroring.
+        return Ok(Json(serde_json::json!({
+            "db_enabled": false,
+            "entries": [],
+        })));
+    };
+
+    let (event, limit) =
+        crate::db::notification_log_query_plan(params.event.as_deref(), params.limit);
+    let entries = store.list_notification_log(limit, event.as_deref()).await?;
+    Ok(Json(serde_json::json!({
+        "db_enabled": true,
+        "entries": entries,
+    })))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /events  (db feature only) — generic event ingest for non-spawner emitters
+//
+// Bots (risk_halt) and the advisor (edge_decay, later) POST here rather than
+// running their own parallel Discord path — so their alerts flow through the
+// same channel store, filters, and delivery ledger. X-Internal-Token gated
+// (the scoped EVENTS_TOKEN arrives with plan-03 D2). The event MUST be on a
+// server-side allowlist — arbitrary strings can NOT mint new wire kinds.
+// 202 accepted · 400 unknown/non-ingestable kind · 401 no token (middleware).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Event kinds an external emitter may raise through `POST /events`. NOT the
+/// full vocabulary: only kinds whose authoritative source is outside the
+/// spawner. Everything else is minted by the spawner's own emission points.
+#[cfg(feature = "db")]
+const INGESTABLE_EVENT_KINDS: &[&str] = &[
+    crate::notifications::EVENT_RISK_HALT,
+    crate::notifications::EVENT_EDGE_DECAY,
+];
+
+#[cfg(feature = "db")]
+async fn ingest_event_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::models::EventIngestRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let event = req.event.trim();
+    if !INGESTABLE_EVENT_KINDS.contains(&event) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("unknown or non-ingestable event kind '{event}'"),
+            })),
+        );
+    }
+    let event = event.to_string();
+    let bot_id = req.bot_id.unwrap_or_default();
+    let bot_id = bot_id.trim();
+    let mode = req.mode.unwrap_or_default();
+    let mode = mode.trim();
+
+    // Build a source-marked detail, capped to the embed/ledger budget (512).
+    let supplied = req.detail.unwrap_or_default();
+    let supplied = supplied.trim();
+    let marked = if supplied.is_empty() {
+        "source=ingest".to_string()
+    } else {
+        format!("{supplied} [source=ingest]")
+    };
+    let detail: String = marked.chars().take(INGEST_DETAIL_MAX).collect();
+
+    // Best-effort, off-path dispatch (also writes the ledger via the dispatcher).
+    spawn_dispatch(
+        &state,
+        NotificationEvent::from_ingest(&event, bot_id, mode, &detail),
+    );
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "ok": true, "event": event })),
+    )
+}
+
+/// Cap on an ingested `detail` (matches the Discord embed / ledger budget).
+#[cfg(feature = "db")]
+const INGEST_DETAIL_MAX: usize = 512;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Saved spawn configs  (db feature only) — reusable named spawn templates

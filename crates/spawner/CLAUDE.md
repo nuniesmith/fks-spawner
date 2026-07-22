@@ -59,7 +59,9 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `POST` | `/notifications` | yes (db only) | Store/UPSERT a notification channel (Discord webhook — URL encrypted, never read back) |
 | `GET` | `/notifications` | yes (db only) | List channels (name/kind/events — never the URL) |
 | `DELETE` | `/notifications/{name}` | yes (db only) | Remove one notification channel (hard delete) |
-| `POST` | `/notifications/{name}/test` | yes (db only) | Send a one-off "connected" probe to one channel; reports whether the webhook accepted it |
+| `POST` | `/notifications/{name}/test` | yes (db only) | Send a one-off "connected" probe to one channel; reports whether the webhook accepted it (also records a `test_sent`/`test_failed` delivery-ledger row) |
+| `GET` | `/notifications/history` | yes (db only) | Delivery ledger (`notification_log`, fks 013): one row per webhook send ATTEMPT — real events + test probes — so "did the 3am crash page actually send?" is answerable in the WebUI. `?limit=` (default 100 / cap 1000) + `?event=` filter; response `{db_enabled, entries:[{ts,event,bot_id,channel_name,kind,outcome,status_code,detail}]}` newest-first; graceful `db_enabled:false` without a DB. NEVER returns a webhook URL (the table doesn't hold one) |
+| `POST` | `/events` | yes (db only) | Generic event INGEST for non-spawner emitters (bots raise `risk_halt`, the advisor `edge_decay`) so their alerts flow through the SAME channel store, filters, and delivery ledger instead of a parallel per-bot Discord path. Body `{event, bot_id?, mode?, detail?}`; `event` MUST be on the server-side allowlist (`risk_halt`, `edge_decay`) — arbitrary strings can NOT mint wire kinds; `detail` capped at 512 + `source=ingest`-marked. 202 accepted · 400 unknown/non-ingestable kind · 401 no token. Best-effort off-path dispatch |
 | `GET` `POST` | `/configs` | yes (db only) | List / save (UPSERT) reusable spawn configs (optional self-contained `bot_id`, stored in the `config_json` blob) |
 | `DELETE` | `/configs/{name}` | yes (db only) | Soft-delete a saved config |
 | `POST` | `/configs/{name}/respawn` | yes (db only) | Atomically redeploy a saved config's bot: stop→force-remove the existing `fks-bot-{bot_id}` container (idempotent — skips cleanly if it isn't running) THEN spawn a fresh one through the SAME `/spawn` path, so CURRENT stored secrets are re-injected (rotated keys picked up) and the config's `:latest` image runs (freshly-built code). Body `{ bot_id? }` overrides the config's stored id; bot_id resolves override > config > 400. The remove is awaited BEFORE the spawn (never two live containers for one bot_id); a residual 409 name-conflict is a clear error, not a half-state. Returns `{ bot_id, old_container_id, new_container_id, status, image }`. NOTE: recreates from the current image — it does NOT rebuild the image from source (see follow-up) |
@@ -144,14 +146,31 @@ Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
   credential storage (`POST /secrets`, `GET /secrets/status`) — all db-gated.
 - `/containers` enriches running bots with live CPU% + memory from the Docker
   stats API (pure CPU%/mem math is unit-tested).
-- **Notification sender** (`src/notifications.rs`): lifecycle events
-  (`bot_spawned` / `bot_stopped` / `bot_removed` / `bot_error`) are dispatched
-  to configured Discord webhook channels (URL decrypted via the `SecretsCipher`).
+- **Notification sender** (`src/notifications.rs`): lifecycle + platform events
+  are dispatched to configured Discord webhook channels (URL decrypted via the
+  `SecretsCipher`). Wire kinds (`ALL_EVENT_KINDS`, a FROZEN contract shared with
+  the WebUI channel filters): `bot_spawned` / `bot_stopped` / `bot_removed` /
+  `bot_error` / `bot_crashed` / `bot_restarted` / `live_flip` / `key_rotation` /
+  `net_worth_milestone` / `risk_halt` / `edge_decay`. `ALWAYS_DELIVERED_KINDS`
+  (`bot_crashed`, `bot_restarted`, `live_flip`, `risk_halt`) bypass every scoped
+  filter — page-worthy events a stale allowlist must never silently drop.
   Best-effort + off the critical path (each dispatch is `tokio::spawn`ed; webhook
   failures are logged + counted, never propagated), gated on `NOTIFY_ENABLED`
   (default true — opt-out). Channel `events=[]` is catch-all; a non-empty list
   filters by kind. `POST /notifications/{name}/test` sends a one-off probe.
-  Webhook URLs are NEVER logged (channel name only).
+  Webhook URLs are NEVER logged (channel name only). Emission points: `live_flip`
+  = every live-mode `spawn_bot`; `key_rotation` = `secrets_handler` upsert;
+  `bot_restarted` = supervisor `maybe_restart` Ok arm; `net_worth_milestone` =
+  net-worth sampler tick (pure crossing detector, env `NET_WORTH_MILESTONE_STEP`,
+  default 0 = OFF, in-memory anchor re-baselines on restart); `risk_halt` /
+  `edge_decay` = `POST /events` ingest.
+- **Delivery ledger** (`notification_log`, fks 013): the dispatcher writes ONE
+  best-effort, DETACHED row per send attempt (`sent` / `http_error` /
+  `send_failed` / `decrypt_failed`; test probes `test_sent` / `test_failed`) — a
+  ledger write can never delay or fail a webhook send. `detail` is a ≤512-char
+  event snippet, NEVER the URL. Read via `GET /notifications/history`; retention
+  is a `prune_notification_log(keep=5000)` sweep piggybacked on the net-worth
+  sampler tick (not a SQL cron job).
 - **Treasury layer** (`src/treasury.rs`; schema `007_treasury.sql` in the fks
   repo): the `transfers` signed cash-flow ledger + `accounts` topology registry
   (tiers: 0 cold-BTC backbone / 1 personal-crypto / 2 rithmic-main /

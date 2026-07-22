@@ -65,9 +65,10 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use spawner::db::{BotRunStore, RecordSpawn};
+use spawner::db::{BotRunStore, NotificationLogRow, RecordSpawn};
 use spawner::models::{AccountRequest, ConfigRequest, EdgeRequest};
 use spawner::net_worth::NetWorthSnapshot;
+use spawner::notifications::{NotificationDispatcher, NotificationEvent};
 use spawner::supervisor::RestartPolicy;
 use spawner::treasury::NewTransfer;
 
@@ -367,6 +368,8 @@ async fn sql_path_roundtrips_against_ephemeral_postgres() {
     exercise_accounts(&store).await;
     exercise_net_worth_transfers_profit(&store).await;
     exercise_edges_and_backtests(&store).await;
+    exercise_notification_log(&store).await;
+    exercise_dispatcher_ledger(&store).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -935,5 +938,134 @@ async fn exercise_edges_and_backtests(store: &BotRunStore) {
     assert!(
         edges.iter().any(|e| e.edge_id == "orb" && !e.active),
         "list_edges still shows the soft-deleted edge"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// notification_log — record / list (newest-first + event filter) / prune
+// ─────────────────────────────────────────────────────────────────────────────
+async fn exercise_notification_log(store: &BotRunStore) {
+    fn row(event: &str, outcome: &str, status: Option<i16>) -> NotificationLogRow {
+        NotificationLogRow {
+            ts: chrono::Utc::now(), // ignored on write (DB DEFAULTs it)
+            event: event.to_string(),
+            bot_id: "eth-scalper".to_string(),
+            channel_name: "ops-all".to_string(),
+            kind: "discord_webhook".to_string(),
+            outcome: outcome.to_string(),
+            status_code: status,
+            detail: format!("{event} snippet"),
+        }
+    }
+
+    // Insert in a known order; id (BIGSERIAL) is monotonic so newest = last in.
+    store
+        .record_notification(&row("bot_spawned", "sent", Some(204)))
+        .await
+        .expect("record bot_spawned");
+    store
+        .record_notification(&row("bot_crashed", "sent", Some(204)))
+        .await
+        .expect("record bot_crashed");
+    store
+        .record_notification(&row("bot_spawned", "send_failed", None))
+        .await
+        .expect("record bot_spawned failure");
+
+    // Newest-first ordering: the last insert leads.
+    let all = store
+        .list_notification_log(100, None)
+        .await
+        .expect("list all");
+    assert_eq!(all.len(), 3, "all three ledger rows come back");
+    assert_eq!(all[0].event, "bot_spawned");
+    assert_eq!(all[0].outcome, "send_failed", "newest row is first");
+    assert_eq!(all[0].status_code, None, "nullable status decodes as None");
+    assert_eq!(all[2].outcome, "sent", "oldest row is last");
+    assert_eq!(all[2].status_code, Some(204));
+
+    // Event filter narrows to one wire kind, still newest-first.
+    let crashed = store
+        .list_notification_log(100, Some("bot_crashed"))
+        .await
+        .expect("list filtered");
+    assert_eq!(crashed.len(), 1);
+    assert_eq!(crashed[0].event, "bot_crashed");
+
+    // Limit is respected (and clamped): asking for 1 returns just the newest.
+    let one = store
+        .list_notification_log(1, None)
+        .await
+        .expect("list limit 1");
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].outcome, "send_failed");
+
+    // Prune keeps only the newest N by id; keep=1 drops the two older rows.
+    let pruned = store.prune_notification_log(1).await.expect("prune keep=1");
+    assert_eq!(pruned, 2, "two older rows pruned");
+    let after = store
+        .list_notification_log(100, None)
+        .await
+        .expect("list after prune");
+    assert_eq!(after.len(), 1, "only the newest row survives");
+    assert_eq!(after[0].outcome, "send_failed");
+
+    // Clean the table so the dispatcher-ledger check starts empty.
+    let dropped = store.prune_notification_log(0).await.expect("prune keep=0");
+    assert_eq!(dropped, 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dispatcher writes the ledger best-effort/off-path: a send to an unroutable
+// webhook produces a `send_failed` row AFTER dispatch settles (B3).
+// ─────────────────────────────────────────────────────────────────────────────
+async fn exercise_dispatcher_ledger(store: &BotRunStore) {
+    // A catch-all channel pointing at an unroutable target: the POST fails fast
+    // (connection refused), so the dispatcher records `send_failed`.
+    store
+        .upsert_channel("ops-all", "discord_webhook", "http://127.0.0.1:1/hook", &[])
+        .await
+        .expect("configure channel");
+
+    // Dispatch a spawn event; the ledger write is a DETACHED tokio::spawn, so it
+    // may land shortly AFTER dispatch() returns — poll for it.
+    let resp = spawner::models::SpawnResponse {
+        container_id: "cid-ledger".to_string(),
+        container_name: "fks-bot-eth".to_string(),
+        bot_id: "eth-scalper".to_string(),
+        image: "fks-bot-eth:v1".to_string(),
+        mode: "paper".to_string(),
+        started_at: chrono::Utc::now(),
+    };
+    NotificationDispatcher::new(store.clone())
+        .dispatch(NotificationEvent::spawned(&resp))
+        .await;
+
+    let mut rows = Vec::new();
+    for _ in 0..50 {
+        rows = store
+            .list_notification_log(10, Some("bot_spawned"))
+            .await
+            .expect("list ledger");
+        if !rows.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rows.len(), 1, "a ledger row lands after dispatch settles");
+    let r = &rows[0];
+    assert_eq!(r.event, "bot_spawned");
+    assert_eq!(r.channel_name, "ops-all");
+    assert_eq!(r.kind, "discord_webhook");
+    assert_eq!(
+        r.outcome, "send_failed",
+        "an unroutable webhook records send_failed"
+    );
+    assert_eq!(r.status_code, None, "a connect failure carries no status");
+    // The no-URL contract: the ledger detail never holds the webhook target.
+    assert!(
+        !r.detail.contains("127.0.0.1") && !r.detail.contains("hook"),
+        "ledger detail must never contain the URL: {}",
+        r.detail
     );
 }

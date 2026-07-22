@@ -121,6 +121,28 @@ fn default_channel_kind() -> String {
     "discord_webhook".to_string()
 }
 
+/// Request body for `POST /events` — the generic event ingest for non-spawner
+/// emitters (bots raise `risk_halt`, the advisor `edge_decay`) so their alerts
+/// flow through the same channel store, filters, and delivery ledger instead of
+/// a parallel per-bot Discord path. The handler validates `event` against a
+/// server-side allowlist (arbitrary strings can NOT mint wire kinds) and caps
+/// `detail`; it carries NO webhook URL or credential — this is an event, not a
+/// channel.
+#[derive(Debug, Deserialize)]
+pub struct EventIngestRequest {
+    /// The wire event kind to raise — must be on the server's ingest allowlist.
+    pub event: String,
+    /// Optional bot handle the event concerns.
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    /// Optional execution-mode label (e.g. "live").
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional human-readable context (truncated + source-marked server-side).
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Saved spawn config (POST /configs) — a reusable, named spawn template
 // ─────────────────────────────────────────────────────────────────────────────

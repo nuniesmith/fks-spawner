@@ -101,6 +101,82 @@ pub const SOURCE_ONCHAIN: &str = "onchain";
 pub const SOURCE_RITHMIC: &str = "rithmic";
 pub const SOURCE_MANUAL: &str = "manual";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Net-worth milestone detection (pure — unit-tested; wired into the sampler)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hysteresis as a fraction of the milestone step (10%): a crossing must clear
+/// the next boundary by this much before it fires, which kills notification spam
+/// when the total oscillates right on a boundary. See [`detect_milestone`].
+pub const MILESTONE_HYSTERESIS_FRAC: f64 = 0.10;
+
+/// A milestone crossing and its direction (the boundary value crossed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MilestoneCross {
+    /// Total rose through this boundary (green, a gain).
+    Up(f64),
+    /// Total fell through this boundary (amber, a drawdown).
+    Down(f64),
+}
+
+/// The result of feeding a fresh total to the milestone detector: an optional
+/// crossing to notify, plus the `last` milestone anchor to persist for the next
+/// tick (unchanged when nothing crossed).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MilestoneUpdate {
+    pub cross: Option<MilestoneCross>,
+    pub last: f64,
+}
+
+/// PURE milestone-crossing detector (total-only v1, both directions).
+///
+/// - `last` is the last-announced milestone boundary (a multiple of `step`; on
+///   the very first sample the caller baselines it to `current`'s boundary so
+///   process start never fires — a restart re-baselines, which is acceptable).
+/// - `current` is the fresh total.
+/// - `step` is `NET_WORTH_MILESTONE_STEP`; `<= 0` (or a non-finite total)
+///   disables detection entirely (`cross: None`, `last` unchanged).
+/// - `hysteresis` (e.g. `step * MILESTONE_HYSTERESIS_FRAC`) is how far past the
+///   NEXT boundary `current` must move before a crossing counts. Because the
+///   anchor snaps to the crossed boundary, sub-step jitter never re-fires and
+///   the hysteresis band absorbs jitter sitting exactly on a boundary.
+///
+/// Fires at most one crossing per call (the boundary `current` snapped to), so a
+/// multi-step jump announces the furthest boundary reached rather than spamming
+/// one row per intervening step.
+pub fn detect_milestone(last: f64, current: f64, step: f64, hysteresis: f64) -> MilestoneUpdate {
+    if step <= 0.0 || !current.is_finite() || !last.is_finite() {
+        return MilestoneUpdate { cross: None, last };
+    }
+    if current >= last + step + hysteresis {
+        // Snap to the highest whole multiple of `step` at or below `current`.
+        let boundary = (current / step).floor() * step;
+        return MilestoneUpdate {
+            cross: Some(MilestoneCross::Up(boundary)),
+            last: boundary,
+        };
+    }
+    if current <= last - step - hysteresis {
+        // Snap to the lowest whole multiple of `step` at or above `current`.
+        let boundary = (current / step).ceil() * step;
+        return MilestoneUpdate {
+            cross: Some(MilestoneCross::Down(boundary)),
+            last: boundary,
+        };
+    }
+    MilestoneUpdate { cross: None, last }
+}
+
+/// Baseline anchor for the FIRST observed total after (re)start: the whole
+/// multiple of `step` at or below `current`, so the next tick only fires on a
+/// genuine new crossing. `step <= 0` yields `0.0` (detection is OFF anyway).
+pub fn milestone_baseline(current: f64, step: f64) -> f64 {
+    if step <= 0.0 || !current.is_finite() {
+        return 0.0;
+    }
+    (current / step).floor() * step
+}
+
 impl NetWorthSnapshot {
     /// Build a snapshot row for `bot_id` from a parsed `/status` reading,
     /// tagging it as sampler-sourced (`source = bot_status`).
@@ -251,15 +327,24 @@ mod sampler {
 
     use tracing::{debug, warn};
 
-    use super::{NetWorthSnapshot, parse_status_net_worth, running_status_targets};
+    use super::{
+        MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
+        milestone_baseline, parse_status_net_worth, running_status_targets,
+    };
     use crate::config::Config;
     use crate::db::BotRunStore;
     use crate::docker_client::DockerOps;
     use crate::metrics;
+    use crate::notifications::{NotificationDispatcher, NotificationEvent};
 
     /// Per-bot HTTP timeout. Short so one hung/slow bot can never stall the
     /// sweep of the others.
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// How many delivery-ledger rows to retain; the rest are pruned on the
+    /// sampler tick (the established piggyback pattern — the backtest staleness
+    /// sweep already rides here).
+    const NOTIFICATION_LOG_KEEP: i64 = 5000;
 
     /// Polls running bots' `/status` endpoints and appends `net_worth_snapshots`
     /// rows. Cheap to construct (builds one reqwest client reused across the
@@ -350,6 +435,16 @@ mod sampler {
                     warn!(error = %e, "backtest sweep: stale-run sweep failed");
                 }
             }
+
+            // ── Piggyback: notification-log retention ────────────────────────
+            // The delivery ledger grows one row per webhook send; trim it beyond
+            // the newest N here rather than with a SQL cron job (same tick, same
+            // best-effort discipline as the backtest sweep above).
+            match store.prune_notification_log(NOTIFICATION_LOG_KEEP).await {
+                Ok(0) => {}
+                Ok(n) => debug!(pruned = n, "notification-log retention sweep"),
+                Err(e) => warn!(error = %e, "notification-log retention sweep failed"),
+            }
         }
 
         /// GET one bot's `/status` and parse its net worth. `None` = unreachable,
@@ -394,10 +489,80 @@ mod sampler {
     pub async fn run_sampler(docker: Arc<dyn DockerOps>, config: Arc<Config>, store: BotRunStore) {
         let interval = Duration::from_secs(config.net_worth_sample_interval_secs);
         let sampler = NetWorthSampler::new();
+        // In-memory milestone anchor — the last-announced boundary. `None` until
+        // the first total is observed (then baselined without firing). A process
+        // restart re-baselines from the current total (acceptable per OD-5).
+        let mut last_milestone: Option<f64> = None;
         loop {
             tokio::time::sleep(interval).await;
             sampler.sample_once(docker.as_ref(), &config, &store).await;
+            check_net_worth_milestone(&config, &store, &mut last_milestone).await;
         }
+    }
+
+    /// Roll up the freshest snapshot per account into a single total and run the
+    /// pure milestone detector against the in-memory anchor, dispatching a
+    /// `net_worth_milestone` event on a crossing. OFF unless
+    /// `NET_WORTH_MILESTONE_STEP > 0`. Best-effort throughout (never fatal).
+    async fn check_net_worth_milestone(
+        config: &Config,
+        store: &BotRunStore,
+        last_milestone: &mut Option<f64>,
+    ) {
+        let step = config.net_worth_milestone_step;
+        if step <= 0.0 {
+            return; // milestone detection disabled
+        }
+
+        // Freshest snapshot PER account (limit=1 windows one row per bot_id — the
+        // same per-account roll-up the /net-worth window query established), summed
+        // into the treasury total.
+        let rows = match store.list_net_worth(None, 1).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "milestone: net-worth roll-up query failed");
+                return;
+            }
+        };
+        if rows.is_empty() {
+            return; // no data yet — nothing to baseline against
+        }
+        let total: f64 = rows.iter().map(|r| r.net_worth).sum();
+        if !total.is_finite() {
+            return;
+        }
+
+        // First observation after (re)start: baseline the anchor, don't fire.
+        let last = match last_milestone {
+            Some(l) => *l,
+            None => {
+                let base = milestone_baseline(total, step);
+                *last_milestone = Some(base);
+                debug!(total, base, "milestone: baselined anchor (no notification)");
+                return;
+            }
+        };
+
+        let hysteresis = step * MILESTONE_HYSTERESIS_FRAC;
+        let update = detect_milestone(last, total, step, hysteresis);
+        *last_milestone = Some(update.last);
+
+        let Some(cross) = update.cross else {
+            return;
+        };
+        if !config.notify_enabled {
+            return; // detector state advanced, but sending is hard-disabled
+        }
+        let (boundary, up) = match cross {
+            MilestoneCross::Up(b) => (b, true),
+            MilestoneCross::Down(b) => (b, false),
+        };
+        let ev = NotificationEvent::net_worth_milestone(total, boundary, up);
+        let store = store.clone();
+        // Detached, best-effort — never block the sampler loop on a webhook.
+        tokio::spawn(async move {
+            NotificationDispatcher::new(store).dispatch(ev).await;
+        });
     }
 }
 
@@ -607,5 +772,86 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "a");
         assert_eq!(targets[0].1, "http://fks-bot-a:9091/status");
+    }
+
+    // ── milestone crossing detector (pure) ──────────────────────────────────
+
+    const STEP: f64 = 1000.0;
+    fn hyst() -> f64 {
+        STEP * MILESTONE_HYSTERESIS_FRAC // 100.0
+    }
+
+    #[test]
+    fn milestone_step_zero_is_off() {
+        let u = detect_milestone(10_000.0, 999_999.0, 0.0, 0.0);
+        assert_eq!(u.cross, None);
+        assert_eq!(u.last, 10_000.0, "anchor untouched when disabled");
+    }
+
+    #[test]
+    fn milestone_up_cross_snaps_and_fires() {
+        // From an anchor of 10_000, clearing 11_000 by the hysteresis fires Up.
+        let u = detect_milestone(10_000.0, 11_200.0, STEP, hyst());
+        assert_eq!(u.cross, Some(MilestoneCross::Up(11_000.0)));
+        assert_eq!(u.last, 11_000.0);
+    }
+
+    #[test]
+    fn milestone_up_multistep_jump_reports_furthest_boundary() {
+        // A jump of several steps announces the furthest boundary, not each one.
+        let u = detect_milestone(10_000.0, 13_400.0, STEP, hyst());
+        assert_eq!(u.cross, Some(MilestoneCross::Up(13_000.0)));
+        assert_eq!(u.last, 13_000.0);
+    }
+
+    #[test]
+    fn milestone_down_cross_fires_amber() {
+        let u = detect_milestone(10_000.0, 8_800.0, STEP, hyst());
+        assert_eq!(u.cross, Some(MilestoneCross::Down(9_000.0)));
+        assert_eq!(u.last, 9_000.0);
+    }
+
+    #[test]
+    fn milestone_no_cross_within_a_step() {
+        // Moving less than a full step (+ hysteresis) from the anchor: nothing.
+        let u = detect_milestone(10_000.0, 10_500.0, STEP, hyst());
+        assert_eq!(u.cross, None);
+        assert_eq!(u.last, 10_000.0);
+        let u = detect_milestone(10_000.0, 9_500.0, STEP, hyst());
+        assert_eq!(u.cross, None);
+    }
+
+    #[test]
+    fn milestone_oscillation_with_hysteresis_does_not_respam() {
+        // Total jitters around the 11_000 boundary while anchored at 10_000.
+        // Within the hysteresis band (±100) it must NEVER fire.
+        for total in [11_000.0, 11_050.0, 10_960.0, 11_099.0] {
+            let u = detect_milestone(10_000.0, total, STEP, hyst());
+            assert_eq!(u.cross, None, "jitter at {total} must not fire");
+            assert_eq!(u.last, 10_000.0);
+        }
+        // Once it clears the band (>= 11_100) it fires exactly once; then the
+        // anchor snaps to 11_000 and a dip back to 11_000 does NOT re-fire down.
+        let fired = detect_milestone(10_000.0, 11_150.0, STEP, hyst());
+        assert_eq!(fired.cross, Some(MilestoneCross::Up(11_000.0)));
+        let back = detect_milestone(fired.last, 11_000.0, STEP, hyst());
+        assert_eq!(back.cross, None, "sub-step dip must not re-fire");
+    }
+
+    #[test]
+    fn milestone_baseline_snaps_below() {
+        assert_eq!(milestone_baseline(10_450.0, STEP), 10_000.0);
+        assert_eq!(milestone_baseline(0.0, STEP), 0.0);
+        // A baseline followed by a real crossing fires from the baseline anchor.
+        let base = milestone_baseline(10_450.0, STEP);
+        let u = detect_milestone(base, 11_200.0, STEP, hyst());
+        assert_eq!(u.cross, Some(MilestoneCross::Up(11_000.0)));
+    }
+
+    #[test]
+    fn milestone_ignores_non_finite_total() {
+        let u = detect_milestone(10_000.0, f64::NAN, STEP, hyst());
+        assert_eq!(u.cross, None);
+        assert_eq!(u.last, 10_000.0);
     }
 }

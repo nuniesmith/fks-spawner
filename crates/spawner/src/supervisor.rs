@@ -533,11 +533,31 @@ async fn maybe_restart(
             );
             let state = state.clone();
             let bot_id = crash.bot_id.clone();
+            // Carry the attempt bookkeeping into the detached restart so the
+            // recovery event can report "attempt N/M" (policy/attempts don't
+            // outlive this arm otherwise).
+            let attempt_no = attempts + 1;
+            let max_restarts = policy.max_restarts;
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 match crate::api::respawn_from_config(&state, &cfg, bot_id.clone()).await {
                     Ok((_old, resp)) => {
                         info!(bot_id = %bot_id, new_container_id = %resp.container_id, "supervisor: auto-restarted crashed bot");
+                        // Close the loop opened by the (always-delivered) crash
+                        // page: emit an always-delivered `bot_restarted` so a
+                        // crash-scoped channel learns the bot self-healed.
+                        crate::api::spawn_dispatch(
+                            &state,
+                            crate::notifications::NotificationEvent::restarted(
+                                &bot_id,
+                                &resp.image,
+                                &resp.mode,
+                                &format!(
+                                    "attempt {attempt_no}/{max_restarts}, new container {}",
+                                    resp.container_id
+                                ),
+                            ),
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, bot_id = %bot_id, "supervisor: auto-restart failed");
