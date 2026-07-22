@@ -290,6 +290,8 @@ fn test_config(internal_token: &str) -> Config {
         backtest_database_url: String::new(),
         internal_token: internal_token.to_string(),
         require_internal_auth: false,
+        events_token: String::new(),
+        events_url: "http://fks_bot_spawner:8090/events".to_string(),
         notify_enabled: true,
         btc_watch: spawner::btc_watch::BtcWatchConfig::default(),
         rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
@@ -1232,6 +1234,246 @@ async fn events_ingest_is_token_gated() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scoped EVENTS_TOKEN dual-auth on POST /events (plan-03 D2)
+//
+// The ingest is the ONE route with a widened auth: it accepts EITHER the
+// internal token OR a scoped EVENTS_TOKEN in the same `X-Internal-Token` header.
+// FAIL-CLOSED: an unset EVENTS_TOKEN disables the scoped path (only the internal
+// token works). BLAST RADIUS: the scoped token opens ONLY /events — never any
+// other route. Convention (matches the rest of the suite): a missing header is
+// 401, a present-but-wrong token is 403.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a config with both an internal token and a scoped events token set.
+#[cfg(feature = "db")]
+fn config_with_events(internal: &str, events: &str) -> Config {
+    let mut cfg = test_config(internal);
+    cfg.events_token = events.to_string();
+    cfg
+}
+
+#[cfg(feature = "db")]
+fn events_body() -> Body {
+    Body::from(serde_json::json!({ "event": "risk_halt" }).to_string())
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_accepts_internal_token() {
+    // The internal token opens /events whether or not a scoped token is set.
+    for cfg in [
+        test_config("internal-tok"),
+        config_with_events("internal-tok", "scoped-ev"),
+    ] {
+        let (app, _) = build_app(cfg);
+        let resp = app
+            .oneshot(
+                Request::post("/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Internal-Token", "internal-tok")
+                    .body(events_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_accepts_scoped_token_when_set() {
+    // The scoped EVENTS_TOKEN opens /events when configured — this is the whole
+    // point of the widened auth (bots hold only this token).
+    let (app, _) = build_app(config_with_events("internal-tok", "scoped-ev"));
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Internal-Token", "scoped-ev")
+                .body(events_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_rejects_scoped_token_when_events_token_unset() {
+    // FAIL CLOSED: with EVENTS_TOKEN empty the scoped path is DISABLED — a token
+    // that would have been the scoped one is just a wrong token now (403). An
+    // unset token is never an open door.
+    let (app, _) = build_app(test_config("internal-tok")); // events_token = ""
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Internal-Token", "scoped-ev")
+                .body(events_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_rejects_a_token_matching_neither() {
+    // A token that is neither the internal nor the scoped one is rejected (403),
+    // even though a scoped token IS configured.
+    let (app, _) = build_app(config_with_events("internal-tok", "scoped-ev"));
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Internal-Token", "not-either-token")
+                .body(events_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_missing_header_with_scoped_token_set_is_401() {
+    // Missing header is still 401 (not 403), even with a scoped token configured.
+    let (app, _) = build_app(config_with_events("internal-tok", "scoped-ev"));
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(events_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// BLAST-RADIUS PIN: the scoped events token opens ONLY /events. The SAME token
+/// that is ACCEPTED (202) on /events is REJECTED (403) on every other protected
+/// route — proving a compromised bot holding it can reach nothing but the
+/// events mailbox.
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn scoped_events_token_opens_only_the_events_route() {
+    let cfg = config_with_events("internal-tok", "scoped-ev");
+
+    // 1. Opens /events.
+    let (app, _) = build_app(cfg.clone());
+    let ok = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("X-Internal-Token", "scoped-ev")
+                .body(events_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::ACCEPTED,
+        "scoped token must open /events"
+    );
+
+    // 2. Rejected on other protected routes — the blast-radius pin. Each of
+    //    these accepts the INTERNAL token only; the scoped token is a stranger.
+    for (method, uri) in [
+        ("GET", "/containers"),
+        ("POST", "/spawn"),
+        ("GET", "/secrets/status"),
+        ("GET", "/transfers"),
+        ("GET", "/net-worth"),
+    ] {
+        let (app, _) = build_app(cfg.clone());
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("X-Internal-Token", "scoped-ev")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "scoped events token must NOT open {method} {uri}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spawn-env injection of the scoped ingest vars (plan-03 D2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn events_env_injected_when_token_set() {
+    let mut cfg = test_config("internal-tok");
+    cfg.events_token = "scoped-ev".to_string();
+    cfg.events_url = "http://fks_bot_spawner:8090/events".to_string();
+
+    let mut env: HashMap<String, String> = HashMap::new();
+    spawner::api::inject_events_env(&cfg, &mut env);
+
+    assert_eq!(
+        env.get("SPAWNER_EVENTS_URL").map(String::as_str),
+        Some("http://fks_bot_spawner:8090/events")
+    );
+    assert_eq!(
+        env.get("SPAWNER_EVENTS_TOKEN").map(String::as_str),
+        Some("scoped-ev")
+    );
+}
+
+#[test]
+fn events_env_absent_when_token_empty() {
+    let cfg = test_config("internal-tok"); // events_token = ""
+    let mut env: HashMap<String, String> = HashMap::new();
+    spawner::api::inject_events_env(&cfg, &mut env);
+    assert!(
+        env.is_empty(),
+        "empty EVENTS_TOKEN must inject nothing (additive), got {env:?}"
+    );
+}
+
+#[test]
+fn operator_config_env_wins_over_injected_events_vars() {
+    // Precedence: a value already in the stored config env is NEVER overwritten.
+    let mut cfg = test_config("internal-tok");
+    cfg.events_token = "scoped-ev".to_string();
+    cfg.events_url = "http://fks_bot_spawner:8090/events".to_string();
+
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert(
+        "SPAWNER_EVENTS_URL".to_string(),
+        "http://operator-override:9999/events".to_string(),
+    );
+    env.insert(
+        "SPAWNER_EVENTS_TOKEN".to_string(),
+        "operator-token".to_string(),
+    );
+
+    spawner::api::inject_events_env(&cfg, &mut env);
+
+    assert_eq!(
+        env.get("SPAWNER_EVENTS_URL").map(String::as_str),
+        Some("http://operator-override:9999/events"),
+        "operator-provided URL must win"
+    );
+    assert_eq!(
+        env.get("SPAWNER_EVENTS_TOKEN").map(String::as_str),
+        Some("operator-token"),
+        "operator-provided token must win"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

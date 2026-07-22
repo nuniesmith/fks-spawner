@@ -40,7 +40,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     auth::require_internal_token,
@@ -161,7 +161,9 @@ pub fn build_router(state: AppState) -> Router {
             "/notifications/{name}/test",
             post(test_notification_handler),
         )
-        .route("/events", post(ingest_event_handler))
+        // NOTE: `/events` is deliberately NOT here — it carries a WIDENED auth
+        // (internal token OR scoped EVENTS_TOKEN) and lives on its own sub-router
+        // below so the scoped token opens ONLY the events mailbox.
         .route(
             "/configs",
             get(list_configs_handler).post(save_config_handler),
@@ -196,9 +198,28 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             require_internal_token,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    Router::new().merge(public).merge(protected)
+    // The generic event ingest `POST /events` is the ONE route with a widened
+    // auth: it accepts EITHER the internal token OR the scoped `EVENTS_TOKEN`
+    // (fail-closed — the scoped path is disabled until EVENTS_TOKEN is set). It
+    // is kept on its OWN sub-router with its own middleware so the blast radius
+    // of a bot-held events token is EXACTLY this mailbox — every route on the
+    // `protected` sub-router above still requires the internal token, so the
+    // scoped token is rejected there.
+    #[cfg(feature = "db")]
+    let events = Router::new()
+        .route("/events", post(ingest_event_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_events_or_internal_token,
+        ))
+        .with_state(state.clone());
+
+    let router = Router::new().merge(public).merge(protected);
+    #[cfg(feature = "db")]
+    let router = router.merge(events);
+    router
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +318,30 @@ async fn inject_secrets(
     Ok(())
 }
 
+/// Inject the scoped events-ingest env (`SPAWNER_EVENTS_URL` +
+/// `SPAWNER_EVENTS_TOKEN`) into a spawn's env so the bot can POST `risk_halt` to
+/// the spawner's own `/events` mailbox (plan-03 D2).
+///
+/// - **Gated on `EVENTS_TOKEN`.** Empty (the default) ⇒ inject NOTHING; the bot
+///   simply has no ingest path. This is purely additive — zero behaviour change
+///   until the operator sets the token.
+/// - **Config env WINS.** `or_insert` never overwrites an operator-provided
+///   value already present in the stored config's env (documented precedence,
+///   identical to `inject_secrets`).
+/// - **Never logs the token value** — only that the plumbing is present.
+///
+/// Pure over its `(config, env)` inputs (no I/O), so precedence is unit-tested.
+pub fn inject_events_env(config: &Config, env: &mut std::collections::HashMap<String, String>) {
+    if config.events_token.is_empty() {
+        return;
+    }
+    env.entry("SPAWNER_EVENTS_URL".to_string())
+        .or_insert_with(|| config.events_url.clone());
+    env.entry("SPAWNER_EVENTS_TOKEN".to_string())
+        .or_insert_with(|| config.events_token.clone());
+    debug!("scoped events-ingest env is available to spawned bots (token value not logged)");
+}
+
 /// The shared internal spawn path used by BOTH `POST /spawn` and
 /// `POST /configs/{name}/respawn`. It injects any requested stored secrets into
 /// the env (so a rotate-then-respawn picks up the CURRENT keys), spawns through
@@ -350,6 +395,17 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
             let secrets = std::mem::take(&mut req.secrets);
             inject_secrets(store, &secrets, &mut req.env).await?;
         }
+        req
+    };
+
+    // ── Events-ingest env injection (plan-03 D2) ─────────────────────────────
+    // When EVENTS_TOKEN is configured, hand every spawned bot the scoped ingest
+    // URL + token so it can raise `risk_halt` through POST /events. Empty token
+    // ⇒ inject NOTHING (additive — the bot just has no ingest path). Not
+    // db-gated: the ingest auth is, but the env plumbing is plain.
+    let req = {
+        let mut req = req;
+        inject_events_env(&state.config, &mut req.env);
         req
     };
 

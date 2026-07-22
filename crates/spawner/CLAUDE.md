@@ -61,7 +61,7 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `DELETE` | `/notifications/{name}` | yes (db only) | Remove one notification channel (hard delete) |
 | `POST` | `/notifications/{name}/test` | yes (db only) | Send a one-off "connected" probe to one channel; reports whether the webhook accepted it (also records a `test_sent`/`test_failed` delivery-ledger row) |
 | `GET` | `/notifications/history` | yes (db only) | Delivery ledger (`notification_log`, fks 013): one row per webhook send ATTEMPT — real events + test probes — so "did the 3am crash page actually send?" is answerable in the WebUI. `?limit=` (default 100 / cap 1000) + `?event=` filter; response `{db_enabled, entries:[{ts,event,bot_id,channel_name,kind,outcome,status_code,detail}]}` newest-first; graceful `db_enabled:false` without a DB. NEVER returns a webhook URL (the table doesn't hold one) |
-| `POST` | `/events` | yes (db only) | Generic event INGEST for non-spawner emitters (bots raise `risk_halt`, the advisor `edge_decay`) so their alerts flow through the SAME channel store, filters, and delivery ledger instead of a parallel per-bot Discord path. Body `{event, bot_id?, mode?, detail?}`; `event` MUST be on the server-side allowlist (`risk_halt`, `edge_decay`) — arbitrary strings can NOT mint wire kinds; `detail` capped at 512 + `source=ingest`-marked. 202 accepted · 400 unknown/non-ingestable kind · 401 no token. Best-effort off-path dispatch |
+| `POST` | `/events` | **dual** (db only) | Generic event INGEST for non-spawner emitters (bots raise `risk_halt`, the advisor `edge_decay`) so their alerts flow through the SAME channel store, filters, and delivery ledger instead of a parallel per-bot Discord path. Body `{event, bot_id?, mode?, detail?}`; `event` MUST be on the server-side allowlist (`risk_halt`, `edge_decay`) — arbitrary strings can NOT mint wire kinds; `detail` capped at 512 + `source=ingest`-marked. 202 accepted · 400 unknown/non-ingestable kind · 401 missing token · 403 wrong token. Best-effort off-path dispatch. **DUAL-AUTH (plan-03 D2):** this is the ONE route that accepts EITHER the internal token OR the scoped `EVENTS_TOKEN` in `X-Internal-Token`; every OTHER route is internal-token-only, so a bot holding only the scoped token opens ONLY this mailbox (blast-radius pin). FAIL-CLOSED: empty `EVENTS_TOKEN` disables the scoped path (internal token only). See the auth note below |
 | `GET` `POST` | `/configs` | yes (db only) | List / save (UPSERT) reusable spawn configs (optional self-contained `bot_id`, stored in the `config_json` blob) |
 | `DELETE` | `/configs/{name}` | yes (db only) | Soft-delete a saved config |
 | `POST` | `/configs/{name}/respawn` | yes (db only) | Atomically redeploy a saved config's bot: stop→force-remove the existing `fks-bot-{bot_id}` container (idempotent — skips cleanly if it isn't running) THEN spawn a fresh one through the SAME `/spawn` path, so CURRENT stored secrets are re-injected (rotated keys picked up) and the config's `:latest` image runs (freshly-built code). Body `{ bot_id? }` overrides the config's stored id; bot_id resolves override > config > 400. The remove is awaited BEFORE the spawn (never two live containers for one bot_id); a residual 409 name-conflict is a clear error, not a half-state. Returns `{ bot_id, old_container_id, new_container_id, status, image }`. NOTE: recreates from the current image — it does NOT rebuild the image from source (see follow-up) |
@@ -80,6 +80,26 @@ Auth = `X-Internal-Token: ${NGINX_INTERNAL_TOKEN}` set by nginx.
 Empty token = dev passthrough, announced LOUDLY at boot
 (`auth::check_internal_auth_posture`); set `REQUIRE_INTERNAL_TOKEN=true` to
 fail closed instead (refuse to boot with an empty token).
+
+**Scoped `EVENTS_TOKEN` (plan-03 D2, bot→spawner ingest).** `POST /events` is the
+ONE route with a widened auth: it accepts EITHER `NGINX_INTERNAL_TOKEN` OR the
+scoped `EVENTS_TOKEN` in the same `X-Internal-Token` header
+(`auth::require_events_or_internal_token`, constant-time). Every OTHER route
+stays internal-token-only, so a bot handed only the scoped token can open ONLY
+the events mailbox — never `/spawn`, `/secrets`, `/transfers`, … (the
+blast-radius property, pinned by the `scoped_events_token_opens_only_the_events_route`
+integration test). **FAIL-CLOSED:** `EVENTS_TOKEN` unset/empty (the default)
+DISABLES the scoped path entirely — only the internal token opens `/events`; an
+unset token is never an open door. The token value is NEVER logged. `EVENTS_TOKEN`
+also gates spawn-env injection: when non-empty, every spawned bot gets
+`SPAWNER_EVENTS_URL` (default `http://fks_bot_spawner:8090/events`, override
+`SPAWNER_EVENTS_URL`) + `SPAWNER_EVENTS_TOKEN` in its env so it can raise
+`risk_halt` through the ingest; empty ⇒ NOTHING is injected (additive, zero
+behaviour change until the operator sets it). Precedence: an operator-provided
+value already in the stored config's env WINS (`or_insert`, same as
+`inject_secrets`). The compose passthrough `EVENTS_TOKEN=${EVENTS_TOKEN:-}` on the
+`fks_bot_spawner` service is a separate one-line fks PR (schema/compose live in
+the fks repo).
 
 ## Code conventions
 

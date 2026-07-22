@@ -106,6 +106,25 @@ pub struct Config {
     /// hop that injects `X-Internal-Token`.
     pub require_internal_auth: bool,
 
+    /// SCOPED bot→spawner ingest token (plan-03 D2). When non-empty, `POST
+    /// /events` accepts EITHER this value OR `internal_token` in the
+    /// `X-Internal-Token` header — and NO other route accepts it (the
+    /// blast-radius property: a compromised bot holding this token can open
+    /// ONLY the events mailbox, never `/spawn`, `/secrets`, `/transfers`, …).
+    /// FAIL-CLOSED: empty (the default) DISABLES the scoped path entirely —
+    /// only the internal token opens `/events`, an unset token is never an open
+    /// door. Also gates env injection: empty ⇒ spawned bots receive NO
+    /// `SPAWNER_EVENTS_*` env (additive, zero behaviour change until set). The
+    /// value is NEVER logged. Env: EVENTS_TOKEN.
+    pub events_token: String,
+
+    /// The `/events` ingest URL injected into spawned bots as
+    /// `SPAWNER_EVENTS_URL` (alongside `SPAWNER_EVENTS_TOKEN`) when
+    /// `events_token` is non-empty. Default is the spawner's container-DNS name
+    /// on `fks_network` (`http://fks_bot_spawner:8090/events`) — the address a
+    /// sibling bot container reaches it at. Env: SPAWNER_EVENTS_URL.
+    pub events_url: String,
+
     /// Whether bot-lifecycle events are dispatched to configured notification
     /// channels (Discord webhooks). Opt-out: defaults to `true`. With zero
     /// channels configured it is a cheap no-op regardless; set
@@ -161,6 +180,9 @@ impl Config {
             backtest_database_url: env::var("BACKTEST_DB_URL").unwrap_or_default(),
             internal_token: env::var("NGINX_INTERNAL_TOKEN").unwrap_or_default(),
             require_internal_auth: env_parse_bool("REQUIRE_INTERNAL_TOKEN", false),
+            events_token: env::var("EVENTS_TOKEN").unwrap_or_default(),
+            events_url: env::var("SPAWNER_EVENTS_URL")
+                .unwrap_or_else(|_| "http://fks_bot_spawner:8090/events".to_string()),
             notify_enabled: env_parse_bool("NOTIFY_ENABLED", true),
             btc_watch: BtcWatchConfig::from_env(),
             rithmic_sampler: RithmicSamplerConfig::from_env(),
@@ -234,6 +256,8 @@ mod tests {
             backtest_database_url: String::new(),
             internal_token: String::new(),
             require_internal_auth: false,
+            events_token: String::new(),
+            events_url: "http://fks_bot_spawner:8090/events".to_string(),
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
@@ -271,6 +295,8 @@ mod tests {
             backtest_database_url: String::new(),
             internal_token: String::new(),
             require_internal_auth: false,
+            events_token: String::new(),
+            events_url: "http://fks_bot_spawner:8090/events".to_string(),
             notify_enabled: true,
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),

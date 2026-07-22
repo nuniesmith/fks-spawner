@@ -19,6 +19,7 @@ use exchange_apiws::cryptocom::CryptocomCredentials;
 use exchange_apiws::kraken::KrakenCredentials;
 
 use crypto_bot_core::alerts::Alerter;
+use crypto_bot_core::events::EventClient;
 use crypto_bot_core::journal::Journal;
 use crypto_bot_core::status::{self, HoldingStatus, VenueStatus};
 
@@ -94,6 +95,13 @@ pub struct Engine {
     venues: Vec<Venue>,
     poll_secs: u64,
     alerter: Alerter,
+    /// Fire-and-forget spawner `/events` ingest for platform `risk_halt` events
+    /// (trade-cap trip). A no-op unless the spawner injected `SPAWNER_EVENTS_*`
+    /// (i.e. its `EVENTS_TOKEN` is set) — additive alongside the Discord alert.
+    event_client: EventClient,
+    /// Bot handle carried on emitted `risk_halt` events (container id / name;
+    /// falls back to the bot's own name).
+    event_bot_id: String,
     journal: Journal,
     // ── Risk guardrails (live-money) ─────────────────────────────────────────
     /// Drawdown breaker threshold; `None` = disabled.
@@ -253,10 +261,20 @@ impl Engine {
             }
         };
 
+        // Spawner event ingest for risk_halt (no-op unless SPAWNER_EVENTS_* were
+        // injected). The bot handle prefers the container id/name the spawner
+        // exposes as HOSTNAME, then the bot's own name.
+        let event_client = EventClient::from_env();
+        let event_bot_id = env_str("FKS_BOT_ID")
+            .or_else(|| env_str("HOSTNAME"))
+            .unwrap_or_else(|| "spot-portfolio".to_string());
+
         Ok(Self {
             venues,
             poll_secs: cfg.poll_secs,
             alerter,
+            event_client,
+            event_bot_id,
             journal,
             max_drawdown_pct: cfg.max_drawdown_pct,
             max_trade_pct: cfg.max_trade_pct,
@@ -322,7 +340,7 @@ impl Engine {
                         // unverified venue (absent from `live_venues`) or a tripped
                         // breaker forces dry-run this cycle.
                         let vlive = venue.live && !halted;
-                        match run_cycle(venue, vlive, mtp, msp, rtp, ai_ref, &self.alerter, &self.journal).await {
+                        match run_cycle(venue, vlive, mtp, msp, rtp, ai_ref, &self.alerter, &self.event_client, &self.event_bot_id, &self.journal).await {
                             Ok(value) => venue.last_value = Some(value),
                             Err(e) => {
                                 warn!(venue = venue.ex.name(), error = format!("{e:#}"), "rebalance cycle failed");
@@ -405,6 +423,8 @@ async fn run_cycle(
     reconcile_tolerance_pct: Option<f64>,
     ai: Option<&AiTilt>,
     alerter: &Alerter,
+    event_client: &EventClient,
+    bot_id: &str,
     journal: &Journal,
 ) -> Result<f64> {
     // 1. Live prices for each target asset.
@@ -652,6 +672,31 @@ async fn run_cycle(
                         "🚫 {} skipped a {} trade of ${:.0} — exceeds the {:.0}% cap (${:.0}) of the ${:.0} venue value. Likely a mispriced/buggy plan.",
                         venue.ex.name(), tr.name, tr.usd, cap_pct * 100.0, cap, p.total_value
                     ));
+                    // Raise a platform `risk_halt` through the spawner ingest IN
+                    // ADDITION to the Discord alert (no-op unless SPAWNER_EVENTS_*
+                    // were injected). The TRADE-CAP guard is a halt-class guard;
+                    // the drawdown breaker deliberately is NOT emitted here (the
+                    // live spot bot runs breaker-off by HODL policy).
+                    let mode = if venue.paper.is_some() {
+                        "paper"
+                    } else if live {
+                        "live"
+                    } else {
+                        "dry-run"
+                    };
+                    event_client.fire_risk_halt(
+                        bot_id,
+                        mode,
+                        format!(
+                            "trade-cap guard: {} {} trade ${:.0} exceeds the {:.0}% cap (${:.0}) of ${:.0} venue value — order SKIPPED",
+                            venue.ex.name(),
+                            tr.name,
+                            tr.usd,
+                            cap_pct * 100.0,
+                            cap,
+                            p.total_value
+                        ),
+                    );
                     continue;
                 }
                 match execute_trade(venue, tr, live, max_slippage_pct, alerter, journal).await {
