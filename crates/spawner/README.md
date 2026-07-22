@@ -153,7 +153,7 @@ idempotent):
 
 ```bash
 docker compose exec postgres \
-  psql -U fks_user -d ruby_db -f /docker-entrypoint-initdb.d/25-spawner.sql
+  psql -U fks_user -d fks_db -f /docker-entrypoint-initdb.d/25-spawner.sql
 ```
 
 ---

@@ -1675,16 +1675,16 @@ mod tests {
     #[test]
     fn sanitize_strips_credentials() {
         assert_eq!(
-            sanitize_url("postgres://fks_user:secret@postgres:5432/ruby_db"),
-            "postgres:5432/ruby_db"
+            sanitize_url("postgres://fks_user:secret@postgres:5432/fks_db"),
+            "postgres:5432/fks_db"
         );
     }
 
     #[test]
     fn sanitize_handles_no_creds() {
         assert_eq!(
-            sanitize_url("postgres://postgres:5432/ruby_db"),
-            "postgres:5432/ruby_db"
+            sanitize_url("postgres://postgres:5432/fks_db"),
+            "postgres:5432/fks_db"
         );
     }
 
