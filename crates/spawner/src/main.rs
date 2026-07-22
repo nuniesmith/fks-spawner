@@ -14,6 +14,11 @@
 //                             database_url with a loud per-run warning (DB only)
 //   NGINX_INTERNAL_TOKEN      shared secret nginx injects; empty = auth DISABLED (dev, logs a loud warn)
 //   REQUIRE_INTERNAL_TOKEN    when true, refuse to boot with an empty NGINX_INTERNAL_TOKEN (fail closed)
+//   EVENTS_TOKEN              scoped bot→spawner ingest token (plan-03 D2). Non-empty: POST /events
+//                             also accepts it (dual-auth, this route ONLY) AND every spawned bot gets
+//                             SPAWNER_EVENTS_URL/_TOKEN injected. Empty (default) = scoped path DISABLED
+//                             (fail closed) + nothing injected. Never logged
+//   SPAWNER_EVENTS_URL        /events URL injected into bots (default: http://fks_bot_spawner:8090/events)
 //   ALLOWED_NETWORK           Docker network for spawned containers (default: fks_network)
 //   DEFAULT_CPU_LIMIT         fractional cores (default: 1.0)
 //   DEFAULT_MEMORY_LIMIT_MB   memory cap in MiB (default: 512)

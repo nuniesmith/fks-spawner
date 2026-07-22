@@ -125,6 +125,63 @@ pub async fn require_internal_token(
     }
 }
 
+/// Auth for the ONE widened route — `POST /events` (plan-03 D2). Accepts
+/// EITHER the internal token OR the scoped `EVENTS_TOKEN`, both presented in the
+/// SAME `X-Internal-Token` header the ingest handler already reads. Every OTHER
+/// route stays on [`require_internal_token`], so a bot holding only the scoped
+/// token can open ONLY this mailbox — the blast-radius property.
+///
+/// Properties:
+/// - **Fail closed.** When `Config.events_token` is empty (the default) the
+///   scoped path is DISABLED: only the internal token opens `/events`. An unset
+///   token is NEVER an open door — a wrong/scoped token then rejects like any
+///   other bad token.
+/// - **Constant-time** compares (reuses [`constant_time_eq`]) so a byte mismatch
+///   on either token can't leak via timing.
+/// - **Dev passthrough.** An empty `internal_token` disables auth entirely,
+///   identical to [`require_internal_token`] (local-dev, no nginx hop).
+/// - **Never logs** either token value (mismatch logs the fact, not the bytes).
+pub async fn require_events_or_internal_token(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let internal = state.config.internal_token.as_str();
+    if internal.is_empty() {
+        // Dev mode — no auth (identical posture to require_internal_token).
+        return Ok(next.run(req).await);
+    }
+    let events = state.config.events_token.as_str();
+
+    let header_name = HeaderName::from_static(HEADER);
+    let Some(presented) = req.headers().get(&header_name) else {
+        warn!("rejected /events request without X-Internal-Token");
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse::new("missing X-Internal-Token")),
+        ));
+    };
+
+    let presented = presented.as_bytes();
+    // Compute both before combining so the accept path doesn't short-circuit in
+    // a token-dependent way. The scoped token is only ever a candidate when
+    // configured (fail closed): an empty EVENTS_TOKEN can never match.
+    let internal_ok = constant_time_eq(presented, internal.as_bytes());
+    let events_ok = !events.is_empty() && constant_time_eq(presented, events.as_bytes());
+
+    if internal_ok || events_ok {
+        Ok(next.run(req).await)
+    } else {
+        warn!(
+            "rejected /events request with a token matching neither the internal nor the events token"
+        );
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse::new("invalid X-Internal-Token")),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{check_internal_auth_posture, constant_time_eq};

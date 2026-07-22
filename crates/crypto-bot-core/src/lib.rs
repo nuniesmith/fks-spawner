@@ -5,6 +5,8 @@
 //! original `crypto` repo, where both bots shared them via `use crate::…`:
 //!
 //! - [`alerts`]  — fire-and-forget Discord webhook notifications ([`alerts::Alerter`]).
+//! - [`events`]  — fire-and-forget spawner `POST /events` ingest for platform
+//!   `risk_halt` events ([`events::EventClient`]).
 //! - [`journal`] — append-only JSONL trade journal ([`journal::Journal`]).
 //! - [`status`]  — the FKS bot HTTP contract: `/health`, `/metrics`, `/status`,
 //!   plus the process-global [`status::StatusState`] every update site pokes.
@@ -14,5 +16,6 @@
 //! in this repo; the futures/funding edges in the private `fks-state` repo).
 
 pub mod alerts;
+pub mod events;
 pub mod journal;
 pub mod status;
