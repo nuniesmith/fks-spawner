@@ -70,6 +70,12 @@ pub struct Config {
     /// NET_WORTH_SAMPLE_INTERVAL_SECS. Only runs when the DB is configured.
     pub net_worth_sample_interval_secs: u64,
 
+    /// Milestone step (in the net-worth currency, USD) for the
+    /// `net_worth_milestone` event: the sampler notifies when total net worth
+    /// crosses an integer multiple of this, in either direction. `0.0` (default)
+    /// = OFF. Env: NET_WORTH_MILESTONE_STEP. See `crate::net_worth`.
+    pub net_worth_milestone_step: f64,
+
     /// Postgres connection string. Empty = stateless mode (no DB writes).
     /// Recognised env vars (in order): SPAWNER_DATABASE_URL, DATABASE_URL.
     pub database_url: String,
@@ -148,6 +154,7 @@ impl Config {
                 "NET_WORTH_SAMPLE_INTERVAL_SECS",
                 crate::net_worth::DEFAULT_SAMPLE_INTERVAL_SECS,
             ),
+            net_worth_milestone_step: env_parse_f64("NET_WORTH_MILESTONE_STEP", 0.0),
             database_url: env::var("SPAWNER_DATABASE_URL")
                 .or_else(|_| env::var("DATABASE_URL"))
                 .unwrap_or_default(),
@@ -222,6 +229,7 @@ mod tests {
             prune_live_after_secs: 604_800,
             prune_interval_secs: 60,
             net_worth_sample_interval_secs: 300,
+            net_worth_milestone_step: 0.0,
             database_url: String::new(),
             backtest_database_url: String::new(),
             internal_token: String::new(),
@@ -258,6 +266,7 @@ mod tests {
             prune_live_after_secs: 604_800,
             prune_interval_secs: 0,
             net_worth_sample_interval_secs: 0,
+            net_worth_milestone_step: 0.0,
             database_url: String::new(),
             backtest_database_url: String::new(),
             internal_token: String::new(),

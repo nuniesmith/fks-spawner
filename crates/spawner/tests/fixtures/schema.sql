@@ -125,6 +125,25 @@ CREATE TRIGGER trg_notification_channels_updated_at
     BEFORE UPDATE ON notification_channels
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
+-- ── notification_log (013_notification_log.sql) ──────────────────────────────
+-- Delivery ledger: one row per webhook send attempt. detail is a truncated
+-- event snippet, NEVER the URL; outcome is CHECK-bounded to the dispatcher arms.
+CREATE TABLE IF NOT EXISTS notification_log (
+    id           BIGSERIAL PRIMARY KEY,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event        TEXT NOT NULL,
+    bot_id       TEXT NOT NULL DEFAULT '',
+    channel_name TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    outcome      TEXT NOT NULL CHECK (outcome IN
+                 ('sent','http_error','send_failed','decrypt_failed',
+                  'test_sent','test_failed')),
+    status_code  SMALLINT,
+    detail       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS notification_log_ts_idx ON notification_log (ts DESC);
+CREATE INDEX IF NOT EXISTS notification_log_event_ts_idx ON notification_log (event, ts DESC);
+
 -- ── ui_layouts (005_ui_layouts.sql) ──────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ui_layouts (
     name        TEXT        PRIMARY KEY,

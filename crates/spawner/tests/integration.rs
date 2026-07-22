@@ -285,6 +285,7 @@ fn test_config(internal_token: &str) -> Config {
         prune_live_after_secs: 604_800,
         prune_interval_secs: 60,
         net_worth_sample_interval_secs: 300,
+        net_worth_milestone_step: 0.0,
         database_url: String::new(),
         backtest_database_url: String::new(),
         internal_token: internal_token.to_string(),
@@ -1093,6 +1094,138 @@ async fn notifications_test_route_is_token_gated() {
         .oneshot(
             Request::post("/notifications/ops-alerts/test")
                 .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notification history (db feature) — graceful behaviour + auth without a DB
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn notifications_history_degrades_gracefully_without_db() {
+    // No DATABASE_URL (store: None) — GET /notifications/history must return the
+    // graceful shape {db_enabled:false, entries:[]}, never 500.
+    let (app, _) = build_app(test_config(""));
+
+    let resp = app
+        .oneshot(
+            Request::get("/notifications/history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"entries\":[]"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn notifications_history_is_token_gated() {
+    // With a configured token, the history route rejects an unauthenticated
+    // request (401) before touching the store — the static /history segment
+    // must be reachable (not swallowed by /notifications/{name}) and gated.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    let resp = app
+        .oneshot(
+            Request::get("/notifications/history?limit=10&event=bot_crashed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generic event ingest POST /events (db feature) — allowlist + auth + caps
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_ingest_accepts_allowlisted_kind() {
+    // A valid, allowlisted kind is ACCEPTED (202) even without a DB — dispatch
+    // is best-effort/off-path and simply no-ops with no channels configured.
+    let (app, _) = build_app(test_config(""));
+
+    let body = serde_json::json!({
+        "event": "risk_halt",
+        "bot_id": "crypto-spot-live",
+        "mode": "live",
+        "detail": "trade-cap tripped"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"ok\":true"), "body: {payload}");
+    assert!(
+        payload.contains("\"event\":\"risk_halt\""),
+        "body: {payload}"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_ingest_rejects_unknown_kind() {
+    // An arbitrary string must NOT mint a wire kind — 400, not 202. Even a real
+    // spawner-minted kind that isn't ingestable (bot_spawned) is rejected here.
+    let (app, _) = build_app(test_config(""));
+
+    for bad in ["totally_made_up", "bot_spawned"] {
+        let body = serde_json::json!({ "event": bad }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "'{bad}' must be rejected"
+        );
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn events_ingest_is_token_gated() {
+    // With a configured token, POST /events rejects an unauthenticated request
+    // (401) before validating the body — the ingest is money-adjacent.
+    let (app, _) = build_app(test_config("s3cr3t"));
+
+    let body = serde_json::json!({ "event": "risk_halt" }).to_string();
+    let resp = app
+        .oneshot(
+            Request::post("/events")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await

@@ -484,6 +484,94 @@ impl BotRunStore {
         Ok(removed)
     }
 
+    // ── notification_log (see src/sql/spawner/013_notification_log.sql) ──────
+    // The delivery ledger: one row per webhook send ATTEMPT (real events and
+    // one-off test probes), written best-effort + OFF the critical path by the
+    // dispatcher so "did the 3am crash page actually send?" is answerable from
+    // the WebUI instead of `docker logs`. `detail` is a truncated event snippet
+    // and NEVER the webhook URL — the dispatcher's no-URL contract extends here.
+
+    /// Append one delivery-ledger row (plain INSERT, `ts` DEFAULTs to NOW() in
+    /// the DB so the row's own `ts` is a read-side field only). Best-effort by
+    /// convention: the caller fires this detached so a ledger failure can never
+    /// delay or fail a webhook send.
+    pub async fn record_notification(&self, row: &NotificationLogRow) -> Result<(), SpawnerError> {
+        sqlx::query(
+            "INSERT INTO notification_log \
+                 (event, bot_id, channel_name, kind, outcome, status_code, detail) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&row.event)
+        .bind(&row.bot_id)
+        .bind(&row.channel_name)
+        .bind(&row.kind)
+        .bind(&row.outcome)
+        .bind(row.status_code)
+        .bind(&row.detail)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Read the delivery ledger newest-first for `GET /notifications/history`.
+    /// `limit` is clamped defensively into `1..=NOTIFICATION_LOG_MAX_LIMIT`
+    /// (the handler pre-clamps via [`notification_log_query_plan`]); an optional
+    /// `event` filters to one wire kind. Ordered `ts DESC, id DESC` so the most
+    /// recent send is first (id tiebreak keeps same-tick rows deterministic).
+    /// Never selects the webhook URL — the table doesn't hold one.
+    pub async fn list_notification_log(
+        &self,
+        limit: i64,
+        event: Option<&str>,
+    ) -> Result<Vec<NotificationLogRow>, SpawnerError> {
+        let limit = limit.clamp(1, NOTIFICATION_LOG_MAX_LIMIT);
+        let event = event.map(str::trim).filter(|s| !s.is_empty());
+        let rows =
+            match event {
+                Some(ev) => sqlx::query(
+                    "SELECT ts, event, bot_id, channel_name, kind, outcome, status_code, detail \
+                     FROM notification_log \
+                     WHERE event = $1 \
+                     ORDER BY ts DESC, id DESC LIMIT $2",
+                )
+                .bind(ev)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await,
+                None => sqlx::query(
+                    "SELECT ts, event, bot_id, channel_name, kind, outcome, status_code, detail \
+                     FROM notification_log \
+                     ORDER BY ts DESC, id DESC LIMIT $1",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await,
+            }
+            .map_err(map_sqlx)?;
+
+        Ok(rows.into_iter().map(NotificationLogRow::from_row).collect())
+    }
+
+    /// Retention sweep: delete every ledger row beyond the newest `keep` (by
+    /// id, which is monotonic so it mirrors `ts DESC`). Piggybacked on the
+    /// net-worth sampler tick — deliberately NOT a SQL cron job. Returns the
+    /// number of rows pruned.
+    pub async fn prune_notification_log(&self, keep: i64) -> Result<u64, SpawnerError> {
+        let keep = keep.max(0);
+        let res = sqlx::query(
+            "DELETE FROM notification_log \
+             WHERE id NOT IN ( \
+                 SELECT id FROM notification_log ORDER BY id DESC LIMIT $1 \
+             )",
+        )
+        .bind(keep)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(res.rows_affected())
+    }
+
     // ── bot_configs (see src/sql/spawner/002_spawner.sql) ───────────────────
     // Reusable named spawn templates. Resource limits + env live in the row's
     // JSONB `config_json` (the sqlx build has no decimal feature, so the NUMERIC
@@ -1206,6 +1294,33 @@ pub fn net_worth_query_plan(bot_id: Option<&str>, limit: Option<i64>) -> (Option
     (bot_id, limit)
 }
 
+// ── GET /notifications/history request shaping (pure — unit-tested) ──────────
+
+/// Default number of delivery-ledger rows `GET /notifications/history` returns.
+pub const NOTIFICATION_LOG_DEFAULT_LIMIT: i64 = 100;
+/// Hard cap on the number of ledger rows `GET /notifications/history` returns.
+pub const NOTIFICATION_LOG_MAX_LIMIT: i64 = 1000;
+
+/// Pure request-shaping for `GET /notifications/history`. Clamps `limit` into
+/// `1..=NOTIFICATION_LOG_MAX_LIMIT` (defaulting to
+/// [`NOTIFICATION_LOG_DEFAULT_LIMIT`] when absent) and normalises the optional
+/// `event` filter (trimmed; blank → no filter). Mirrors [`net_worth_query_plan`]
+/// so the shaping is unit-testable without a live database. Returns
+/// `(event_filter, limit)`.
+pub fn notification_log_query_plan(
+    event: Option<&str>,
+    limit: Option<i64>,
+) -> (Option<String>, i64) {
+    let limit = limit
+        .unwrap_or(NOTIFICATION_LOG_DEFAULT_LIMIT)
+        .clamp(1, NOTIFICATION_LOG_MAX_LIMIT);
+    let event = event
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (event, limit)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DTOs
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1502,6 +1617,46 @@ impl NotificationChannelRow {
     }
 }
 
+/// A row of the delivery ledger (`notification_log`, fks 013), exposed via
+/// GET /notifications/history. Written by the dispatcher after each send
+/// attempt; `detail` is a truncated event snippet and NEVER the webhook URL.
+/// Serialises to `{ts, event, bot_id, channel_name, kind, outcome,
+/// status_code, detail}`. On a write the `ts` is ignored (the DB DEFAULTs it to
+/// NOW()); it is populated on reads.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NotificationLogRow {
+    pub ts: DateTime<Utc>,
+    /// Wire event kind (bot_spawned, bot_crashed, …) — or `test` for a probe.
+    pub event: String,
+    pub bot_id: String,
+    /// The `notification_channels.name` this attempt targeted.
+    pub channel_name: String,
+    /// Transport (discord_webhook).
+    pub kind: String,
+    /// One of: sent / http_error / send_failed / decrypt_failed /
+    /// test_sent / test_failed (matches the SQL CHECK constraint).
+    pub outcome: String,
+    /// HTTP status when the webhook responded; `None` for connect/decrypt fails.
+    pub status_code: Option<i16>,
+    pub detail: String,
+}
+
+impl NotificationLogRow {
+    fn from_row(r: PgRow) -> Self {
+        Self {
+            ts: r.try_get("ts").unwrap_or_else(|_| Utc::now()),
+            event: r.try_get("event").unwrap_or_default(),
+            bot_id: r.try_get("bot_id").unwrap_or_default(),
+            channel_name: r.try_get("channel_name").unwrap_or_default(),
+            kind: r.try_get("kind").unwrap_or_default(),
+            outcome: r.try_get("outcome").unwrap_or_default(),
+            // Nullable SMALLINT — NULL decodes as Err, which `.ok()` maps to None.
+            status_code: r.try_get("status_code").ok(),
+            detail: r.try_get("detail").unwrap_or_default(),
+        }
+    }
+}
+
 /// A `ui_layouts` list entry exposed via GET /ui/layouts — the name + when it
 /// was last saved (the full layout blob is fetched per-name via GET
 /// /ui/layouts/{name}, keeping the list light).
@@ -1620,7 +1775,8 @@ fn sanitize_url(url: &str) -> String {
 mod tests {
     use super::{
         NET_WORTH_DEFAULT_LIMIT, NET_WORTH_MAX_LIMIT, NET_WORTH_WINDOW_SQL,
-        PROFIT_END_SNAPSHOT_SQL, PROFIT_START_SNAPSHOT_SQL, net_worth_query_plan, sanitize_url,
+        NOTIFICATION_LOG_DEFAULT_LIMIT, NOTIFICATION_LOG_MAX_LIMIT, PROFIT_END_SNAPSHOT_SQL,
+        PROFIT_START_SNAPSHOT_SQL, net_worth_query_plan, notification_log_query_plan, sanitize_url,
     };
 
     // ── query-text contracts ─────────────────────────────────────────────────
@@ -1716,6 +1872,33 @@ mod tests {
         assert_eq!(
             net_worth_query_plan(Some("  eth-scalper "), None).0,
             Some("eth-scalper".to_string())
+        );
+    }
+
+    #[test]
+    fn notification_log_query_plan_defaults_and_clamps_limit() {
+        assert_eq!(
+            notification_log_query_plan(None, None).1,
+            NOTIFICATION_LOG_DEFAULT_LIMIT
+        );
+        assert_eq!(notification_log_query_plan(None, Some(25)).1, 25);
+        // Below the floor clamps up to 1; a silly-large limit clamps to the cap.
+        assert_eq!(notification_log_query_plan(None, Some(0)).1, 1);
+        assert_eq!(notification_log_query_plan(None, Some(-9)).1, 1);
+        assert_eq!(
+            notification_log_query_plan(None, Some(i64::MAX)).1,
+            NOTIFICATION_LOG_MAX_LIMIT
+        );
+    }
+
+    #[test]
+    fn notification_log_query_plan_normalises_event_filter() {
+        assert_eq!(notification_log_query_plan(None, None).0, None);
+        assert_eq!(notification_log_query_plan(Some(""), None).0, None);
+        assert_eq!(notification_log_query_plan(Some("  "), None).0, None);
+        assert_eq!(
+            notification_log_query_plan(Some(" bot_crashed "), None).0,
+            Some("bot_crashed".to_string())
         );
     }
 }

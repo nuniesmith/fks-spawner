@@ -47,14 +47,44 @@ pub const EVENT_BOT_ERROR: &str = "bot_error";
 /// from `bot_error` (a failed spawn) so a live-money crash can be routed/paged
 /// on its own, and page-worthy: this is the 3am-panic signal.
 pub const EVENT_BOT_CRASHED: &str = "bot_crashed";
+/// A bounded auto-restart of a crashed bot SUCCEEDED — the resolution of the
+/// always-delivered crash page, so it is itself always delivered (a channel
+/// that saw the crash must see the recovery).
+pub const EVENT_BOT_RESTARTED: &str = "bot_restarted";
+/// A bot entered `mode=live` — real money is now moving. Emitted on EVERY live
+/// spawn (covers `/spawn`, respawn, and supervisor restarts, which all funnel
+/// through the spawn path). Page-worthy → always delivered.
+pub const EVENT_LIVE_FLIP: &str = "live_flip";
+/// Exchange API credentials were stored/overwritten via `/secrets`. Carries the
+/// exchange NAME only — NEVER key material — plus the operational reminder that
+/// running bots need a respawn to pick up rotated keys.
+pub const EVENT_KEY_ROTATION: &str = "key_rotation";
+/// Total net worth crossed a configured `NET_WORTH_MILESTONE_STEP` boundary
+/// (either direction). OFF by default (step 0).
+pub const EVENT_NET_WORTH_MILESTONE: &str = "net_worth_milestone";
+/// A bot-side risk guard tripped (trade-cap / kill-switch — NOT a drawdown
+/// halt). Arrives via the generic `POST /events` ingest. Page-worthy on a live
+/// bot by the same logic as a crash → always delivered.
+pub const EVENT_RISK_HALT: &str = "risk_halt";
+/// The advisor detected edge drift on a weekly re-backtest. Arrives via the
+/// generic `POST /events` ingest (the drift comparison lives in fks-state).
+pub const EVENT_EDGE_DECAY: &str = "edge_decay";
 
 /// All known event kinds, in emission-priority order. Handy for docs/tests.
+/// This is a FROZEN wire contract shared with the WebUI channel filters — the
+/// exact snake_case strings a stored `events` allowlist matches against.
 pub const ALL_EVENT_KINDS: &[&str] = &[
     EVENT_BOT_SPAWNED,
     EVENT_BOT_STOPPED,
     EVENT_BOT_REMOVED,
     EVENT_BOT_ERROR,
     EVENT_BOT_CRASHED,
+    EVENT_BOT_RESTARTED,
+    EVENT_LIVE_FLIP,
+    EVENT_KEY_ROTATION,
+    EVENT_NET_WORTH_MILESTONE,
+    EVENT_RISK_HALT,
+    EVENT_EDGE_DECAY,
 ];
 
 /// Discord caps embed field values at 1024 chars and titles at 256; we stay
@@ -148,6 +178,79 @@ impl NotificationEvent {
         }
     }
 
+    /// `bot_restarted` — a bounded auto-restart succeeded. `detail` carries the
+    /// attempt count + the new container id (never a webhook URL).
+    pub fn restarted(bot_id: &str, image: &str, mode: &str, detail: &str) -> Self {
+        Self {
+            event: EVENT_BOT_RESTARTED.to_string(),
+            bot_id: bot_id.to_string(),
+            image: image.to_string(),
+            mode: mode.to_string(),
+            timestamp: Utc::now(),
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    /// `live_flip` — a bot entered live mode. Built from the spawn response so
+    /// bot_id/image/mode are populated; emitted IN ADDITION to `bot_spawned`.
+    pub fn live_flip(resp: &SpawnResponse) -> Self {
+        Self {
+            event: EVENT_LIVE_FLIP.to_string(),
+            bot_id: resp.bot_id.clone(),
+            image: resp.image.clone(),
+            mode: resp.mode.clone(),
+            timestamp: Utc::now(),
+            detail: Some("live mode — real money now moving".to_string()),
+        }
+    }
+
+    /// `key_rotation` — exchange credentials were stored. Carries the exchange
+    /// name ONLY (no key material, by construction — this struct has no field
+    /// for it) plus the respawn reminder that IS the point of the notification.
+    pub fn key_rotation(exchange: &str) -> Self {
+        Self {
+            event: EVENT_KEY_ROTATION.to_string(),
+            bot_id: exchange.to_string(),
+            image: String::new(),
+            mode: String::new(),
+            timestamp: Utc::now(),
+            detail: Some(format!(
+                "{exchange} keys stored — running bots using them need a respawn to pick up the change"
+            )),
+        }
+    }
+
+    /// `net_worth_milestone` — total net worth crossed `milestone` (`up` = green
+    /// gain, `down` = amber drawdown). The direction is carried in `detail` (and
+    /// drives the payload stripe colour).
+    pub fn net_worth_milestone(total: f64, milestone: f64, up: bool) -> Self {
+        let (arrow, dir) = if up { ("▲", "up") } else { ("▼", "down") };
+        Self {
+            event: EVENT_NET_WORTH_MILESTONE.to_string(),
+            bot_id: "treasury".to_string(),
+            image: String::new(),
+            mode: String::new(),
+            timestamp: Utc::now(),
+            detail: Some(format!(
+                "{arrow} total net worth crossed ${milestone:.0} {dir} (now ${total:.2})"
+            )),
+        }
+    }
+
+    /// Generic constructor for an event arriving through `POST /events`. The
+    /// caller has already validated `event` against the ingest allowlist; this
+    /// only shapes the struct (image is unknown for an externally-sourced event).
+    pub fn from_ingest(event: &str, bot_id: &str, mode: &str, detail: &str) -> Self {
+        Self {
+            event: event.to_string(),
+            bot_id: bot_id.to_string(),
+            image: String::new(),
+            mode: mode.to_string(),
+            timestamp: Utc::now(),
+            detail: (!detail.is_empty()).then(|| detail.to_string()),
+        }
+    }
+
     fn from_container_id(event: &str, container_id: &str, detail: Option<String>) -> Self {
         Self {
             event: event.to_string(),
@@ -170,7 +273,17 @@ impl NotificationEvent {
 /// `["bot_error","bot_stopped"]` would otherwise SILENTLY drop the 3am
 /// live-money crash page. A page you cannot afford to lose to a stale filter is
 /// always delivered.
-pub const ALWAYS_DELIVERED_KINDS: &[&str] = &[EVENT_BOT_CRASHED];
+pub const ALWAYS_DELIVERED_KINDS: &[&str] = &[
+    EVENT_BOT_CRASHED,
+    // The resolution of the always-delivered crash page — a channel that was
+    // paged on the crash must also see the self-heal (OD-3).
+    EVENT_BOT_RESTARTED,
+    // Real money starting to move is the same page-worthiness class as a crash
+    // and must not be droppable by a stale scoped filter (OD-4).
+    EVENT_LIVE_FLIP,
+    // A tripped risk guard on a live bot is page-worthy by the crash logic (D1).
+    EVENT_RISK_HALT,
+];
 
 /// Whether a channel whose subscription filter is `events` should receive an
 /// event of kind `event`.
@@ -195,12 +308,25 @@ pub fn channel_wants(events: &[String], event: &str) -> bool {
 pub fn discord_payload(ev: &NotificationEvent) -> serde_json::Value {
     // Discord accepts an integer `color`; pick a stripe per event kind.
     let color: u32 = match ev.event.as_str() {
-        EVENT_BOT_SPAWNED => 0x2E_CC71, // green
-        EVENT_BOT_STOPPED => 0xE6_7E22, // orange
-        EVENT_BOT_REMOVED => 0x95_A5A6, // grey
-        EVENT_BOT_ERROR => 0xE7_4C3C,   // red
-        EVENT_BOT_CRASHED => 0xE7_4C3C, // red (page-worthy)
-        _ => 0x34_98DB,                 // blue (unknown)
+        EVENT_BOT_SPAWNED => 0x2E_CC71,   // green
+        EVENT_BOT_STOPPED => 0xE6_7E22,   // orange
+        EVENT_BOT_REMOVED => 0x95_A5A6,   // grey
+        EVENT_BOT_ERROR => 0xE7_4C3C,     // red
+        EVENT_BOT_CRASHED => 0xE7_4C3C,   // red (page-worthy)
+        EVENT_BOT_RESTARTED => 0x2E_CC71, // green (recovery)
+        EVENT_LIVE_FLIP => 0xC0_392B,     // deep red (real money now moving)
+        EVENT_KEY_ROTATION => 0x9B_59B6,  // purple (credentials)
+        // Green on a gain, amber on a drawdown — direction rides in `detail`.
+        EVENT_NET_WORTH_MILESTONE => {
+            if ev.detail.as_deref().is_some_and(|d| d.contains('▼')) {
+                0xF3_9C12 // amber (down)
+            } else {
+                0x2E_CC71 // green (up)
+            }
+        }
+        EVENT_RISK_HALT => 0xE7_4C3C,  // red (page-worthy)
+        EVENT_EDGE_DECAY => 0xF3_9C12, // amber (drift)
+        _ => 0x34_98DB,                // blue (unknown)
     };
 
     let mut fields = vec![
@@ -238,6 +364,22 @@ fn field(name: &str, value: &str, inline: bool) -> serde_json::Value {
     serde_json::json!({ "name": name, "value": v, "inline": inline })
 }
 
+/// Max length of a delivery-ledger `detail` snippet. Matches the DB column's
+/// truncation contract (`013_notification_log.sql`: detail ≤512, NEVER the URL).
+pub const MAX_LEDGER_DETAIL_LEN: usize = 512;
+
+/// The `detail` snippet persisted to the delivery ledger for an event: the
+/// event's own `detail`, truncated to [`MAX_LEDGER_DETAIL_LEN`]. NEVER contains
+/// the webhook URL (this only ever reads `NotificationEvent.detail`, which is
+/// operator-facing context, never a target). Pure + always-compiled so it is
+/// unit-testable without the `db` feature.
+pub fn ledger_detail(ev: &NotificationEvent) -> String {
+    match &ev.detail {
+        Some(d) => d.chars().take(MAX_LEDGER_DETAIL_LEN).collect(),
+        None => String::new(),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The dispatcher — needs the channel store + an HTTP client (db feature)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -246,14 +388,24 @@ fn field(name: &str, value: &str, inline: bool) -> serde_json::Value {
 mod dispatcher {
     use std::time::Duration;
 
+    use chrono::Utc;
     use tracing::{debug, warn};
 
-    use super::{NotificationEvent, channel_wants, discord_payload};
-    use crate::db::BotRunStore;
+    use super::{NotificationEvent, channel_wants, discord_payload, ledger_detail};
+    use crate::db::{BotRunStore, NotificationLogRow};
     use crate::metrics;
 
     /// Per-POST timeout. Kept short so a hung webhook can never pile up.
     const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Transport recorded in the delivery ledger. Only Discord webhooks reach
+    /// the dispatcher today (dispatch skips other channel kinds).
+    const LEDGER_TRANSPORT: &str = "discord_webhook";
+
+    /// Synthetic `event` value ledgered for a one-off `/test` probe — not a wire
+    /// kind. The history view tells probes apart by the `test_sent`/`test_failed`
+    /// outcome; this keeps the `event` column non-empty and self-describing.
+    const TEST_EVENT: &str = "test";
 
     /// Outcome of a one-off test send (POST /notifications/{name}/test).
     #[derive(Debug)]
@@ -304,6 +456,11 @@ mod dispatcher {
             };
 
             let payload = discord_payload(&ev);
+            // Ledger context carried into each detached write — event kind, the
+            // bot handle, and a truncated detail snippet. NEVER the webhook URL.
+            let event = ev.event.clone();
+            let bot_id = ev.bot_id.clone();
+            let detail = ledger_detail(&ev);
             let mut sends = Vec::new();
             for ch in channels {
                 // Only Discord webhooks are wired today; skip unknown kinds
@@ -314,7 +471,13 @@ mod dispatcher {
                 if !channel_wants(&ch.events, &ev.event) {
                     continue;
                 }
-                sends.push(self.deliver(ch.name, payload.clone()));
+                sends.push(self.deliver(
+                    ch.name,
+                    payload.clone(),
+                    event.clone(),
+                    bot_id.clone(),
+                    detail.clone(),
+                ));
             }
 
             if sends.is_empty() {
@@ -324,36 +487,84 @@ mod dispatcher {
             futures_util::future::join_all(sends).await;
         }
 
+        /// Fire a DETACHED, best-effort delivery-ledger write. NEVER awaited on
+        /// the send path — a ledger failure (or slow DB) must not delay or fail
+        /// a webhook delivery, exactly like the module's best-effort contract.
+        /// `detail` is already a URL-free, truncated snippet (see `ledger_detail`).
+        fn spawn_ledger(
+            &self,
+            channel_name: String,
+            event: String,
+            bot_id: String,
+            outcome: &'static str,
+            status_code: Option<i16>,
+            detail: String,
+        ) {
+            let store = self.store.clone();
+            let row = NotificationLogRow {
+                ts: Utc::now(),
+                event,
+                bot_id,
+                channel_name,
+                kind: LEDGER_TRANSPORT.to_string(),
+                outcome: outcome.to_string(),
+                status_code,
+                detail,
+            };
+            tokio::spawn(async move {
+                if let Err(e) = store.record_notification(&row).await {
+                    // No URL to leak — the row + error are both channel/DB-side.
+                    warn!(error = %e, "notify: delivery-ledger write failed");
+                }
+            });
+        }
+
         /// Decrypt one channel's URL and POST the payload. Logs the channel
-        /// NAME only — never the URL.
-        async fn deliver(&self, name: String, payload: serde_json::Value) {
+        /// NAME only — never the URL. After each terminal outcome it fires a
+        /// DETACHED ledger row (best-effort, off the send path).
+        async fn deliver(
+            &self,
+            name: String,
+            payload: serde_json::Value,
+            event: String,
+            bot_id: String,
+            detail: String,
+        ) {
             let url = match self.store.get_channel_target(&name).await {
                 Ok(Some(u)) => u,
                 Ok(None) => {
+                    // A race, not a send attempt — no ledger row (the SQL
+                    // outcome set has no "vanished" arm).
                     warn!(channel = %name, "notify: channel vanished before send");
                     return;
                 }
                 Err(e) => {
                     warn!(channel = %name, error = %e, "notify: channel URL decrypt failed");
                     metrics::NOTIFY_FAILED_TOTAL.inc();
+                    self.spawn_ledger(name, event, bot_id, "decrypt_failed", None, detail);
                     return;
                 }
             };
 
             match self.client.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    let code = resp.status().as_u16() as i16;
                     metrics::NOTIFY_SENT_TOTAL.inc();
                     debug!(channel = %name, status = %resp.status(), "notify: delivered");
+                    self.spawn_ledger(name, event, bot_id, "sent", Some(code), detail);
                 }
                 Ok(resp) => {
+                    let code = resp.status().as_u16() as i16;
                     metrics::NOTIFY_FAILED_TOTAL.inc();
                     warn!(channel = %name, status = %resp.status(), "notify: webhook non-2xx");
+                    self.spawn_ledger(name, event, bot_id, "http_error", Some(code), detail);
                 }
                 Err(e) => {
                     metrics::NOTIFY_FAILED_TOTAL.inc();
                     // reqwest's Display never includes the request body; but be
                     // explicit that we log the channel, not the URL.
                     warn!(channel = %name, error = %e, "notify: webhook POST failed");
+                    self.spawn_ledger(name, event, bot_id, "send_failed", None, detail);
                 }
             }
         }
@@ -367,6 +578,14 @@ mod dispatcher {
                 Ok(None) => return TestOutcome::NotFound,
                 Err(e) => {
                     warn!(channel = %name, error = %e, "notify test: URL decrypt failed");
+                    self.spawn_ledger(
+                        name.to_string(),
+                        TEST_EVENT.to_string(),
+                        String::new(),
+                        "test_failed",
+                        None,
+                        "connectivity probe — URL decrypt failed".to_string(),
+                    );
                     return TestOutcome::Failed("channel URL could not be decrypted".to_string());
                 }
             };
@@ -378,18 +597,44 @@ mod dispatcher {
 
             match self.client.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
+                    let code = resp.status().as_u16();
                     metrics::NOTIFY_SENT_TOTAL.inc();
                     debug!(channel = %name, "notify test: delivered");
+                    self.spawn_ledger(
+                        name.to_string(),
+                        TEST_EVENT.to_string(),
+                        String::new(),
+                        "test_sent",
+                        Some(code as i16),
+                        "connectivity probe".to_string(),
+                    );
                     TestOutcome::Delivered
                 }
                 Ok(resp) => {
+                    let code = resp.status().as_u16();
                     metrics::NOTIFY_FAILED_TOTAL.inc();
                     warn!(channel = %name, status = %resp.status(), "notify test: non-2xx");
-                    TestOutcome::HttpStatus(resp.status().as_u16())
+                    self.spawn_ledger(
+                        name.to_string(),
+                        TEST_EVENT.to_string(),
+                        String::new(),
+                        "test_failed",
+                        Some(code as i16),
+                        "connectivity probe — webhook returned non-2xx".to_string(),
+                    );
+                    TestOutcome::HttpStatus(code)
                 }
                 Err(e) => {
                     metrics::NOTIFY_FAILED_TOTAL.inc();
                     warn!(channel = %name, error = %e, "notify test: POST failed");
+                    self.spawn_ledger(
+                        name.to_string(),
+                        TEST_EVENT.to_string(),
+                        String::new(),
+                        "test_failed",
+                        None,
+                        "connectivity probe — webhook request failed".to_string(),
+                    );
                     TestOutcome::Failed("webhook request failed".to_string())
                 }
             }
@@ -581,5 +826,178 @@ mod tests {
         assert_eq!(e.bot_id, "x");
         assert_eq!(e.image, "fks-bot-x:latest");
         assert_eq!(e.mode, "paper");
+    }
+
+    // ── new event kinds (plan-03 Phase C/D) ─────────────────────────────────
+
+    /// Every kind renders a non-blue stripe (blue is the unknown-kind fallback),
+    /// so a new kind that forgot its `discord_payload` arm can't ship silently.
+    #[test]
+    fn every_known_kind_has_a_dedicated_stripe() {
+        for kind in ALL_EVENT_KINDS {
+            let color = discord_payload(&ev(kind))["embeds"][0]["color"]
+                .as_u64()
+                .unwrap();
+            assert_ne!(
+                color, 0x34_98DB,
+                "{kind} falls through to the unknown-kind blue stripe"
+            );
+        }
+    }
+
+    /// The always-delivered set is EXACTLY the four page-worthy kinds — a
+    /// regression that added (or dropped) one would flip a stale scoped filter's
+    /// behaviour for a money-adjacent page.
+    #[test]
+    fn always_delivered_set_is_the_page_worthy_four() {
+        let empty: Vec<String> = vec![];
+        for kind in [
+            EVENT_BOT_CRASHED,
+            EVENT_BOT_RESTARTED,
+            EVENT_LIVE_FLIP,
+            EVENT_RISK_HALT,
+        ] {
+            assert!(ALWAYS_DELIVERED_KINDS.contains(&kind), "{kind} must page");
+            // Bypasses even an allowlist that omits it.
+            let scoped = vec![EVENT_BOT_STOPPED.to_string()];
+            assert!(channel_wants(&scoped, kind));
+        }
+        // Non-page kinds are filtered normally (an empty filter still catches
+        // all, but a scoped filter that omits them drops them).
+        for kind in [
+            EVENT_KEY_ROTATION,
+            EVENT_NET_WORTH_MILESTONE,
+            EVENT_EDGE_DECAY,
+        ] {
+            assert!(!ALWAYS_DELIVERED_KINDS.contains(&kind));
+            assert!(channel_wants(&empty, kind), "empty filter catches {kind}");
+            let scoped = vec![EVENT_BOT_STOPPED.to_string()];
+            assert!(
+                !channel_wants(&scoped, kind),
+                "{kind} must be droppable by a scoped filter"
+            );
+        }
+    }
+
+    #[test]
+    fn restarted_is_green_recovery_with_attempt_detail() {
+        let e = NotificationEvent::restarted(
+            "eth-scalper",
+            "fks-bot-eth:v1",
+            "live",
+            "attempt 1/3, new container abc123",
+        );
+        assert_eq!(e.event, EVENT_BOT_RESTARTED);
+        let p = discord_payload(&e);
+        assert_eq!(p["embeds"][0]["color"], 0x2E_CC71, "recovery is green");
+        let detail = p["embeds"][0]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "detail")
+            .unwrap();
+        assert_eq!(detail["value"], "attempt 1/3, new container abc123");
+    }
+
+    #[test]
+    fn live_flip_is_deep_red_from_response() {
+        let resp = SpawnResponse {
+            container_id: "cid".to_string(),
+            container_name: "fks-bot-x".to_string(),
+            bot_id: "crypto-spot-live".to_string(),
+            image: "fks-bot-crypto-spot:latest".to_string(),
+            mode: "live".to_string(),
+            started_at: Utc::now(),
+        };
+        let e = NotificationEvent::live_flip(&resp);
+        assert_eq!(e.event, EVENT_LIVE_FLIP);
+        assert_eq!(e.bot_id, "crypto-spot-live");
+        assert_eq!(e.mode, "live");
+        assert_eq!(discord_payload(&e)["embeds"][0]["color"], 0xC0_392B);
+    }
+
+    /// SECURITY: a key_rotation event must carry the exchange name + the respawn
+    /// reminder and NOTHING that looks like key material. The struct has no
+    /// field for a secret by construction; this locks the rendered payload too.
+    #[test]
+    fn key_rotation_carries_reminder_never_key_material() {
+        let e = NotificationEvent::key_rotation("kraken");
+        assert_eq!(e.event, EVENT_KEY_ROTATION);
+        let detail = e.detail.as_deref().unwrap();
+        assert!(detail.contains("kraken"));
+        assert!(
+            detail.contains("respawn"),
+            "the reminder IS the point of the event"
+        );
+        // Whole rendered payload, serialised, must not leak secret-shaped keys.
+        let rendered = discord_payload(&e).to_string();
+        for banned in ["api_key", "api_secret", "passphrase", "secret"] {
+            assert!(
+                !rendered.contains(banned),
+                "key_rotation payload leaked '{banned}'"
+            );
+        }
+        assert_eq!(discord_payload(&e)["embeds"][0]["color"], 0x9B_59B6);
+    }
+
+    #[test]
+    fn net_worth_milestone_direction_drives_arrow_and_stripe() {
+        let up = NotificationEvent::net_worth_milestone(105_000.0, 100_000.0, true);
+        assert!(up.detail.as_deref().unwrap().contains('▲'));
+        assert!(up.detail.as_deref().unwrap().contains("up"));
+        assert_eq!(
+            discord_payload(&up)["embeds"][0]["color"],
+            0x2E_CC71,
+            "a gain is green"
+        );
+
+        let down = NotificationEvent::net_worth_milestone(95_000.0, 100_000.0, false);
+        assert!(down.detail.as_deref().unwrap().contains('▼'));
+        assert!(down.detail.as_deref().unwrap().contains("down"));
+        assert_eq!(
+            discord_payload(&down)["embeds"][0]["color"],
+            0xF3_9C12,
+            "a drawdown is amber"
+        );
+    }
+
+    #[test]
+    fn ingest_constructor_shapes_external_event() {
+        let e = NotificationEvent::from_ingest(
+            EVENT_RISK_HALT,
+            "eth-scalper",
+            "live",
+            "trade-cap tripped [source=ingest]",
+        );
+        assert_eq!(e.event, EVENT_RISK_HALT);
+        assert_eq!(e.bot_id, "eth-scalper");
+        assert_eq!(e.mode, "live");
+        assert_eq!(e.image, "", "external events have no image");
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("trade-cap tripped [source=ingest]")
+        );
+        // Blank detail collapses to None (no empty "detail" field rendered).
+        let blank = NotificationEvent::from_ingest(EVENT_EDGE_DECAY, "", "", "");
+        assert!(blank.detail.is_none());
+        assert_eq!(discord_payload(&e)["embeds"][0]["color"], 0xE7_4C3C);
+    }
+
+    // ── ledger detail snippet ───────────────────────────────────────────────
+
+    #[test]
+    fn ledger_detail_truncates_and_never_holds_a_url() {
+        // None detail → empty snippet.
+        assert_eq!(ledger_detail(&ev(EVENT_BOT_SPAWNED)), "");
+
+        // A long detail is truncated to the column budget (char-safe).
+        let long = "z".repeat(MAX_LEDGER_DETAIL_LEN + 200);
+        let e = NotificationEvent::error("id", "img", "live", &long);
+        let snippet = ledger_detail(&e);
+        assert_eq!(snippet.chars().count(), MAX_LEDGER_DETAIL_LEN);
+
+        // The snippet only ever reflects `detail` — never the (absent) URL.
+        let e2 = NotificationEvent::crashed("b", "i", "live", "exit_code=139");
+        assert_eq!(ledger_detail(&e2), "exit_code=139");
     }
 }
