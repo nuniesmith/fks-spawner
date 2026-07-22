@@ -1805,7 +1805,7 @@ async fn backtest_spawn_request_round_trips_through_the_spawn_path() {
         42,
         "fks-bot-backtest-crypto-futures:latest",
         &params,
-        "postgres://fks_user:pw@postgres:5432/ruby_db",
+        "postgres://fks_user:pw@postgres:5432/fks_db",
     );
     let resp = mock.spawn(req).await.expect("spawn accepted");
 

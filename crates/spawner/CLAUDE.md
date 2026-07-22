@@ -138,7 +138,7 @@ curl -N http://localhost:8090/container/<id>/logs?tail=100 \
 
 ## Status
 
-Hardened (auth + HTTP integration tests) and DB-backed in `ruby_db`:
+Hardened (auth + HTTP integration tests) and DB-backed in `fks_db`:
 - `bot_runs` history (`/runs`), `bot_configs` saved spawn templates
   (`GET`/`POST /configs`, `DELETE /configs/{name}`), and `exchange_secrets`
   credential storage (`POST /secrets`, `GET /secrets/status`) — all db-gated.

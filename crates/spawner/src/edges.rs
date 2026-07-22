@@ -19,7 +19,7 @@
 //   BACKTEST_RUN_ID   — its backtest_runs row id
 //   BACKTEST_EDGE_ID  — the edge it is validating
 //   BACKTEST_PARAMS   — the request's params object as a JSON string
-//   BACKTEST_DB_URL   — a Postgres URL for the SAME ruby_db (the container is
+//   BACKTEST_DB_URL   — a Postgres URL for the SAME fks_db (the container is
 //                       on fks_network so `postgres:5432` resolves), with
 //                       which the container UPDATEs ITS OWN row: status
 //                       completed|failed + results + finished_at. The spawner
@@ -393,7 +393,7 @@ mod tests {
             7,
             "fks-bot-backtest-crypto-futures:latest",
             &params,
-            "postgres://fks_user:pw@postgres:5432/ruby_db",
+            "postgres://fks_user:pw@postgres:5432/fks_db",
         );
         assert_eq!(req.image, "fks-bot-backtest-crypto-futures:latest");
         assert_eq!(req.bot_id.as_deref(), Some("bt-funding-reversion-7"));
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(sent, params, "params round-trip as a JSON string");
         assert_eq!(
             req.env.get("BACKTEST_DB_URL").map(String::as_str),
-            Some("postgres://fks_user:pw@postgres:5432/ruby_db")
+            Some("postgres://fks_user:pw@postgres:5432/fks_db")
         );
         assert_eq!(
             req.labels.get("fks.edge_id").map(String::as_str),
@@ -426,10 +426,10 @@ mod tests {
     #[test]
     fn backtest_db_url_prefers_the_dedicated_low_privilege_role() {
         let (url, degraded) = resolve_backtest_db_url(
-            "postgres://fks_backtest:pw@postgres:5432/ruby_db",
-            "postgres://fks_user:pw@postgres:5432/ruby_db",
+            "postgres://fks_backtest:pw@postgres:5432/fks_db",
+            "postgres://fks_user:pw@postgres:5432/fks_db",
         );
-        assert_eq!(url, "postgres://fks_backtest:pw@postgres:5432/ruby_db");
+        assert_eq!(url, "postgres://fks_backtest:pw@postgres:5432/fks_db");
         assert!(!degraded, "dedicated URL is the healthy path");
     }
 
@@ -439,8 +439,8 @@ mod tests {
         // functional — but flagged degraded so the caller warns loudly.
         for unset in ["", "   "] {
             let (url, degraded) =
-                resolve_backtest_db_url(unset, "postgres://fks_user:pw@postgres:5432/ruby_db");
-            assert_eq!(url, "postgres://fks_user:pw@postgres:5432/ruby_db");
+                resolve_backtest_db_url(unset, "postgres://fks_user:pw@postgres:5432/fks_db");
+            assert_eq!(url, "postgres://fks_user:pw@postgres:5432/fks_db");
             assert!(degraded, "fallback to the spawner's own URL is degraded");
         }
     }
