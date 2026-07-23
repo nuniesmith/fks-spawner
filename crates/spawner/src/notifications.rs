@@ -298,6 +298,59 @@ pub fn channel_wants(events: &[String], event: &str) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Rate-limit (429) retry policy — pure + always-compiled so the decision logic
+// is unit-testable without the `db` feature (the actual POST/sleep lives in the
+// db-gated dispatcher). Discord answers a tripped webhook rate limit with a
+// `429` + `Retry-After` (seconds); folding that into `http_error` silently
+// dropped page-worthy always-delivered alerts. Instead we honour the header
+// with a small bounded retry.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Total webhook POST attempts (initial + retries) before giving up. Bounded so
+/// a persistent rate limit can't park a detached dispatch indefinitely.
+pub const MAX_SEND_ATTEMPTS: u32 = 3;
+/// Ceiling on a single honoured `Retry-After` delay — a hostile/huge header
+/// cannot stall the task. With [`MAX_SEND_ATTEMPTS`] this caps total wait.
+pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+/// Fallback backoff when a `429` arrives without a usable `Retry-After`.
+pub const DEFAULT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What to do after one webhook POST returned HTTP `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostAction {
+    /// 2xx — delivered, stop.
+    Delivered,
+    /// `429` — sleep the (bounded) delay, then retry if attempts remain.
+    RetryAfter(std::time::Duration),
+    /// Any other non-2xx — permanent `http_error`, do not retry.
+    HttpError,
+}
+
+/// Parse a `Retry-After` header value (Discord sends integer/decimal seconds)
+/// into a bounded sleep. Absent/garbage/negative → [`DEFAULT_RETRY_BACKOFF`];
+/// always clamped to [`MAX_RETRY_AFTER`].
+pub fn parse_retry_after(header: Option<&str>) -> std::time::Duration {
+    header
+        .and_then(|h| h.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(std::time::Duration::from_secs_f64)
+        .unwrap_or(DEFAULT_RETRY_BACKOFF)
+        .min(MAX_RETRY_AFTER)
+}
+
+/// Decide the next action from a webhook's HTTP `status` and its `Retry-After`
+/// header. Pure: the caller owns the attempt budget + the actual sleep.
+pub fn classify_response(status: u16, retry_after: Option<&str>) -> PostAction {
+    if (200..300).contains(&status) {
+        PostAction::Delivered
+    } else if status == 429 {
+        PostAction::RetryAfter(parse_retry_after(retry_after))
+    } else {
+        PostAction::HttpError
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Discord payload builder
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -391,12 +444,31 @@ mod dispatcher {
     use chrono::Utc;
     use tracing::{debug, warn};
 
-    use super::{NotificationEvent, channel_wants, discord_payload, ledger_detail};
+    use once_cell::sync::Lazy;
+
+    use super::{
+        MAX_SEND_ATTEMPTS, NotificationEvent, PostAction, channel_wants, classify_response,
+        discord_payload, ledger_detail,
+    };
     use crate::db::{BotRunStore, NotificationLogRow};
     use crate::metrics;
 
     /// Per-POST timeout. Kept short so a hung webhook can never pile up.
     const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Process-wide webhook client, built once and shared. `reqwest::Client`
+    /// clones share one connection pool, so every dispatch reuses keep-alive
+    /// connections instead of standing up a fresh client (and pool) per call.
+    static SHARED_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+        // A per-request timeout guards each POST; `build()` only fails on a TLS
+        // backend init error, in which case fall back to the default client
+        // (still functional, just without our timeout preset).
+        reqwest::Client::builder()
+            .timeout(WEBHOOK_TIMEOUT)
+            .user_agent(concat!("fks-spawner/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default()
+    });
 
     /// Transport recorded in the delivery ledger. Only Discord webhooks reach
     /// the dispatcher today (dispatch skips other channel kinds).
@@ -422,8 +494,8 @@ mod dispatcher {
     }
 
     /// Loads channels, decrypts webhook URLs, and POSTs Discord payloads.
-    /// Cheap to construct (clones the `BotRunStore` pool handle + builds a
-    /// reqwest client), so callers build one per dispatch.
+    /// Cheap to construct (clones the `BotRunStore` pool handle + the shared
+    /// [`SHARED_CLIENT`] Arc), so callers build one per dispatch.
     pub struct NotificationDispatcher {
         store: BotRunStore,
         client: reqwest::Client,
@@ -431,15 +503,12 @@ mod dispatcher {
 
     impl NotificationDispatcher {
         pub fn new(store: BotRunStore) -> Self {
-            // A per-request timeout guards each POST; `build()` only fails on a
-            // TLS backend init error, in which case fall back to the default
-            // client (still functional, just without our timeout preset).
-            let client = reqwest::Client::builder()
-                .timeout(WEBHOOK_TIMEOUT)
-                .user_agent(concat!("fks-spawner/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .unwrap_or_default();
-            Self { store, client }
+            // Clone the shared client — cheap (an Arc bump) and keeps the
+            // connection pool alive across dispatches for webhook keep-alive.
+            Self {
+                store,
+                client: SHARED_CLIENT.clone(),
+            }
         }
 
         /// Dispatch `ev` to every channel whose filter matches. BEST-EFFORT:
@@ -546,26 +615,74 @@ mod dispatcher {
                 }
             };
 
-            match self.client.post(&url).json(&payload).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    let code = resp.status().as_u16() as i16;
-                    metrics::NOTIFY_SENT_TOTAL.inc();
-                    debug!(channel = %name, status = %resp.status(), "notify: delivered");
-                    self.spawn_ledger(name, event, bot_id, "sent", Some(code), detail);
-                }
-                Ok(resp) => {
-                    let code = resp.status().as_u16() as i16;
-                    metrics::NOTIFY_FAILED_TOTAL.inc();
-                    warn!(channel = %name, status = %resp.status(), "notify: webhook non-2xx");
-                    self.spawn_ledger(name, event, bot_id, "http_error", Some(code), detail);
-                }
-                Err(e) => {
-                    metrics::NOTIFY_FAILED_TOTAL.inc();
-                    // A webhook URL's path IS the secret token, and reqwest's
-                    // Display appends the request URL — strip it with
-                    // `without_url` so only the channel NAME reaches the log.
-                    warn!(channel = %name, error = %reqwest::Error::without_url(e), "notify: webhook POST failed");
-                    self.spawn_ledger(name, event, bot_id, "send_failed", None, detail);
+            // Bounded retry loop: honour a `429`/`Retry-After` up to
+            // MAX_SEND_ATTEMPTS so a rate-limit burst cannot silently drop a
+            // page-worthy always-delivered alert. Every other outcome is
+            // terminal on the first pass (unchanged behaviour). The ledger
+            // records only the FINAL outcome.
+            let mut attempt: u32 = 0;
+            loop {
+                attempt += 1;
+                match self.client.post(&url).json(&payload).send().await {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let code = status.as_u16();
+                        let retry_after = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        match classify_response(code, retry_after.as_deref()) {
+                            PostAction::Delivered => {
+                                metrics::NOTIFY_SENT_TOTAL.inc();
+                                debug!(channel = %name, status = %status, "notify: delivered");
+                                self.spawn_ledger(
+                                    name,
+                                    event,
+                                    bot_id,
+                                    "sent",
+                                    Some(code as i16),
+                                    detail,
+                                );
+                                return;
+                            }
+                            PostAction::RetryAfter(delay) if attempt < MAX_SEND_ATTEMPTS => {
+                                warn!(
+                                    channel = %name,
+                                    status = %status,
+                                    attempt,
+                                    delay_ms = delay.as_millis() as u64,
+                                    "notify: rate-limited (429), backing off then retrying"
+                                );
+                                tokio::time::sleep(delay).await;
+                                // retry
+                            }
+                            // Non-retryable status, OR a 429 with the attempt
+                            // budget exhausted → record the final http_error.
+                            _ => {
+                                metrics::NOTIFY_FAILED_TOTAL.inc();
+                                warn!(channel = %name, status = %status, attempt, "notify: webhook non-2xx");
+                                self.spawn_ledger(
+                                    name,
+                                    event,
+                                    bot_id,
+                                    "http_error",
+                                    Some(code as i16),
+                                    detail,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        metrics::NOTIFY_FAILED_TOTAL.inc();
+                        // A webhook URL's path IS the secret token, and reqwest's
+                        // Display appends the request URL — strip it with
+                        // `without_url` so only the channel NAME reaches the log.
+                        warn!(channel = %name, error = %reqwest::Error::without_url(e), "notify: webhook POST failed");
+                        self.spawn_ledger(name, event, bot_id, "send_failed", None, detail);
+                        return;
+                    }
                 }
             }
         }
@@ -654,6 +771,8 @@ pub use dispatcher::{NotificationDispatcher, TestOutcome};
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn ev(kind: &str) -> NotificationEvent {
@@ -880,6 +999,39 @@ mod tests {
                 "{kind} must be droppable by a scoped filter"
             );
         }
+    }
+
+    #[test]
+    fn classify_response_retries_only_on_429() {
+        // 2xx is terminal-delivered.
+        assert_eq!(classify_response(200, None), PostAction::Delivered);
+        assert_eq!(classify_response(204, None), PostAction::Delivered);
+        // A rate limit retries, honouring the header delay.
+        assert_eq!(
+            classify_response(429, Some("2")),
+            PostAction::RetryAfter(Duration::from_secs(2))
+        );
+        // A 429 with no usable header falls back to the default backoff.
+        assert_eq!(
+            classify_response(429, None),
+            PostAction::RetryAfter(DEFAULT_RETRY_BACKOFF)
+        );
+        // Any other non-2xx is a permanent http_error, never retried.
+        assert_eq!(classify_response(400, None), PostAction::HttpError);
+        assert_eq!(classify_response(404, Some("5")), PostAction::HttpError);
+        assert_eq!(classify_response(500, None), PostAction::HttpError);
+    }
+
+    #[test]
+    fn parse_retry_after_is_bounded_and_lenient() {
+        // Decimal seconds (Discord's form) parse.
+        assert_eq!(parse_retry_after(Some("1.5")), Duration::from_secs_f64(1.5));
+        // A hostile/huge value is clamped to the ceiling.
+        assert_eq!(parse_retry_after(Some("9999")), MAX_RETRY_AFTER);
+        // Absent / garbage / negative → default backoff.
+        assert_eq!(parse_retry_after(None), DEFAULT_RETRY_BACKOFF);
+        assert_eq!(parse_retry_after(Some("soon")), DEFAULT_RETRY_BACKOFF);
+        assert_eq!(parse_retry_after(Some("-3")), DEFAULT_RETRY_BACKOFF);
     }
 
     #[test]
