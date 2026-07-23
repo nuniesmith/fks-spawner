@@ -487,7 +487,10 @@ mod sampler {
     /// `NET_WORTH_SAMPLE_INTERVAL_SECS`. Spawned as a detached background task
     /// from `main`; only started when a Postgres store is configured.
     pub async fn run_sampler(docker: Arc<dyn DockerOps>, config: Arc<Config>, store: BotRunStore) {
-        let interval = Duration::from_secs(config.net_worth_sample_interval_secs);
+        // Clamp to >=1s so `NET_WORTH_SAMPLE_INTERVAL_SECS=0` (a natural
+        // "disable" guess) can't become a busy-loop hammering every bot's
+        // /status + the pool. Mirrors the `supervisor::run` guard.
+        let interval = Duration::from_secs(config.net_worth_sample_interval_secs.max(1));
         let sampler = NetWorthSampler::new();
         // In-memory milestone anchor — the last-announced boundary. `None` until
         // the first total is observed (then baselined without firing). A process

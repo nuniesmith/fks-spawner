@@ -128,8 +128,24 @@ async fn main() -> anyhow::Result<()> {
     if let Some(store_sampler) = store.clone() {
         let docker_sampler: Arc<dyn DockerOps> = docker.clone();
         let config_sampler = config.clone();
+        // Supervised: a panic inside the sampler must not permanently stop
+        // notification_log pruning + stale-backtest sweeps. The factory clones
+        // fresh handles on every respawn. Runs for the process lifetime (no
+        // graceful-shutdown signal for these detached loops).
         tokio::spawn(async move {
-            spawner::net_worth::run_sampler(docker_sampler, config_sampler, store_sampler).await;
+            spawner::task_supervisor::supervise(
+                "net-worth-sampler",
+                || false,
+                move || {
+                    let docker = docker_sampler.clone();
+                    let config = config_sampler.clone();
+                    let store = store_sampler.clone();
+                    async move {
+                        spawner::net_worth::run_sampler(docker, config, store).await;
+                    }
+                },
+            )
+            .await;
         });
         info!(
             interval_secs = %config.net_worth_sample_interval_secs,
@@ -220,8 +236,21 @@ async fn main() -> anyhow::Result<()> {
     {
         let sup_state = state.clone();
         let interval = config.prune_interval_secs;
+        // Supervised: a dead supervisor silently ends ALL crash paging +
+        // gauge/SD refresh. Respawn it on panic rather than losing it until a
+        // container bounce.
         tokio::spawn(async move {
-            spawner::supervisor::run(sup_state, interval).await;
+            spawner::task_supervisor::supervise(
+                "crash-supervisor",
+                || false,
+                move || {
+                    let state = sup_state.clone();
+                    async move {
+                        spawner::supervisor::run(state, interval).await;
+                    }
+                },
+            )
+            .await;
         });
         info!(
             interval_secs = %config.prune_interval_secs,

@@ -29,4 +29,5 @@ pub mod rithmic_sampler;
 #[cfg(feature = "db")]
 pub mod secrets_crypto;
 pub mod supervisor;
+pub mod task_supervisor;
 pub mod treasury;
