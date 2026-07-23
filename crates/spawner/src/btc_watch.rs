@@ -405,7 +405,9 @@ mod watcher {
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(address = %addr, error = %e, "cold-BTC watcher: esplora unreachable");
+                    // Strip the request URL from the reqwest error (uniform with
+                    // the webhook paths) — the address is logged separately.
+                    debug!(address = %addr, error = %reqwest::Error::without_url(e), "cold-BTC watcher: esplora unreachable");
                     return None;
                 }
             };
@@ -423,7 +425,7 @@ mod watcher {
             let resp = match self.client.get(KRAKEN_TICKER_URL).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(error = %e, "cold-BTC watcher: kraken ticker unreachable");
+                    debug!(error = %reqwest::Error::without_url(e), "cold-BTC watcher: kraken ticker unreachable");
                     return None;
                 }
             };
