@@ -110,7 +110,13 @@ impl EventClient {
             match res {
                 Ok(r) if r.status().is_success() => debug!("risk_halt event ingested"),
                 Ok(r) => warn!(status = %r.status(), "event ingest returned non-2xx"),
-                Err(e) => warn!(error = %e, "event ingest POST failed"),
+                // The token rides an `X-Internal-Token` header, not the URL, so
+                // the ingest URL isn't itself a secret — but strip it anyway so
+                // reqwest's Display can never surface a request URL into logs
+                // (uniform with the webhook alert paths).
+                Err(e) => {
+                    warn!(error = %reqwest::Error::without_url(e), "event ingest POST failed")
+                }
             }
         });
     }

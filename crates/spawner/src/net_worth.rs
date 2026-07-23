@@ -454,7 +454,7 @@ mod sampler {
             let resp = match self.client.get(url).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(bot_id = %bot_id, error = %e, "net-worth sampler: /status unreachable");
+                    debug!(bot_id = %bot_id, error = %reqwest::Error::without_url(e), "net-worth sampler: /status unreachable");
                     return None;
                 }
             };

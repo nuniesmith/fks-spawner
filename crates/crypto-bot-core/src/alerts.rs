@@ -46,7 +46,11 @@ impl Alerter {
             match res {
                 Ok(r) if r.status().is_success() => debug!("alert sent"),
                 Ok(r) => warn!(status = %r.status(), "alert: discord returned non-2xx"),
-                Err(e) => warn!(error = %e, "alert: discord webhook POST failed"),
+                // A webhook URL's path IS the secret token — reqwest's Display
+                // appends the request URL, so strip it before logging.
+                Err(e) => {
+                    warn!(error = %reqwest::Error::without_url(e), "alert: discord webhook POST failed")
+                }
             }
         });
     }
@@ -63,5 +67,49 @@ impl Alerter {
             .timeout(Duration::from_secs(10))
             .send()
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A webhook URL's path IS its secret token, and reqwest's `Display`
+    /// appends the request URL to transport errors — so logging the raw error
+    /// (`%e`) would leak the token. The `notify`/`notify_blocking` error arms
+    /// strip it with `reqwest::Error::without_url` before logging; this test
+    /// proves the stripping actually removes the token from the rendered error.
+    ///
+    /// We force a real transport error (connection refused to a closed local
+    /// port — no network egress, deterministic offline) against a URL whose
+    /// path carries a fake token, then assert the token is present in the raw
+    /// error's `Display` but absent once `without_url` is applied.
+    #[tokio::test]
+    async fn without_url_strips_webhook_token_from_error_display() {
+        const FAKE_TOKEN: &str = "s3cr3t-webhook-token-do-not-log";
+        // Port 1 is closed → immediate connection-refused; reqwest attaches the
+        // request URL to the resulting transport error.
+        let url = format!("http://127.0.0.1:1/api/webhooks/123456/{FAKE_TOKEN}");
+
+        // Building a reqwest Client requires the rustls crypto provider (the
+        // production `Alerter::new` installs it the same way).
+        exchange_apiws::ensure_crypto_provider();
+        let err = reqwest::Client::new()
+            .post(&url)
+            .send()
+            .await
+            .expect_err("POST to a closed local port must fail");
+
+        // Precondition: the raw error really does carry the token (otherwise the
+        // test would pass vacuously and never guard the leak).
+        assert!(
+            err.to_string().contains(FAKE_TOKEN),
+            "sanity: raw reqwest error should embed the URL/token; got: {err}"
+        );
+
+        // The fix: without_url removes the URL, so the token cannot reach a log.
+        let stripped = reqwest::Error::without_url(err);
+        assert!(
+            !stripped.to_string().contains(FAKE_TOKEN),
+            "without_url must strip the token from the error Display; got: {stripped}"
+        );
     }
 }

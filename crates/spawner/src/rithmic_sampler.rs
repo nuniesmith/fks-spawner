@@ -218,7 +218,7 @@ mod sampler {
             let resp = match self.client.get(&url).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(error = %e, "rithmic sampler: /positions unreachable (connector likely down)");
+                    debug!(error = %reqwest::Error::without_url(e), "rithmic sampler: /positions unreachable (connector likely down)");
                     return None;
                 }
             };

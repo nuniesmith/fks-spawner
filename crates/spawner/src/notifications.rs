@@ -561,9 +561,10 @@ mod dispatcher {
                 }
                 Err(e) => {
                     metrics::NOTIFY_FAILED_TOTAL.inc();
-                    // reqwest's Display never includes the request body; but be
-                    // explicit that we log the channel, not the URL.
-                    warn!(channel = %name, error = %e, "notify: webhook POST failed");
+                    // A webhook URL's path IS the secret token, and reqwest's
+                    // Display appends the request URL — strip it with
+                    // `without_url` so only the channel NAME reaches the log.
+                    warn!(channel = %name, error = %reqwest::Error::without_url(e), "notify: webhook POST failed");
                     self.spawn_ledger(name, event, bot_id, "send_failed", None, detail);
                 }
             }
@@ -626,7 +627,9 @@ mod dispatcher {
                 }
                 Err(e) => {
                     metrics::NOTIFY_FAILED_TOTAL.inc();
-                    warn!(channel = %name, error = %e, "notify test: POST failed");
+                    // The webhook URL's path IS the secret token — strip it via
+                    // `without_url` before logging (see `deliver`).
+                    warn!(channel = %name, error = %reqwest::Error::without_url(e), "notify test: POST failed");
                     self.spawn_ledger(
                         name.to_string(),
                         TEST_EVENT.to_string(),
