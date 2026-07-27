@@ -1479,6 +1479,28 @@ pub async fn respawn_from_config(
     // window with two live containers for this bot_id. Absent = None.
     let old_container_id = remove_existing_bot(state.docker.as_ref(), &container_name).await?;
 
+    // Close the OLD run's ledger row. respawn tears the container down through
+    // `remove_existing_bot` (a direct Docker call), which bypasses the
+    // `record_remove` that the HTTP remove endpoint performs — so before this,
+    // every respawn left a row claiming `running` forever. 16 such rows had
+    // accumulated by 2026-07-26 against 2 real containers, some three weeks
+    // old. Beyond the wrong "what is running" view, the supervisor classifies
+    // an exited container with a still-open row as a CRASH, so a stale row is
+    // a false LiveBotCrashed page waiting to happen. Best-effort + awaited: a
+    // DB hiccup must not fail the respawn (the container is already gone), but
+    // it must land before the new row is written.
+    #[cfg(feature = "db")]
+    if let Some(old_id) = old_container_id.as_deref()
+        && let Some(store) = state.store.as_ref()
+        && let Err(e) = store.record_remove(old_id).await
+    {
+        warn!(
+            error = %e,
+            container_id = %old_id,
+            "respawn: record_remove failed — bot_runs row left open"
+        );
+    }
+
     let resp = match spawn_bot(state, spawn_req).await {
         Ok(resp) => resp,
         // (d) The remove reported success but Docker still holds the name. Do
