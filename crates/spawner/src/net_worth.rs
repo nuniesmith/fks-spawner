@@ -337,7 +337,19 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     // makes the total wrong even while the others tick. Hence min() over the
     // per-venue stamps, with a root-level stamp used only as a fallback for
     // bots that publish one (crypto-demo, fks-bot-example).
-    let updated = venue_stamps(&v).into_iter().min().or_else(|| {
+    // Gate ONLY on venues in `live` mode.
+    //
+    // A stale stamp means two very different things depending on the bot. A
+    // LIVE venue reports a real broker balance and refreshes every cycle
+    // (~90s observed), so an old stamp means the bot cannot reach it — it is
+    // BLIND and its net worth is frozen. A PAPER bot marks its book on trade
+    // events, so its account snapshot is legitimately hours old while nothing
+    // happens — it is IDLE and its net worth is perfectly correct.
+    //
+    // Conflating the two took the funding bot's treasury series offline for
+    // 15 hours on 2026-07-27: 176 consecutive skips against a stamp that was
+    // 15.5h old BY DESIGN. Idle is not blind.
+    let updated = live_venue_stamps(&v).into_iter().min().or_else(|| {
         UPDATED_KEYS
             .iter()
             .find_map(|k| v.get(*k).and_then(value_as_f64))
@@ -352,13 +364,17 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     })
 }
 
-/// Per-venue `updated` stamps from a `/status` body.
+/// `updated` stamps for venues trading REAL money.
 ///
 /// The spot bot serves `exchanges: [{exchange, mode, total_value, updated}]`
-/// (crypto-bot-core `VenueStatus`); older/other shapes use `venues`.
-fn venue_stamps(v: &serde_json::Value) -> Vec<u64> {
+/// (crypto-bot-core `VenueStatus`); older/other shapes use `venues`. Paper
+/// venues are excluded deliberately — see `parse_status_net_worth`. An empty
+/// result means "nothing here can be checked", which reads as fresh rather
+/// than blanking the series.
+fn live_venue_stamps(v: &serde_json::Value) -> Vec<u64> {
     venue_entries(v)
         .into_iter()
+        .filter(|e| e.mode.eq_ignore_ascii_case("live"))
         .filter_map(|e| e.updated)
         .collect()
 }
@@ -725,6 +741,52 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── idle is not blind (2026-07-27 regression) ───────────────────────────
+    /// The funding bot: a PAPER venue whose account snapshot is legitimately
+    /// 15.5 hours old because it marks its book on trade events, not on a
+    /// timer. Gating on this stamp took its treasury series offline for 15
+    /// hours (176 consecutive skips) before this test existed.
+    #[test]
+    fn a_paper_venue_stamp_never_gates_the_sample() {
+        let body = r#"{"net_worth_usd": 11190.18636279, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper", "updated": 1785000000}
+        ]}"#;
+        let r = parse_status_net_worth(body).expect("parses");
+        assert_eq!(
+            r.updated, None,
+            "a paper venue must not contribute a staleness stamp — idle is not blind"
+        );
+        assert!(!reading_is_stale(r.updated, 1_785_000_000 + 55_643, 600));
+    }
+
+    #[test]
+    fn a_live_venue_still_gates_even_beside_a_paper_one() {
+        // Mixed bot: the live leg is what can go blind, so it must still gate.
+        let body = r#"{"net_worth_usd": 100.0, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper", "updated": 1785000000},
+            {"exchange": "Kraken",         "mode": "live",  "updated": 1785086000}
+        ]}"#;
+        let r = parse_status_net_worth(body).expect("parses");
+        assert_eq!(
+            r.updated,
+            Some(1_785_086_000),
+            "the LIVE venue supplies the stamp"
+        );
+        assert!(reading_is_stale(r.updated, 1_785_086_000 + 700, 600));
+    }
+
+    #[test]
+    fn the_live_spot_bot_is_unaffected_by_the_paper_carve_out() {
+        // All three of its venues are live, so the 2026-07-22 protection holds.
+        let r = parse_status_net_worth(LIVE_SPOT_STATUS).expect("parses");
+        assert_eq!(r.updated, Some(1_785_127_274));
+        let now = 1_785_127_274 + 65 * 60;
+        assert!(
+            reading_is_stale(r.updated, now, 600),
+            "blackout must still be refused"
+        );
+    }
 
     // ── per-venue freshness (P-26) ──────────────────────────────────────────
     /// The REAL shape the production spot bot serves: no root `updated`, three
