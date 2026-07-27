@@ -96,26 +96,65 @@ impl BotRunStore {
             info!("exchange_secrets encryption-at-rest ENABLED (SPAWNER_SECRETS_KEY set)");
         }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(5)
-            .acquire_timeout(Duration::from_secs(5))
-            .connect(database_url)
-            .await;
+        // BOUNDED RETRY (2026-07-26 review). This used to be a single 5s
+        // attempt: on a cold boot where Postgres was not accepting connections
+        // yet, the spawner came up PERMANENTLY stateless — no bot_runs ledger,
+        // no notification channels (they live in this DB), and therefore NO
+        // live-bot crash paging — while /health still answered 200. Nothing
+        // ever retried, so the degradation was silent and survived until
+        // someone restarted the container. Compose now also gates startup on
+        // postgres being healthy, but that only covers `compose up`: this
+        // retry is what covers a slow/restarting database generally.
+        const CONNECT_ATTEMPTS: u32 = 10;
+        let mut backoff = Duration::from_secs(1);
+        let mut last_err: Option<sqlx::Error> = None;
 
-        match pool {
-            Ok(pool) => {
-                info!(url_host = %sanitize_url(database_url), "spawner connected to Postgres");
-                Some(Self { pool, cipher })
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    url_host = %sanitize_url(database_url),
-                    "spawner failed to connect to Postgres — running stateless"
-                );
-                None
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect(database_url)
+                .await
+            {
+                Ok(pool) => {
+                    if attempt > 1 {
+                        info!(
+                            attempt,
+                            "spawner reached Postgres after retrying (cold-boot race)"
+                        );
+                    }
+                    info!(url_host = %sanitize_url(database_url), "spawner connected to Postgres");
+                    return Some(Self { pool, cipher });
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        attempt,
+                        max_attempts = CONNECT_ATTEMPTS,
+                        url_host = %sanitize_url(database_url),
+                        "spawner could not reach Postgres — retrying"
+                    );
+                    last_err = Some(e);
+                    if attempt < CONNECT_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        // cap so ten attempts span ~1 minute, not hours
+                        backoff = (backoff * 2).min(Duration::from_secs(15));
+                    }
+                }
             }
         }
+
+        // Loud, because the consequences are invisible at runtime: this process
+        // will not page on a crashed live bot until it is restarted.
+        error!(
+            error = ?last_err,
+            attempts = CONNECT_ATTEMPTS,
+            url_host = %sanitize_url(database_url),
+            "spawner failed to reach Postgres after all retries — running STATELESS: \
+             no bot_runs ledger, no notification channels, and NO live-bot crash paging \
+             until this process is restarted"
+        );
+        None
     }
 
     /// Check the bot_runs table exists. Logs a warning if it doesn't but does
