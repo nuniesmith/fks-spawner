@@ -300,8 +300,12 @@ impl DockerClient {
         );
 
         // ── Host config (hardened — see build_bot_host_config) ─────────────────
-        let host_config =
-            build_bot_host_config(memory_bytes, cpu_quota_us, self.config.default_cpu_shares);
+        let host_config = build_bot_host_config(
+            memory_bytes,
+            cpu_quota_us,
+            self.config.default_cpu_shares,
+            &bot_id,
+        );
 
         let networking_config = NetworkingConfig {
             endpoints_config: Some(endpoints),
@@ -747,8 +751,51 @@ fn mem_used_bytes(usage: u64, cache: u64) -> i64 {
 /// capability is safe with no `cap_add`. Extracted as a pure fn so the posture
 /// is unit-tested without a Docker daemon (the spawn path itself is exercised
 /// via `MockDockerClient`, which doesn't build a `HostConfig`).
-fn build_bot_host_config(memory_bytes: i64, cpu_quota_us: i64, cpu_shares: i64) -> HostConfig {
+/// Per-bot persistent state directory, mounted at [`BOT_STATE_MOUNT`].
+///
+/// Bots were spawned with NO mounts, so anything written to disk — the
+/// spot bot's JSONL fill journal, any restart-safety state — lived only in
+/// the container filesystem and was destroyed by every respawn (2026-07-26
+/// review). Each bot gets its OWN named volume, so bots stay isolated from
+/// each other (a shared mount would let the paper bot read the live bot's
+/// journal) and the data survives respawns/upgrades.
+///
+/// NOTE the image must create this directory owned by the bot user: Docker
+/// initialises a fresh named volume from the image path, so if the directory
+/// is absent the volume is created root-owned and a non-root bot cannot write.
+pub const BOT_STATE_MOUNT: &str = "/var/lib/fks-bot";
+
+/// Volume name for a bot's state directory. Derived from the bot id so no API
+/// change is needed and the mapping stays inspectable (`docker volume ls`).
+pub fn bot_state_volume(bot_id: &str) -> String {
+    let safe: String = bot_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("fks-bot-state-{safe}")
+}
+
+fn build_bot_host_config(
+    memory_bytes: i64,
+    cpu_quota_us: i64,
+    cpu_shares: i64,
+    bot_id: &str,
+) -> HostConfig {
     HostConfig {
+        // Per-bot state volume (see BOT_STATE_MOUNT). Named volume, not a host
+        // bind: no host path is exposed to the bot and Docker manages the
+        // lifecycle. `:rw` is explicit — the bot writes its journal here.
+        binds: Some(vec![format!(
+            "{}:{}:rw",
+            bot_state_volume(bot_id),
+            BOT_STATE_MOUNT
+        )]),
         memory: Some(memory_bytes),
         memory_swap: Some(memory_bytes), // disable swap
         cpu_period: Some(100_000),
@@ -823,8 +870,9 @@ fn stats_from_response(r: bollard::models::ContainerStatsResponse) -> ContainerS
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerInfo, SpawnRequest, SpawnerError, build_bot_host_config, compute_cpu_percent,
-        count_running_bots, mem_used_bytes, validate_spawn_request,
+        BOT_STATE_MOUNT, ContainerInfo, SpawnRequest, SpawnerError, bot_state_volume,
+        build_bot_host_config, compute_cpu_percent, count_running_bots, mem_used_bytes,
+        validate_spawn_request,
     };
 
     /// Minimal ContainerInfo in the given Docker state, for cap-count tests.
@@ -916,9 +964,32 @@ mod tests {
 
     #[test]
     fn bot_host_config_enforces_security_contract() {
-        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024);
+        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "crypto-spot");
         // The hardening that was missing: drop every Linux capability.
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
+        // Per-bot state volume: present, bot-specific (NOT shared — a shared
+        // mount would let the paper bot read the live bot's fill journal), and
+        // mounted at the documented path.
+        let binds = hc.binds.clone().expect("bot must get a state volume");
+        assert_eq!(binds.len(), 1, "exactly one bind: the state volume");
+        assert!(
+            binds[0].starts_with(&format!("{}:", bot_state_volume("crypto-spot"))),
+            "volume must be per-bot, got {}",
+            binds[0]
+        );
+        // Distinct bots MUST get distinct volumes — this is the isolation
+        // property, not a naming detail.
+        assert_ne!(
+            bot_state_volume("crypto-spot"),
+            bot_state_volume("crypto-funding")
+        );
+        // Names with path/shell-hostile characters are sanitised.
+        assert_eq!(bot_state_volume("a/b c"), "fks-bot-state-a-b-c");
+        assert!(
+            binds[0].contains(BOT_STATE_MOUNT),
+            "mounted at the state path"
+        );
+        assert!(!binds[0].starts_with('/'), "named volume, not a host bind");
         // No capabilities are added back — bots need none.
         assert!(
             hc.cap_add.is_none(),
