@@ -1288,6 +1288,7 @@ const NET_WORTH_WINDOW_SQL: &str = "SELECT bot_id, ts, net_worth::float8 AS net_
                 ROW_NUMBER() OVER (PARTITION BY bot_id ORDER BY ts DESC, id DESC) AS rn \
          FROM net_worth_snapshots \
          WHERE ($1::text IS NULL OR bot_id = $1) \
+           AND source <> 'bot_status_stale' \
      ) recent \
      WHERE rn <= $2 \
      ORDER BY ts ASC, id ASC";
@@ -1297,6 +1298,7 @@ const NET_WORTH_WINDOW_SQL: &str = "SELECT bot_id, ts, net_worth::float8 AS net_
 /// inserted wins) instead of planner-dependent.
 const PROFIT_START_SNAPSHOT_SQL: &str = "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
      WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+       AND source <> 'bot_status_stale' \
      ORDER BY ts ASC, id ASC LIMIT 1";
 
 /// SQL picking the LAST snapshot bounding the `GET /profit` window. The
@@ -1304,6 +1306,7 @@ const PROFIT_START_SNAPSHOT_SQL: &str = "SELECT ts, net_worth::float8 AS net_wor
 /// inserted wins) instead of planner-dependent.
 const PROFIT_END_SNAPSHOT_SQL: &str = "SELECT ts, net_worth::float8 AS net_worth FROM net_worth_snapshots \
      WHERE bot_id = $1 AND ($2::timestamptz IS NULL OR ts >= $2) \
+       AND source <> 'bot_status_stale' \
      ORDER BY ts DESC, id DESC LIMIT 1";
 
 // ── GET /net-worth request shaping (pure — unit-tested) ──────────────────────

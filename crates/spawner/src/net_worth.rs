@@ -101,6 +101,11 @@ pub struct NetWorthSnapshot {
 ///   - `rithmic`  — the Rithmic account-balance sampler
 ///   - `manual`   — a hand-entered snapshot (POST /net-worth)
 pub const SOURCE_BOT_STATUS: &str = "bot_status";
+/// A `bot_status` row that was recorded from a FROZEN reading, before the
+/// staleness guard existed (see src/sql/spawner/015_net_worth_stale_provenance.sql).
+/// Retained for the audit trail; EXCLUDED from every read path so derived
+/// figures are computed only from readings that were actually fresh.
+pub const SOURCE_BOT_STATUS_STALE: &str = "bot_status_stale";
 pub const SOURCE_ONCHAIN: &str = "onchain";
 pub const SOURCE_RITHMIC: &str = "rithmic";
 pub const SOURCE_MANUAL: &str = "manual";
