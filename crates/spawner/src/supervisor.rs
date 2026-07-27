@@ -402,6 +402,21 @@ pub async fn tick(state: &crate::api::AppState, tracker: &mut RestartTracker) {
             Ok(_) => {
                 info!(container = %&id[..12.min(id.len())], "supervisor: pruned stopped container");
                 pruned += 1;
+                // Close the ledger row too — the auto-prune removes the
+                // container directly, so without this the row stays `running`
+                // forever (the one-shot backtest bots were the bulk of the 16
+                // stale rows found on 2026-07-26). Best-effort: a DB failure
+                // must never abort the sweep.
+                #[cfg(feature = "db")]
+                if let Some(store) = state.store.as_ref()
+                    && let Err(e) = store.record_remove(id).await
+                {
+                    warn!(
+                        error = %e,
+                        container_id = %id,
+                        "supervisor: record_remove after prune failed — row left open"
+                    );
+                }
             }
             Err(e) => warn!(container = %id, error = %e, "supervisor: prune remove failed"),
         }
