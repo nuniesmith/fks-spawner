@@ -69,6 +69,10 @@ pub struct NetWorthReading {
     pub net_worth: f64,
     pub currency: String,
     pub venue: Option<String>,
+    /// The bot's OWN `updated` epoch-seconds stamp for this figure, when it
+    /// publishes one. `None` = the bot does not report freshness, so the
+    /// reading cannot be staleness-checked (recorded, as before).
+    pub updated: Option<u64>,
 }
 
 /// One row destined for `net_worth_snapshots`. `ts` is intentionally omitted —
@@ -283,6 +287,40 @@ fn first_string(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
 /// Returns `None` when the body isn't JSON, or carries no recognised numeric
 /// net-worth field — the caller treats that as "this bot doesn't report net
 /// worth" and skips it. Currency defaults to USD when unspecified.
+/// Keys a bot may use to stamp when its status figure was produced.
+const UPDATED_KEYS: [&str; 4] = ["updated", "updated_at", "ts", "timestamp"];
+
+/// Wall-clock epoch seconds (the same basis the bots stamp `updated` with).
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a reading is too old to record as a fresh sample.
+///
+/// On 2026-07-22 the live spot bot lost DNS for every venue for 65 minutes.
+/// Its `/status` kept serving the last good figure, the sampler recorded that
+/// frozen number every 5 minutes stamped `ts=NOW()`, and the durable treasury
+/// series gained **15 consecutive rows identical to 8 decimal places**
+/// (206.26301554) spanning 75 minutes — a flat plateau that never happened,
+/// feeding the D5 profit decomposition and the milestone detector. Nothing
+/// about the write looked wrong; the row was simply not true.
+///
+/// A reading older than `max_age_secs` is refused rather than recorded. Gaps
+/// are honest; fabricated flat rows are not. Returns false when the bot
+/// publishes no stamp (nothing to check) or when clocks disagree such that
+/// the stamp is in the future (treated as fresh — a skewed clock must not
+/// silently blank the series).
+pub fn reading_is_stale(updated: Option<u64>, now_secs: u64, max_age_secs: u64) -> bool {
+    match updated {
+        None => false,
+        Some(u) if u > now_secs => false,
+        Some(u) => now_secs.saturating_sub(u) > max_age_secs,
+    }
+}
+
 pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let net_worth = NET_WORTH_KEYS
@@ -290,10 +328,18 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
         .find_map(|k| v.get(*k).and_then(value_as_f64))?;
     let currency = first_string(&v, CURRENCY_KEYS).unwrap_or_else(|| "USD".to_string());
     let venue = first_string(&v, VENUE_KEYS);
+    // The bot stamps every snapshot it publishes (crypto-bot-core status.rs).
+    // Ignoring it is how a FROZEN reading became 15 "fresh" rows on 2026-07-22.
+    let updated = UPDATED_KEYS
+        .iter()
+        .find_map(|k| v.get(*k).and_then(value_as_f64))
+        .filter(|n| *n > 0.0)
+        .map(|n| n as u64);
     Some(NetWorthReading {
         net_worth,
         currency,
         venue,
+        updated,
     })
 }
 
@@ -329,7 +375,8 @@ mod sampler {
 
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
-        milestone_baseline, parse_status_net_worth, running_status_targets,
+        milestone_baseline, now_epoch_secs, parse_status_net_worth, reading_is_stale,
+        running_status_targets,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -399,6 +446,27 @@ mod sampler {
                     // Bot doesn't expose net worth (or was unreachable) — skip.
                     continue;
                 };
+                // Refuse a figure the BOT ITSELF stamps as old. Tolerate two
+                // sample intervals (a single missed cycle is normal jitter);
+                // beyond that the bot is serving a frozen value and writing it
+                // with ts=NOW() manufactures history. A GAP in the series is
+                // honest; a flat plateau that never happened is not.
+                let max_age = config.net_worth_sample_interval_secs.max(1) * 2;
+                if reading_is_stale(reading.updated, now_epoch_secs(), max_age) {
+                    let age = reading
+                        .updated
+                        .map(|u| now_epoch_secs().saturating_sub(u))
+                        .unwrap_or(0);
+                    warn!(
+                        bot_id = %bot_id,
+                        age_secs = age,
+                        max_age_secs = max_age,
+                        "net-worth sampler: /status figure is STALE — skipping rather than \
+                         recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
+                         which wrote 15 identical rows into the treasury series)"
+                    );
+                    continue;
+                }
                 let snap = NetWorthSnapshot::from_reading(&bot_id, reading);
                 match store.record_net_worth(&snap).await {
                     Ok(()) => {
@@ -579,6 +647,47 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── staleness guard (2026-07-22 DNS blackout) ───────────────────────────
+    #[test]
+    fn stale_reading_is_refused_fresh_one_is_kept() {
+        let now = 1_785_000_000u64;
+        let max_age = 600; // 2 x a 300s interval
+        // Fresh: stamped this cycle.
+        assert!(!reading_is_stale(Some(now), now, max_age));
+        // One missed cycle — tolerated, this is normal jitter.
+        assert!(!reading_is_stale(Some(now - 300), now, max_age));
+        // Exactly at the bound is still acceptable.
+        assert!(!reading_is_stale(Some(now - 600), now, max_age));
+        // Beyond it: the bot is serving a frozen figure.
+        assert!(reading_is_stale(Some(now - 601), now, max_age));
+        // The real incident: 65 minutes of frozen /status.
+        assert!(reading_is_stale(Some(now - 65 * 60), now, max_age));
+    }
+
+    #[test]
+    fn missing_or_future_stamp_is_not_treated_as_stale() {
+        let now = 1_785_000_000u64;
+        // A bot that publishes no stamp cannot be checked — record it, as before.
+        assert!(!reading_is_stale(None, now, 600));
+        // Clock skew putting the stamp ahead must NOT blank the series.
+        assert!(!reading_is_stale(Some(now + 120), now, 600));
+    }
+
+    #[test]
+    fn parse_extracts_the_bots_updated_stamp() {
+        // With a stamp (the shape crypto-bot-core publishes).
+        let r = parse_status_net_worth(r#"{"net_worth_usd": 206.26, "updated": 1785000000}"#)
+            .expect("parses");
+        assert_eq!(r.updated, Some(1_785_000_000));
+        // Without one — still parses, just unverifiable.
+        let r2 = parse_status_net_worth(r#"{"net_worth_usd": 206.26}"#).expect("parses");
+        assert_eq!(r2.updated, None);
+        // Garbage/zero stamp is treated as absent rather than 1970.
+        let r3 = parse_status_net_worth(r#"{"net_worth_usd": 1.0, "updated": 0}"#).expect("parses");
+        assert_eq!(r3.updated, None);
+    }
+
     use std::collections::HashMap;
 
     fn container(name: &str, bot_id: &str, state: &str) -> ContainerInfo {
@@ -672,6 +781,7 @@ mod tests {
             net_worth: 500.0,
             currency: "USD".to_string(),
             venue: Some("kucoin".to_string()),
+            updated: None,
         };
         let snap = NetWorthSnapshot::from_reading("eth-scalper", reading);
         assert_eq!(snap.bot_id, "eth-scalper");
