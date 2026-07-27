@@ -73,10 +73,19 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     useradd -u 10001 -m -s /usr/sbin/nologin appuser
 
+# Persistent per-bot state directory. The spawner mounts a named volume here
+# (BOT_STATE_MOUNT in docker_client.rs). It MUST exist in the image and be
+# owned by the bot user: Docker initialises a fresh named volume from the
+# image path, so if this directory were absent the volume would be created
+# root-owned and this non-root bot could not write its journal. Before the
+# mount existed, everything written to disk died with the container on every
+# respawn (2026-07-26 review).
+RUN mkdir -p /var/lib/fks-bot && chown 10001:10001 /var/lib/fks-bot
+
 USER appuser
-# State files (journals) default to the CWD — point it at appuser's writable
-# home.
-WORKDIR /home/appuser
+# State files (journals) resolve against the CWD. Point it at the MOUNTED
+# state dir so the journal survives respawns; /home/appuser is ephemeral.
+WORKDIR /var/lib/fks-bot
 
 ENV RUST_LOG=info \
     RUST_BACKTRACE=1
