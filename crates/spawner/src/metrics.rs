@@ -8,9 +8,11 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Counter, Encoder, Gauge, HistogramVec, TextEncoder, register_counter, register_gauge,
-    register_histogram_vec,
+    Counter, Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder, register_counter, register_gauge,
+    register_gauge_vec, register_histogram_vec,
 };
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Counters
@@ -108,6 +110,34 @@ pub static CRASHED_BOTS: Lazy<Gauge> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Age, in seconds, of each venue's last successful account refresh — as
+/// stamped by the BOT, not by the scraper. This is the metric that would have
+/// made the 2026-07-22 DNS blackout visible within minutes instead of being
+/// found in the database five days later: every venue's age climbing together
+/// is a connectivity failure, one venue climbing alone is a venue problem.
+///
+/// A venue that vanishes from `/status` stops being exported rather than
+/// reporting a stale age forever (see `set_venue_ages`).
+pub static VENUE_STATUS_AGE: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fks_bot_venue_status_age_seconds",
+        "Seconds since a bot venue last refreshed its account snapshot (bot-stamped)",
+        &["bot_id", "exchange", "mode"]
+    )
+    .expect("metric registration failed")
+});
+
+/// Net-worth samples SKIPPED because the bot's own stamp said the figure was
+/// stale. Non-zero means the treasury series has an honest gap; it is the
+/// counterpart to the silent fabrication this replaced.
+pub static NET_WORTH_STALE_SKIPPED_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "fks_spawner_net_worth_stale_skipped_total",
+        "Net-worth samples refused because the bot-stamped figure was too old"
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Histograms
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +150,43 @@ pub static SPAWN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     )
     .expect("metric registration failed")
 });
+
+/// One venue's exported age: `(exchange, mode, age_seconds)`.
+pub type VenueAge = (String, String, f64);
+
+/// Publish per-venue ages for one bot, retiring labels for venues that are no
+/// longer reported.
+///
+/// A GaugeVec keeps a child series forever once created. Without this, a venue
+/// that disappears from `/status` (bot reconfigured, venue removed) would keep
+/// exporting its last age — which then climbs forever and fires the alert
+/// permanently. Retiring the stale label sets keeps "age is high" meaningful.
+pub fn set_venue_ages(bot_id: &str, ages: &[VenueAge]) {
+    /// exchange + mode label pair, per bot.
+    type VenueLabels = HashSet<(String, String)>;
+    static SEEN: Lazy<Mutex<HashMap<String, VenueLabels>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
+    let current: HashSet<(String, String)> = ages
+        .iter()
+        .map(|(ex, mode, _)| (ex.clone(), mode.clone()))
+        .collect();
+
+    for (exchange, mode, age) in ages {
+        VENUE_STATUS_AGE
+            .with_label_values(&[bot_id, exchange, mode])
+            .set(*age);
+    }
+
+    if let Ok(mut seen) = SEEN.lock() {
+        if let Some(prev) = seen.get(bot_id) {
+            for (exchange, mode) in prev.difference(&current) {
+                let _ = VENUE_STATUS_AGE.remove_label_values(&[bot_id, exchange, mode]);
+            }
+        }
+        seen.insert(bot_id.to_string(), current);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Render
@@ -139,6 +206,8 @@ pub fn render() -> String {
     let _ = &*RUNNING_BOTS;
     let _ = &*LIVE_BOTS_RUNNING;
     let _ = &*CRASHED_BOTS;
+    let _ = &*VENUE_STATUS_AGE;
+    let _ = &*NET_WORTH_STALE_SKIPPED_TOTAL;
     let _ = &*SPAWN_DURATION;
 
     let encoder = TextEncoder::new();

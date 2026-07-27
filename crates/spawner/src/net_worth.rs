@@ -330,17 +330,79 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     let venue = first_string(&v, VENUE_KEYS);
     // The bot stamps every snapshot it publishes (crypto-bot-core status.rs).
     // Ignoring it is how a FROZEN reading became 15 "fresh" rows on 2026-07-22.
-    let updated = UPDATED_KEYS
-        .iter()
-        .find_map(|k| v.get(*k).and_then(value_as_f64))
-        .filter(|n| *n > 0.0)
-        .map(|n| n as u64);
+    //
+    // The production spot bot publishes NO root-level stamp — freshness lives
+    // per-venue in `exchanges[]`. And `net_worth_usd` is a SUM across those
+    // venues, so it is only as fresh as its STALEST component: one dead venue
+    // makes the total wrong even while the others tick. Hence min() over the
+    // per-venue stamps, with a root-level stamp used only as a fallback for
+    // bots that publish one (crypto-demo, fks-bot-example).
+    let updated = venue_stamps(&v).into_iter().min().or_else(|| {
+        UPDATED_KEYS
+            .iter()
+            .find_map(|k| v.get(*k).and_then(value_as_f64))
+            .filter(|n| *n > 0.0)
+            .map(|n| n as u64)
+    });
     Some(NetWorthReading {
         net_worth,
         currency,
         venue,
         updated,
     })
+}
+
+/// Per-venue `updated` stamps from a `/status` body.
+///
+/// The spot bot serves `exchanges: [{exchange, mode, total_value, updated}]`
+/// (crypto-bot-core `VenueStatus`); older/other shapes use `venues`.
+fn venue_stamps(v: &serde_json::Value) -> Vec<u64> {
+    venue_entries(v)
+        .into_iter()
+        .filter_map(|e| e.updated)
+        .collect()
+}
+
+/// One venue's freshness, for both the staleness decision and the
+/// per-venue Prometheus gauge (P-26).
+#[derive(Debug, Clone, PartialEq)]
+pub struct VenueFreshness {
+    pub exchange: String,
+    pub mode: String,
+    pub updated: Option<u64>,
+}
+
+/// Parse the per-venue array out of a `/status` body. Empty when the bot
+/// publishes no venue breakdown.
+pub fn parse_venue_freshness(body: &str) -> Vec<VenueFreshness> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .map(|v| venue_entries(&v))
+        .unwrap_or_default()
+}
+
+fn venue_entries(v: &serde_json::Value) -> Vec<VenueFreshness> {
+    const VENUE_ARRAY_KEYS: [&str; 2] = ["exchanges", "venues"];
+    VENUE_ARRAY_KEYS
+        .iter()
+        .find_map(|k| v.get(*k).and_then(|a| a.as_array()))
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let exchange = first_string(e, &["exchange", "venue", "name"])?;
+                    Some(VenueFreshness {
+                        exchange,
+                        mode: first_string(e, &["mode"]).unwrap_or_else(|| "?".to_string()),
+                        updated: e
+                            .get("updated")
+                            .and_then(value_as_f64)
+                            .filter(|n| *n > 0.0)
+                            .map(|n| n as u64),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Build the `/status` URL for a bot from its container name + the bot metrics
@@ -375,8 +437,8 @@ mod sampler {
 
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
-        milestone_baseline, now_epoch_secs, parse_status_net_worth, reading_is_stale,
-        running_status_targets,
+        milestone_baseline, now_epoch_secs, parse_status_net_worth, parse_venue_freshness,
+        reading_is_stale, running_status_targets,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -465,6 +527,7 @@ mod sampler {
                          recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
                          which wrote 15 identical rows into the treasury series)"
                     );
+                    metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
                     continue;
                 }
                 let snap = NetWorthSnapshot::from_reading(&bot_id, reading);
@@ -541,6 +604,21 @@ mod sampler {
                     return None;
                 }
             };
+            // Per-venue freshness (P-26). Rides the /status body we already
+            // fetched — no extra request. Exported even when the bot publishes
+            // no net worth, because a dead venue is worth seeing regardless.
+            let now = now_epoch_secs();
+            let ages: Vec<(String, String, f64)> = parse_venue_freshness(&body)
+                .into_iter()
+                .filter_map(|v| {
+                    v.updated
+                        .map(|u| (v.exchange, v.mode, now.saturating_sub(u) as f64))
+                })
+                .collect();
+            if !ages.is_empty() {
+                metrics::set_venue_ages(bot_id, &ages);
+            }
+
             match parse_status_net_worth(&body) {
                 some @ Some(_) => some,
                 None => {
@@ -647,6 +725,90 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── per-venue freshness (P-26) ──────────────────────────────────────────
+    /// The REAL shape the production spot bot serves: no root `updated`, three
+    /// venues under `exchanges[]`, each with its own stamp. The first cut of
+    /// the staleness guard only read a root stamp and was therefore a complete
+    /// no-op against this body — the exact bot it was written to protect.
+    const LIVE_SPOT_STATUS: &str = r#"{
+        "bot": "spot-portfolio", "mode": "live", "net_worth_usd": 165.12386300312613,
+        "exchanges": [
+            {"exchange": "Crypto.com",  "mode": "live", "total_value": 55.84, "updated": 1785127277},
+            {"exchange": "Kraken",      "mode": "live", "total_value": 35.82, "updated": 1785127274},
+            {"exchange": "KuCoin-spot", "mode": "live", "total_value": 73.44, "updated": 1785127275}
+        ]
+    }"#;
+
+    #[test]
+    fn freshness_comes_from_the_stalest_venue_not_the_root() {
+        let r = parse_status_net_worth(LIVE_SPOT_STATUS).expect("parses");
+        // net_worth is a SUM across venues, so it is only as fresh as its
+        // oldest component — the min, never the max.
+        assert_eq!(r.updated, Some(1_785_127_274));
+        assert!((r.net_worth - 165.123_863_003_126_13).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_dead_venue_makes_the_total_stale_even_when_others_tick() {
+        // Kraken frozen an hour ago; the other two refreshed seconds ago. The
+        // SUM is wrong, so the sample must be refused.
+        let body = r#"{"net_worth_usd": 165.0, "exchanges": [
+            {"exchange": "Crypto.com", "mode": "live", "updated": 1785127277},
+            {"exchange": "Kraken",     "mode": "live", "updated": 1785123600},
+            {"exchange": "KuCoin",     "mode": "live", "updated": 1785127275}
+        ]}"#;
+        let r = parse_status_net_worth(body).expect("parses");
+        assert_eq!(r.updated, Some(1_785_123_600));
+        assert!(reading_is_stale(r.updated, 1_785_127_280, 600));
+    }
+
+    #[test]
+    fn venue_freshness_exposes_every_venue_with_mode() {
+        let v = parse_venue_freshness(LIVE_SPOT_STATUS);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].exchange, "Crypto.com");
+        assert_eq!(v[0].mode, "live");
+        assert_eq!(v[1].updated, Some(1_785_127_274));
+        // A body with no venue breakdown yields nothing rather than erroring.
+        assert!(parse_venue_freshness(r#"{"net_worth_usd": 1.0}"#).is_empty());
+        assert!(parse_venue_freshness("not json").is_empty());
+    }
+
+    #[test]
+    fn root_stamp_is_the_fallback_when_no_venues_are_published() {
+        let body = r#"{"net_worth_usd": 10.0, "updated": 1785000000}"#;
+        assert_eq!(
+            parse_status_net_worth(body).unwrap().updated,
+            Some(1_785_000_000)
+        );
+        // And a venue array with no stamps falls back to the root too.
+        let mixed = r#"{"net_worth_usd": 10.0, "updated": 1785000000,
+                        "exchanges": [{"exchange": "Kraken", "mode": "live"}]}"#;
+        assert_eq!(
+            parse_status_net_worth(mixed).unwrap().updated,
+            Some(1_785_000_000)
+        );
+    }
+
+    #[test]
+    fn the_2026_07_22_blackout_would_now_be_refused() {
+        // Every venue frozen together — the DNS signature. 65 minutes stale.
+        let now = 1_785_127_280u64;
+        let frozen = now - 65 * 60;
+        let body = format!(
+            r#"{{"net_worth_usd": 206.26301554, "exchanges": [
+                {{"exchange": "Crypto.com", "mode": "live", "updated": {frozen}}},
+                {{"exchange": "Kraken",     "mode": "live", "updated": {frozen}}},
+                {{"exchange": "KuCoin",     "mode": "live", "updated": {frozen}}}
+            ]}}"#
+        );
+        let r = parse_status_net_worth(&body).expect("parses");
+        assert!(
+            reading_is_stale(r.updated, now, 600),
+            "the frozen 206.26301554 reading must be refused, not written 15 times"
+        );
+    }
 
     // ── staleness guard (2026-07-22 DNS blackout) ───────────────────────────
     #[test]
