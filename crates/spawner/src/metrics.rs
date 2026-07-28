@@ -160,10 +160,48 @@ pub static SPAWN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
 /// and stay green through exactly the outage they exist to catch (the gauge
 /// reproducing, one level up, the frozen-reading bug it was built to expose).
 ///
-/// Removing the series is the honest state: absent, not "fine". `up == 0` and
-/// BotStopped still cover the bot being down.
+/// Removing the series is the honest state: absent, not "fine".
+///
+/// CORRECTION to an earlier version of this comment, which claimed `up == 0`
+/// and BotStopped cover the bot being down. They do NOT for a deliberate
+/// stop/remove: the Prometheus SD file is rewritten to drop non-running bots,
+/// so no `up` series survives to be 0. Coverage for that path comes from
+/// `retire_absent_bots` (this module) removing the series entirely.
 pub fn retire_venue_ages(bot_id: &str) {
     set_venue_ages(bot_id, &[]);
+}
+
+/// Retire every bot that is no longer in the running set.
+///
+/// `set_venue_ages` / `retire_venue_ages` are only reachable from `probe()`,
+/// and `probe()` only runs for bots whose container state is "running". So a
+/// bot that is stopped, crashes, or is removed is never probed again and its
+/// venue series linger FROZEN at their last ages until the spawner restarts.
+///
+/// That is not merely untidy. Stop a bot while one of its venues sits at 1200s
+/// and `BotVenueStale` fires on the money channel FOREVER. The mitigation
+/// claimed elsewhere ("up == 0 covers it") does NOT hold for a deliberate
+/// stop/remove: the Prometheus SD file is rewritten to drop non-running bots,
+/// so no `up` series exists at all — neither `up == 0` nor
+/// BotVenueFreshnessMissing (which requires `up == 1`) can fire.
+///
+/// Called once per sampler tick with the bots that ARE running.
+pub fn retire_absent_bots(running: &[String]) {
+    let live: HashSet<&str> = running.iter().map(String::as_str).collect();
+    let gone: Vec<String> = match SEEN.lock() {
+        Ok(seen) => seen
+            .keys()
+            .filter(|b| !live.contains(b.as_str()))
+            .cloned()
+            .collect(),
+        Err(_) => return,
+    };
+    for bot_id in gone {
+        set_venue_ages(&bot_id, &[]);
+        if let Ok(mut seen) = SEEN.lock() {
+            seen.remove(&bot_id);
+        }
+    }
 }
 
 /// One venue's exported age: `(exchange, mode, age_seconds)`.
@@ -176,12 +214,15 @@ pub type VenueAge = (String, String, f64);
 /// that disappears from `/status` (bot reconfigured, venue removed) would keep
 /// exporting its last age — which then climbs forever and fires the alert
 /// permanently. Retiring the stale label sets keeps "age is high" meaningful.
-pub fn set_venue_ages(bot_id: &str, ages: &[VenueAge]) {
-    /// exchange + mode label pair, per bot.
-    type VenueLabels = HashSet<(String, String)>;
-    static SEEN: Lazy<Mutex<HashMap<String, VenueLabels>>> =
-        Lazy::new(|| Mutex::new(HashMap::new()));
+/// exchange + mode label pair, per bot.
+type VenueLabels = HashSet<(String, String)>;
 
+/// Which venue label sets are currently exported, per bot. Shared by
+/// `set_venue_ages` (diff-retire within one bot) and `retire_absent_bots`
+/// (retire whole bots that no longer run).
+static SEEN: Lazy<Mutex<HashMap<String, VenueLabels>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub fn set_venue_ages(bot_id: &str, ages: &[VenueAge]) {
     let current: HashSet<(String, String)> = ages
         .iter()
         .map(|(ex, mode, _)| (ex.clone(), mode.clone()))
@@ -236,6 +277,15 @@ pub fn render() -> String {
 mod tests {
     use super::*;
 
+    /// `retire_absent_bots` operates on the whole SEEN map by design, so a test
+    /// calling it would retire bots another test registered concurrently. These
+    /// tests share process-global prometheus + SEEN state and must not overlap.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Count exported children of the venue gauge for one bot_id.
     fn series_for(bot_id: &str) -> usize {
         prometheus::gather()
@@ -252,6 +302,7 @@ mod tests {
 
     #[test]
     fn retiring_a_bot_removes_every_venue_series() {
+        let _g = serial();
         // Unique id: the prometheus registry is process-global and tests run
         // in parallel.
         let bot = "test-retire-all";
@@ -273,6 +324,7 @@ mod tests {
 
     #[test]
     fn a_vanished_venue_is_retired_while_its_siblings_survive() {
+        let _g = serial();
         let bot = "test-retire-one";
         set_venue_ages(
             bot,
@@ -290,7 +342,42 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_that_stops_running_is_retired() {
+        let _g = serial();
+        // The gap #37 left open: probe() only runs for RUNNING bots, so a
+        // stopped/crashed/removed bot was never retired and its series froze
+        // at their last ages — pinning BotVenueStale on the money channel with
+        // no `up` series left for any rule to key off.
+        let gone = "test-absent-gone";
+        let stays = "test-absent-stays";
+        set_venue_ages(gone, &[("Kraken".into(), "live".into(), 1200.0)]);
+        set_venue_ages(stays, &[("KuCoin".into(), "live".into(), 10.0)]);
+        assert_eq!(series_for(gone), 1);
+        assert_eq!(series_for(stays), 1);
+
+        // Next tick: only `stays` is still running.
+        retire_absent_bots(&[stays.to_string()]);
+        assert_eq!(
+            series_for(gone),
+            0,
+            "a bot that stopped must export nothing"
+        );
+        assert_eq!(series_for(stays), 1, "a running bot must be untouched");
+    }
+
+    #[test]
+    fn retiring_absent_bots_with_everything_running_changes_nothing() {
+        let _g = serial();
+        let a = "test-absent-keep-a";
+        set_venue_ages(a, &[("Kraken".into(), "live".into(), 5.0)]);
+        assert_eq!(series_for(a), 1);
+        retire_absent_bots(&[a.to_string()]);
+        assert_eq!(series_for(a), 1);
+    }
+
+    #[test]
     fn retiring_an_unknown_bot_is_a_no_op() {
+        let _g = serial();
         retire_venue_ages("test-never-seen");
         assert_eq!(series_for("test-never-seen"), 0);
     }

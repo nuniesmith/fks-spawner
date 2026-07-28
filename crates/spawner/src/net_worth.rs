@@ -584,6 +584,20 @@ mod sampler {
             };
 
             let targets = running_status_targets(&bots, config.bot_metrics_port);
+
+            // Retire the venue gauge for bots that are no longer running.
+            // probe() — the only other path that touches the gauge — is called
+            // for RUNNING bots only, so without this a stopped/crashed/removed
+            // bot keeps exporting its last ages forever. A bot stopped while a
+            // venue sat above the threshold would pin BotVenueStale on the
+            // money channel permanently.
+            //
+            // Deliberately placed AFTER a SUCCESSFUL list_bots: on a Docker API
+            // error we return above without touching the gauge, because
+            // retiring every bot on a transient failure would flap the series
+            // (and BotVenueFreshnessMissing) once a minute.
+            let running_ids: Vec<String> = targets.iter().map(|(id, _)| id.clone()).collect();
+            metrics::retire_absent_bots(&running_ids);
             debug!(
                 count = targets.len(),
                 "net-worth sampler: polling running bots"
