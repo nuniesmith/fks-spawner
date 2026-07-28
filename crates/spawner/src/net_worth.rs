@@ -354,7 +354,7 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     // Conflating the two took the funding bot's treasury series offline for
     // 15 hours on 2026-07-27: 176 consecutive skips against a stamp that was
     // 15.5h old BY DESIGN. Idle is not blind.
-    let updated = live_venue_stamps(&v).into_iter().min().or_else(|| {
+    let updated = real_money_venue_stamps(&v).into_iter().min().or_else(|| {
         UPDATED_KEYS
             .iter()
             .find_map(|k| v.get(*k).and_then(value_as_f64))
@@ -369,17 +369,24 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     })
 }
 
-/// `updated` stamps for venues trading REAL money.
+/// `updated` stamps for venues holding REAL money.
 ///
 /// The spot bot serves `exchanges: [{exchange, mode, total_value, updated}]`
 /// (crypto-bot-core `VenueStatus`); older/other shapes use `venues`. Paper
-/// venues are excluded deliberately — see `parse_status_net_worth`. An empty
-/// result means "nothing here can be checked", which reads as fresh rather
-/// than blanking the series.
-fn live_venue_stamps(v: &serde_json::Value) -> Vec<u64> {
+/// Excludes ONLY `paper`. The test is "is this real money", NOT "may this
+/// venue place orders" — a spot venue reports `dry-run` when it is outside the
+/// live_venues allowlist OR when the drawdown breaker has halted it
+/// (`vlive = venue.live && !halted`, spot-portfolio portfolio.rs:342), and in
+/// both cases it still holds and reports REAL balances ("real balances, logs
+/// would-be orders"). Keying on `live` disengaged this guard precisely when a
+/// venue got halted — the moment its figures matter most.
+///
+/// An empty result means "nothing here can be checked", which reads as fresh
+/// rather than blanking the series.
+fn real_money_venue_stamps(v: &serde_json::Value) -> Vec<u64> {
     venue_entries(v)
         .into_iter()
-        .filter(|e| e.mode.eq_ignore_ascii_case("live"))
+        .filter(|e| !e.mode.eq_ignore_ascii_case("paper"))
         .filter_map(|e| e.updated)
         .collect()
 }
@@ -746,6 +753,64 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── dry-run is REAL MONEY (2026-07-28 review finding) ───────────────────
+    /// A spot venue publishes mode="dry-run" when it is outside the live_venues
+    /// allowlist OR when the drawdown breaker has halted it
+    /// (`vlive = venue.live && !halted`). It still holds real balances. Gating
+    /// on mode=="live" disengaged the guard exactly when a venue was halted.
+    #[test]
+    fn a_dry_run_venue_still_gates_staleness() {
+        let body = r#"{"net_worth_usd": 165.0, "exchanges": [
+            {"exchange": "Kraken", "mode": "dry-run", "updated": 1785123600}
+        ]}"#;
+        let r = parse_status_net_worth(body).expect("parses");
+        assert_eq!(
+            r.updated,
+            Some(1_785_123_600),
+            "a halted/non-allowlisted venue holds REAL balances and must still be checked"
+        );
+        assert!(reading_is_stale(r.updated, 1_785_123_600 + 3600, 600));
+    }
+
+    #[test]
+    fn a_halted_bot_does_not_lose_its_staleness_protection() {
+        // The drawdown breaker flips EVERY venue to dry-run at once. Before the
+        // fix this emptied the stamp set and made the reading unverifiable.
+        let now = 1_785_127_280u64;
+        let frozen = now - 65 * 60;
+        let body = format!(
+            r#"{{"net_worth_usd": 206.26301554, "exchanges": [
+                {{"exchange": "Crypto.com", "mode": "dry-run", "updated": {frozen}}},
+                {{"exchange": "Kraken",     "mode": "dry-run", "updated": {frozen}}},
+                {{"exchange": "KuCoin",     "mode": "dry-run", "updated": {frozen}}}
+            ]}}"#
+        );
+        let r = parse_status_net_worth(&body).expect("parses");
+        assert!(
+            reading_is_stale(r.updated, now, 600),
+            "a halted bot serving frozen figures must still be refused"
+        );
+    }
+
+    #[test]
+    fn paper_is_still_the_only_exemption() {
+        // The #35 regression fix must survive: paper alone is exempt.
+        let body = r#"{"net_worth_usd": 11190.0, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper", "updated": 1785000000}
+        ]}"#;
+        assert_eq!(parse_status_net_worth(body).unwrap().updated, None);
+        // And a mixed bot takes the stalest REAL-money venue.
+        let mixed = r#"{"net_worth_usd": 100.0, "exchanges": [
+            {"exchange": "sim",    "mode": "paper",   "updated": 1785000000},
+            {"exchange": "Kraken", "mode": "dry-run", "updated": 1785086000},
+            {"exchange": "KuCoin", "mode": "live",    "updated": 1785086500}
+        ]}"#;
+        assert_eq!(
+            parse_status_net_worth(mixed).unwrap().updated,
+            Some(1_785_086_000)
+        );
+    }
 
     // ── idle is not blind (2026-07-27 regression) ───────────────────────────
     /// The funding bot: a PAPER venue whose account snapshot is legitimately
