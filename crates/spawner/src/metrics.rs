@@ -151,6 +151,21 @@ pub static SPAWN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Drop every venue series for a bot.
+///
+/// Called when `/status` cannot be reached, answers non-2xx, or is unreadable.
+/// A GaugeVec child persists once created, so without this a bot that stops
+/// answering keeps exporting its LAST age forever — frozen at a small,
+/// healthy-looking number. Both freshness alerts then evaluate against a lie
+/// and stay green through exactly the outage they exist to catch (the gauge
+/// reproducing, one level up, the frozen-reading bug it was built to expose).
+///
+/// Removing the series is the honest state: absent, not "fine". `up == 0` and
+/// BotStopped still cover the bot being down.
+pub fn retire_venue_ages(bot_id: &str) {
+    set_venue_ages(bot_id, &[]);
+}
+
 /// One venue's exported age: `(exchange, mode, age_seconds)`.
 pub type VenueAge = (String, String, f64);
 
@@ -215,4 +230,68 @@ pub fn render() -> String {
     let mut buf = Vec::new();
     encoder.encode(&families, &mut buf).unwrap_or_default();
     String::from_utf8(buf).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Count exported children of the venue gauge for one bot_id.
+    fn series_for(bot_id: &str) -> usize {
+        prometheus::gather()
+            .iter()
+            .filter(|mf| mf.name() == "fks_bot_venue_status_age_seconds")
+            .flat_map(|mf| mf.get_metric())
+            .filter(|m| {
+                m.get_label()
+                    .iter()
+                    .any(|l| l.name() == "bot_id" && l.value() == bot_id)
+            })
+            .count()
+    }
+
+    #[test]
+    fn retiring_a_bot_removes_every_venue_series() {
+        // Unique id: the prometheus registry is process-global and tests run
+        // in parallel.
+        let bot = "test-retire-all";
+        set_venue_ages(
+            bot,
+            &[
+                ("Kraken".into(), "live".into(), 10.0),
+                ("KuCoin".into(), "live".into(), 12.0),
+                ("Crypto.com".into(), "dry-run".into(), 11.0),
+            ],
+        );
+        assert_eq!(series_for(bot), 3, "three venues should be exported");
+
+        // /status went unreachable. A frozen series reads as FRESH and would
+        // silently un-fire the alerts it feeds; absent is the honest state.
+        retire_venue_ages(bot);
+        assert_eq!(series_for(bot), 0, "an unreachable bot must export nothing");
+    }
+
+    #[test]
+    fn a_vanished_venue_is_retired_while_its_siblings_survive() {
+        let bot = "test-retire-one";
+        set_venue_ages(
+            bot,
+            &[
+                ("Kraken".into(), "live".into(), 10.0),
+                ("KuCoin".into(), "live".into(), 12.0),
+            ],
+        );
+        assert_eq!(series_for(bot), 2);
+
+        // Bot reconfigured: Kraken removed. Its series must not linger and
+        // climb forever, which would pin BotVenueStale permanently.
+        set_venue_ages(bot, &[("KuCoin".into(), "live".into(), 13.0)]);
+        assert_eq!(series_for(bot), 1, "only the surviving venue stays");
+    }
+
+    #[test]
+    fn retiring_an_unknown_bot_is_a_no_op() {
+        retire_venue_ages("test-never-seen");
+        assert_eq!(series_for("test-never-seen"), 0);
+    }
 }
