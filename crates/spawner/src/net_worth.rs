@@ -614,6 +614,7 @@ mod sampler {
                 Ok(r) => r,
                 Err(e) => {
                     debug!(bot_id = %bot_id, error = %reqwest::Error::without_url(e), "net-worth sampler: /status unreachable");
+                    metrics::retire_venue_ages(bot_id);
                     return None;
                 }
             };
@@ -623,12 +624,14 @@ mod sampler {
                     status = %resp.status(),
                     "net-worth sampler: /status non-2xx"
                 );
+                metrics::retire_venue_ages(bot_id);
                 return None;
             }
             let body = match resp.text().await {
                 Ok(b) => b,
                 Err(e) => {
                     debug!(bot_id = %bot_id, error = %e, "net-worth sampler: /status body unreadable");
+                    metrics::retire_venue_ages(bot_id);
                     return None;
                 }
             };
@@ -643,9 +646,12 @@ mod sampler {
                         .map(|u| (v.exchange, v.mode, now.saturating_sub(u) as f64))
                 })
                 .collect();
-            if !ages.is_empty() {
-                metrics::set_venue_ages(bot_id, &ages);
-            }
+            // ALWAYS publish, even when empty. The retirement pass lives inside
+            // set_venue_ages, so skipping the call on an empty set was exactly
+            // what let a vanished venue keep exporting its last age forever —
+            // a frozen gauge reads as FRESH and silently un-fires the very
+            // alerts it feeds. A gauge that lies is worse than no gauge.
+            metrics::set_venue_ages(bot_id, &ages);
 
             match parse_status_net_worth(&body) {
                 some @ Some(_) => some,
