@@ -369,6 +369,38 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     })
 }
 
+/// Does a REAL-MONEY bot report a PAPER venue?
+///
+/// spot-portfolio silently degrades a venue to paper when its build-time key
+/// check fails — bad key after a rotation, or the venue's auth endpoint
+/// erroring during the respawn (portfolio.rs:157-183, `Some(new_paper(&targets,
+/// cfg.paper_usd))` on both the missing-keys and balances-error paths). That
+/// paper venue is seeded with `paper_usd` FAKE cash, and
+/// `StatusState::net_worth()` sums every venue's total_value indiscriminately
+/// — so the published net worth silently contains money that does not exist.
+///
+/// Every other guard here waves it through BY DESIGN: paper venues are exempt
+/// from the staleness stamp (#35/#36), count toward completeness (#38), and
+/// are excluded from the freshness alerts (fks #238). Paper was treated as
+/// harmless because a paper BOT is harmless. A paper VENUE on a live bot is
+/// the opposite: it is the signature of a credential failure, and its balance
+/// is fiction.
+///
+/// `bot.mode != "paper" && any(venue.mode == "paper")` is exactly that
+/// signature. A wholly paper bot (crypto-funding) is unaffected.
+pub fn has_fake_paper_venue(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let bot_mode = first_string(&v, &["mode"]).unwrap_or_default();
+    if bot_mode.eq_ignore_ascii_case("paper") {
+        return false; // a paper bot's paper venues are legitimate
+    }
+    venue_entries(&v)
+        .into_iter()
+        .any(|e| e.mode.eq_ignore_ascii_case("paper"))
+}
+
 /// Is the served venue set COMPLETE?
 ///
 /// A bot's venue map only gains an entry after that venue's first SUCCESSFUL
@@ -491,8 +523,8 @@ mod sampler {
 
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
-        milestone_baseline, now_epoch_secs, parse_status_net_worth, parse_venue_freshness,
-        reading_is_stale, running_status_targets, venue_set_is_complete,
+        has_fake_paper_venue, milestone_baseline, now_epoch_secs, parse_status_net_worth,
+        parse_venue_freshness, reading_is_stale, running_status_targets, venue_set_is_complete,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -679,6 +711,21 @@ mod sampler {
             // alerts it feeds. A gauge that lies is worse than no gauge.
             metrics::set_venue_ages(bot_id, &ages);
 
+            // A real-money bot reporting a PAPER venue is a credential failure
+            // wearing a healthy face: that venue holds fabricated cash which is
+            // summed into net_worth_usd. Refuse before anything else looks at
+            // the number — it is not merely stale or partial, it is FICTION.
+            if has_fake_paper_venue(&body) {
+                warn!(
+                    bot_id = %bot_id,
+                    "net-worth sampler: a REAL-MONEY bot is reporting a PAPER venue \
+                     — its keys failed validation and it is running on fabricated \
+                     cash. Refusing the sample; fix the venue's credentials."
+                );
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                return None;
+            }
+
             // A PARTIAL venue set means net_worth_usd is a partial sum. Refuse
             // it: a wrong total recorded as fresh is the same class of harm as
             // a frozen one, and harder to spot because the number still moves.
@@ -800,6 +847,56 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fabricated paper cash on a live bot (2026-07-28, instance #5) ───────
+    /// The botched-key-rotation shape: bot mode "live", but Kraken silently
+    /// degraded to paper with $1000 of cash that does not exist, and
+    /// net_worth() summed it in.
+    #[test]
+    fn a_paper_venue_on_a_live_bot_is_refused() {
+        let body = r#"{"bot": "spot-portfolio", "mode": "live",
+            "net_worth_usd": 1160.54, "expected_venues": 3, "exchanges": [
+            {"exchange": "Crypto.com",  "mode": "live",  "updated": 1785127277},
+            {"exchange": "Kraken",      "mode": "paper", "updated": 1785127274},
+            {"exchange": "KuCoin-spot", "mode": "live",  "updated": 1785127275}
+        ]}"#;
+        assert!(
+            has_fake_paper_venue(body),
+            "fabricated cash must be detected"
+        );
+        // And prove every OTHER guard waves it through — which is why this
+        // check has to exist separately.
+        assert_eq!(venue_set_is_complete(body), Some(true), "looks complete");
+        let r = parse_status_net_worth(body).expect("parses");
+        assert!(
+            !reading_is_stale(r.updated, 1_785_127_280, 600),
+            "looks fresh"
+        );
+    }
+
+    #[test]
+    fn a_wholly_paper_bot_is_not_flagged() {
+        // crypto-funding: paper bot, paper venue, entirely legitimate. This is
+        // the #35 regression guard — do NOT re-break the funding series.
+        let body = r#"{"bot": "crypto-funding", "mode": "paper",
+            "net_worth_usd": 11190.0, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper", "updated": 1785000000}
+        ]}"#;
+        assert!(!has_fake_paper_venue(body));
+    }
+
+    #[test]
+    fn an_all_real_live_bot_is_not_flagged() {
+        assert!(!has_fake_paper_venue(LIVE_SPOT_STATUS));
+        // dry-run is real money, not fake cash — must not trip this.
+        let dry = r#"{"mode": "live", "net_worth_usd": 100.0, "exchanges": [
+            {"exchange": "Kraken", "mode": "dry-run", "updated": 1785127274}
+        ]}"#;
+        assert!(!has_fake_paper_venue(dry));
+        // Garbage and missing fields are not "fake".
+        assert!(!has_fake_paper_venue("not json"));
+        assert!(!has_fake_paper_venue(r#"{"net_worth_usd": 1.0}"#));
+    }
 
     // ── an incomplete venue set is a WRONG total (2026-07-28 review) ────────
     #[test]
