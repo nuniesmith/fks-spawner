@@ -377,6 +377,14 @@ impl StatusState {
             "market": self.market,
             "mode": self.mode.read().map(|m| m.clone()).unwrap_or_default(),
             "uptime_secs": self.started.elapsed().as_secs(),
+            // How many venues this bot is CONFIGURED with, so a consumer can
+            // tell "all venues reported" from "some venue never checked in".
+            // The venues map only gains an entry after a venue's first
+            // SUCCESSFUL cycle, so a venue that is down at startup is simply
+            // absent from `exchanges[]` — and net_worth_usd is then a partial
+            // sum that looks entirely healthy. Publishing the expected count
+            // is what makes that difference detectable from outside.
+            "expected_venues": self.expected_venues,
             "net_worth_usd": self.net_worth(),
             "pnl_usd": self.pnl_dollars(),
             "signals_total": self.signals.load(Ordering::Relaxed),

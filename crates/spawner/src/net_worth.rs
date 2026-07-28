@@ -369,6 +369,32 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     })
 }
 
+/// Is the served venue set COMPLETE?
+///
+/// A bot's venue map only gains an entry after that venue's first SUCCESSFUL
+/// cycle (spot-portfolio `update_venue` runs at the END of a cycle, and the
+/// cycle short-circuits when a price/balance fetch fails). So a venue that is
+/// down when the process starts — an exchange outage during the respawn that
+/// follows a key rotation, say — is simply ABSENT from `exchanges[]`, and
+/// `net_worth_usd` is a partial sum of only the venues that did report.
+///
+/// Every other guard here is blind to that: the venues that ARE present carry
+/// fresh stamps, so the reading looks perfectly healthy while silently
+/// omitting an entire exchange's balance. This is the 2026-07-22 failure with
+/// a different mechanism — a number that is WRONG rather than OLD, and harder
+/// to spot because it still moves.
+///
+/// `None` when the bot publishes no `expected_venues` (older builds): unknown,
+/// so recorded as before rather than blanked.
+pub fn venue_set_is_complete(body: &str) -> Option<bool> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let expected = v.get("expected_venues").and_then(value_as_f64)? as usize;
+    if expected == 0 {
+        return None;
+    }
+    Some(venue_entries(&v).len() >= expected)
+}
+
 /// `updated` stamps for venues holding REAL money.
 ///
 /// The spot bot serves `exchanges: [{exchange, mode, total_value, updated}]`
@@ -466,7 +492,7 @@ mod sampler {
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
         milestone_baseline, now_epoch_secs, parse_status_net_worth, parse_venue_freshness,
-        reading_is_stale, running_status_targets,
+        reading_is_stale, running_status_targets, venue_set_is_complete,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -647,6 +673,21 @@ mod sampler {
                 metrics::set_venue_ages(bot_id, &ages);
             }
 
+            // A PARTIAL venue set means net_worth_usd is a partial sum. Refuse
+            // it: a wrong total recorded as fresh is the same class of harm as
+            // a frozen one, and harder to spot because the number still moves.
+            if venue_set_is_complete(&body) == Some(false) {
+                let seen = parse_venue_freshness(&body).len();
+                warn!(
+                    bot_id = %bot_id,
+                    venues_reporting = seen,
+                    "net-worth sampler: INCOMPLETE venue set — a venue has not \
+                     checked in, so net worth would be a partial sum. Skipping."
+                );
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                return None;
+            }
+
             match parse_status_net_worth(&body) {
                 some @ Some(_) => some,
                 None => {
@@ -753,6 +794,51 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── an incomplete venue set is a WRONG total (2026-07-28 review) ────────
+    #[test]
+    fn a_missing_venue_makes_the_total_incomplete() {
+        // Kraken was down when the bot started, so it never entered the venue
+        // map. The two venues that DID report are perfectly fresh — every
+        // staleness check passes — but net_worth_usd omits Kraken's balance.
+        let body = r#"{"net_worth_usd": 129.29, "expected_venues": 3, "exchanges": [
+            {"exchange": "Crypto.com",  "mode": "live", "updated": 1785127277},
+            {"exchange": "KuCoin-spot", "mode": "live", "updated": 1785127275}
+        ]}"#;
+        assert_eq!(venue_set_is_complete(body), Some(false));
+        // Proof the other guards are blind to it:
+        let r = parse_status_net_worth(body).expect("parses");
+        assert!(
+            !reading_is_stale(r.updated, 1_785_127_280, 600),
+            "the present venues are fresh — staleness cannot catch this"
+        );
+    }
+
+    #[test]
+    fn a_full_venue_set_is_complete() {
+        let body = r#"{"net_worth_usd": 165.12, "expected_venues": 3, "exchanges": [
+            {"exchange": "Crypto.com",  "mode": "live",    "updated": 1785127277},
+            {"exchange": "Kraken",      "mode": "dry-run", "updated": 1785127274},
+            {"exchange": "KuCoin-spot", "mode": "live",    "updated": 1785127275}
+        ]}"#;
+        assert_eq!(venue_set_is_complete(body), Some(true));
+    }
+
+    #[test]
+    fn an_older_bot_without_expected_venues_is_unknown_not_incomplete() {
+        // Must NOT blank the series for bots that predate the field.
+        let body = r#"{"net_worth_usd": 165.0, "exchanges": [
+            {"exchange": "Kraken", "mode": "live", "updated": 1785127274}
+        ]}"#;
+        assert_eq!(venue_set_is_complete(body), None);
+        assert_eq!(venue_set_is_complete(r#"{"net_worth_usd": 1.0}"#), None);
+        assert_eq!(venue_set_is_complete("not json"), None);
+        // expected_venues:0 is meaningless, not "everything is missing".
+        assert_eq!(
+            venue_set_is_complete(r#"{"expected_venues": 0, "exchanges": []}"#),
+            None
+        );
+    }
 
     // ── dry-run is REAL MONEY (2026-07-28 review finding) ───────────────────
     /// A spot venue publishes mode="dry-run" when it is outside the live_venues
