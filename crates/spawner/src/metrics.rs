@@ -240,12 +240,12 @@ mod tests {
     fn series_for(bot_id: &str) -> usize {
         prometheus::gather()
             .iter()
-            .filter(|mf| mf.get_name() == "fks_bot_venue_status_age_seconds")
+            .filter(|mf| mf.name() == "fks_bot_venue_status_age_seconds")
             .flat_map(|mf| mf.get_metric())
             .filter(|m| {
                 m.get_label()
                     .iter()
-                    .any(|l| l.get_name() == "bot_id" && l.get_value() == bot_id)
+                    .any(|l| l.name() == "bot_id" && l.value() == bot_id)
             })
             .count()
     }
