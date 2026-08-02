@@ -692,7 +692,9 @@ mod sampler {
                          recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
                          which wrote 15 identical rows into the treasury series)"
                     );
-                    metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                    metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                        .with_label_values(&[metrics::refusal::STALE])
+                        .inc();
                     continue;
                 }
                 let snap = NetWorthSnapshot::from_reading(&bot_id, reading);
@@ -801,7 +803,9 @@ mod sampler {
                      — its keys failed validation and it is running on fabricated \
                      cash. Refusing the sample; fix the venue's credentials."
                 );
-                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                    .with_label_values(&[metrics::refusal::FAKE_PAPER])
+                    .inc();
                 return None;
             }
 
@@ -816,7 +820,9 @@ mod sampler {
                     "net-worth sampler: INCOMPLETE venue set — a venue has not \
                      checked in, so net worth would be a partial sum. Skipping."
                 );
-                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                    .with_label_values(&[metrics::refusal::INCOMPLETE])
+                    .inc();
                 return None;
             }
 
@@ -838,7 +844,9 @@ mod sampler {
                      notional_usdt on its ENTRY record and declare its venue basis \
                      via set_venue_total_marks_positions()."
                 );
-                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                    .with_label_values(&[metrics::refusal::UNACCOUNTED])
+                    .inc();
                 return None;
             }
 
