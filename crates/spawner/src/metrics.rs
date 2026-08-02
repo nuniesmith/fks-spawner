@@ -8,8 +8,8 @@
 
 use once_cell::sync::Lazy;
 use prometheus::{
-    Counter, Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder, register_counter, register_gauge,
-    register_gauge_vec, register_histogram_vec,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, HistogramVec, TextEncoder, register_counter,
+    register_counter_vec, register_gauge, register_gauge_vec, register_histogram_vec,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -130,13 +130,40 @@ pub static VENUE_STATUS_AGE: Lazy<GaugeVec> = Lazy::new(|| {
 /// Net-worth samples SKIPPED because the bot's own stamp said the figure was
 /// stale. Non-zero means the treasury series has an honest gap; it is the
 /// counterpart to the silent fabrication this replaced.
-pub static NET_WORTH_STALE_SKIPPED_TOTAL: Lazy<Counter> = Lazy::new(|| {
-    register_counter!(
+/// Net-worth samples the sampler REFUSED, labelled by why.
+///
+/// Four distinct refusals share this metric and they are NOT the same event:
+///   stale        the bot-stamped figure is older than we tolerate
+///   incomplete   a venue is missing, so the total is a partial sum
+///   fake_paper   a real-money bot is reporting a paper venue (a key check failed)
+///   unaccounted  the bot holds an open position it will not vouch for
+///
+/// The label is not decoration. `NetWorthSamplingPausedTooLong` pages on this
+/// counter, and until now its annotation asserted staleness as the cause and
+/// its runbook sent the operator to BotAllVenuesStale / BotVenueStale. Three of
+/// the four refusals have nothing to do with venue staleness, so the page
+/// asserted a cause that was false and pointed at alerts that could not fire —
+/// the same "authoritative claim built on the wrong thing" this whole guard
+/// chain exists to prevent, reproduced in the alert about the guard chain.
+///
+/// Query the old total with `sum(fks_spawner_net_worth_stale_skipped_total)`;
+/// query the actionable one with `by (reason)`.
+pub static NET_WORTH_STALE_SKIPPED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
         "fks_spawner_net_worth_stale_skipped_total",
-        "Net-worth samples refused because the bot-stamped figure was too old"
+        "Net-worth samples refused, by reason (stale|incomplete|fake_paper|unaccounted)",
+        &["reason"]
     )
     .expect("metric registration failed")
 });
+
+/// The refusal reasons, so a call site cannot invent a label string.
+pub mod refusal {
+    pub const STALE: &str = "stale";
+    pub const INCOMPLETE: &str = "incomplete";
+    pub const FAKE_PAPER: &str = "fake_paper";
+    pub const UNACCOUNTED: &str = "unaccounted";
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Histograms
@@ -373,6 +400,42 @@ mod tests {
         assert_eq!(series_for(a), 1);
         retire_absent_bots(&[a.to_string()]);
         assert_eq!(series_for(a), 1);
+    }
+
+    #[test]
+    fn every_refusal_reason_is_its_own_series() {
+        let _g = serial();
+        // NOTE ON WHAT THIS TESTS, because the first version of it was VACUOUS.
+        //
+        // Incrementing the four labels here and then asserting four series exist
+        // proves only that a CounterVec has labels. It passes just as happily
+        // when every call site in net_worth.rs writes `STALE` — which is exactly
+        // the bug. Verified: collapsing all four call sites to STALE left that
+        // version green.
+        //
+        // So this asserts the CALL SITES. The page reading this counter names a
+        // CAUSE; four different refusals sharing one label made that name wrong
+        // three times out of four, and sent the operator to a runbook pointing
+        // at alerts that cannot fire.
+        const SRC: &str = include_str!("net_worth.rs");
+
+        for r in ["STALE", "INCOMPLETE", "FAKE_PAPER", "UNACCOUNTED"] {
+            assert!(
+                SRC.contains(&format!("refusal::{r}")),
+                "net_worth.rs must label a refusal with refusal::{r} — otherwise the \
+                 NetWorthSamplingPausedTooLong page asserts a cause it cannot know"
+            );
+        }
+
+        // And every increment must carry SOME label: a bare .inc() would compile
+        // away the distinction again.
+        let bare = SRC.matches("NET_WORTH_STALE_SKIPPED_TOTAL.inc()").count();
+        assert_eq!(bare, 0, "found {bare} unlabelled refusal increments");
+
+        // The metric itself still works as a labelled vector.
+        NET_WORTH_STALE_SKIPPED_TOTAL
+            .with_label_values(&[refusal::STALE])
+            .inc();
     }
 
     #[test]

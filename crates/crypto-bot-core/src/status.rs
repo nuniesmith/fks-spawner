@@ -105,6 +105,54 @@ pub struct PositionStatus {
     /// Direction-signed open return, in percent.
     pub ret_pct: f64,
     pub updated: u64,
+    /// USD notional the position was opened at, when the brain supplies one
+    /// (the funding brain's `book.notional_usdt()`, also stamped into its
+    /// ledger records as `notional_usdt`).
+    ///
+    /// `ret_pct` alone is a RATIO — it cannot be added to a dollar balance.
+    /// Without a notional the position's dollar value is unknowable from this
+    /// document, so [`StatusState::net_worth`] reports the total as INCOMPLETE
+    /// rather than quietly publishing pre-trade cash as net worth.
+    pub notional_usd: Option<f64>,
+}
+
+/// A bot's net worth, DECOMPOSED so no consumer has to guess what the headline
+/// figure means — and so two bots that mean different things can never be
+/// silently summed.
+///
+/// Before this existed, `/status.net_worth_usd` was `Σ exchanges[].total_value`
+/// for every bot. For the SPOT bot that is a genuine mark-to-market portfolio
+/// value (`cash + Σ holdings[].value`). For the FUTURES/funding bot the venue
+/// snapshot books REALIZED equity — it moves only when a round trip closes —
+/// and the open trade lives in a separate `positions[]` array that the total
+/// never touched. Two different quantities under one field name, summed
+/// together by the spawner's treasury roll-up.
+///
+/// Observed 2026-08-02 on the live paper funding bot: `net_worth_usd`
+/// 11288.31 with an open AVAXUSDTM long at +6.89% on 3000 USDT notional —
+/// about +207 USDT (1.8%) of the book absent from the "net worth". The sign
+/// is the point: an ADVERSE open position makes the treasury show NO DRAWDOWN
+/// AT ALL until the position closes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetWorth {
+    /// The headline figure published as `net_worth_usd`. Equal to
+    /// `venue_total_usd` unless open positions had to be folded in.
+    pub total_usd: f64,
+    /// `Σ exchanges[].total_value` — the venue-reported component.
+    pub venue_total_usd: f64,
+    /// Mark-to-market of the open positions. `None` when at least one open
+    /// position carries no notional, i.e. the book CANNOT be valued.
+    ///
+    /// NB: this is a decomposition, not an addend. When `venue_total_usd`
+    /// already marks positions to market (a live exchange's account equity
+    /// does), this value is already inside it — which is exactly why
+    /// [`StatusState::set_venue_total_marks_positions`] exists.
+    pub unrealized_pnl_usd: Option<f64>,
+    /// How many positions are open.
+    pub open_positions: usize,
+    /// Does `total_usd` account for every open position? `false` means the
+    /// figure is NOT this bot's net worth and must not be recorded as one.
+    pub complete: bool,
 }
 
 /// Process-wide bot status: counters + latest snapshots, shared by the HTTP
@@ -131,6 +179,12 @@ pub struct StatusState {
     expected_venues: usize,
     venues: RwLock<BTreeMap<String, VenueStatus>>,
     positions: RwLock<BTreeMap<String, PositionStatus>>,
+    /// Does the venue-reported total ALREADY mark open positions to market?
+    /// Only the bot knows: a live futures venue reports exchange account
+    /// equity (which includes unrealised PnL), while a paper ledger books
+    /// realized cash. `None` = undeclared, and an undeclared basis with an
+    /// open position is not a net worth — see [`StatusState::net_worth`].
+    venue_total_marks_positions: RwLock<Option<bool>>,
     events: RwLock<Vec<Value>>,
 }
 
@@ -156,6 +210,7 @@ pub fn init(bot: &str, market: &'static str, expected_venues: usize) -> Arc<Stat
                 expected_venues,
                 venues: RwLock::new(BTreeMap::new()),
                 positions: RwLock::new(BTreeMap::new()),
+                venue_total_marks_positions: RwLock::new(None),
                 events: RwLock::new(Vec::new()),
             })
         })
@@ -272,21 +327,107 @@ impl StatusState {
         }
     }
 
-    /// Sum of the venue totals (the "all exchanges" number).
-    pub fn net_worth(&self) -> f64 {
+    /// Declare whether the venue-reported total ALREADY marks open positions
+    /// to market.
+    ///
+    /// - `true`  — the venue figure is an exchange account equity (or any
+    ///   mark-to-market total). Open positions are already inside it; folding
+    ///   the unrealised PnL in again would DOUBLE-COUNT it.
+    /// - `false` — the venue figure is realized cash (a paper ledger's booked
+    ///   equity). Open positions must be folded in to get a net worth.
+    ///
+    /// Undeclared is neither: a bot that has not called this and is holding an
+    /// open position reports `complete: false`, because nothing in this
+    /// process can tell the two bases apart from outside.
+    pub fn set_venue_total_marks_positions(&self, marks: bool) {
+        if let Ok(mut m) = self.venue_total_marks_positions.write() {
+            *m = Some(marks);
+        }
+    }
+
+    /// Sum of the venue totals (the "all exchanges" number). For a spot bot
+    /// this is `cash + Σ holdings`; for a futures bot booking a realized
+    /// ledger it is CASH ONLY — see [`StatusState::net_worth`].
+    pub fn venue_total_usd(&self) -> f64 {
         self.venues
             .read()
             .map(|m| m.values().map(|v| v.total_value).sum())
             .unwrap_or(0.0)
     }
 
+    /// The bot's net worth, decomposed. See [`NetWorth`] for why a single
+    /// `f64` here was a number that meant two different things.
+    ///
+    /// The truth table, by design conservative — every branch either publishes
+    /// a figure that accounts for the whole book, or says it does not:
+    ///
+    /// | open positions | venue basis   | positions valued | result                  |
+    /// |----------------|---------------|------------------|-------------------------|
+    /// | none           | any           | n/a              | venue total, COMPLETE   |
+    /// | some           | marks (`true`)| n/a              | venue total, COMPLETE   |
+    /// | some           | cash (`false`)| yes              | venue + unrealised, ✔   |
+    /// | some           | cash (`false`)| no               | venue total, INCOMPLETE |
+    /// | some           | undeclared    | any              | venue total, INCOMPLETE |
+    pub fn net_worth(&self) -> NetWorth {
+        let venue_total_usd = self.venue_total_usd();
+
+        // ONE read of the position map, so the count and the valuation can
+        // never disagree. `None` = the book is unreadable (a poisoned lock),
+        // which is emphatically not the same as "flat".
+        let book: Option<(usize, Option<f64>)> = self.positions.read().ok().map(|map| {
+            let valued = map.values().try_fold(0.0f64, |acc, p| {
+                let notional = p.notional_usd?;
+                (notional.is_finite() && p.ret_pct.is_finite())
+                    .then(|| acc + notional * p.ret_pct / 100.0)
+            });
+            (map.len(), valued.filter(|v| v.is_finite()))
+        });
+        let (open_positions, unrealized_pnl_usd) = book.unwrap_or((0, None));
+        let marks = self
+            .venue_total_marks_positions
+            .read()
+            .ok()
+            .and_then(|m| *m);
+
+        let (total_usd, complete) = match (book.is_some(), open_positions, marks) {
+            // Book unreadable — nothing may be claimed about it.
+            (false, _, _) => (venue_total_usd, false),
+            // Flat: the venue total IS the net worth, exactly as before.
+            (true, 0, _) => (venue_total_usd, true),
+            // The venue figure already marks the position to market.
+            (true, _, Some(true)) => (venue_total_usd, true),
+            // Realized-cash venue figure + a fully valued book: fold it in, so
+            // an adverse open position shows up as a DRAWDOWN immediately
+            // instead of hiding until the trade closes.
+            (true, _, Some(false)) => match unrealized_pnl_usd {
+                Some(u) => (venue_total_usd + u, true),
+                None => (venue_total_usd, false),
+            },
+            // Undeclared basis with an open position: unknowable. Say so.
+            (true, _, None) => (venue_total_usd, false),
+        };
+
+        NetWorth {
+            total_usd,
+            venue_total_usd,
+            unrealized_pnl_usd,
+            open_positions,
+            complete,
+        }
+    }
+
     /// Realized round-trip PnL + net-worth change since the baseline snapshot.
+    ///
+    /// Uses the same figure `/status` publishes as `net_worth_usd`, so the two
+    /// numbers in one document can never disagree about whether an open
+    /// position counts. Identical to the previous behaviour whenever the total
+    /// is the bare venue sum (flat book, or a book that cannot be valued).
     pub fn pnl_dollars(&self) -> f64 {
         let baseline = self.baseline.get();
         let drift = if baseline.is_nan() {
             0.0
         } else {
-            self.net_worth() - baseline
+            self.net_worth().total_usd - baseline
         };
         self.realized_pnl.get() + drift
     }
@@ -333,7 +474,23 @@ impl StatusState {
 
         // Balances / net worth (values in each venue's cash currency, treated
         // as USD-equivalent).
-        gauge("fks_bot_net_worth_usd", "", self.net_worth());
+        let nw = self.net_worth();
+        gauge("fks_bot_net_worth_usd", "", nw.total_usd);
+        // Whether the gauge above accounts for every open position. A scraper
+        // that sums net worth across bots needs this to know the figures are
+        // the same quantity; 0 means `fks_bot_net_worth_usd` is NOT a net
+        // worth, it is the venue-reported component of one.
+        gauge(
+            "fks_bot_net_worth_complete",
+            "",
+            if nw.complete { 1.0 } else { 0.0 },
+        );
+        // Emitted ONLY when the book can actually be valued. A gauge that
+        // freezes at a stale number reads as healthy and un-fires the alerts
+        // it feeds, so an absent series is the honest signal here.
+        if let Some(u) = nw.unrealized_pnl_usd {
+            gauge("fks_bot_unrealized_pnl_usd", "", u);
+        }
         if let Ok(venues) = self.venues.read() {
             for v in venues.values() {
                 let ex = format!("exchange=\"{}\"", v.exchange);
@@ -372,6 +529,7 @@ impl StatusState {
             .map(|m| m.values().cloned().collect())
             .unwrap_or_default();
         let events = self.events.read().map(|e| e.clone()).unwrap_or_default();
+        let nw = self.net_worth();
         json!({
             "bot": self.bot,
             "market": self.market,
@@ -385,7 +543,21 @@ impl StatusState {
             // sum that looks entirely healthy. Publishing the expected count
             // is what makes that difference detectable from outside.
             "expected_venues": self.expected_venues,
-            "net_worth_usd": self.net_worth(),
+            "net_worth_usd": nw.total_usd,
+            // Does `net_worth_usd` account for every open position? A futures
+            // bot whose venue snapshot books REALIZED cash publishes the same
+            // field name for a completely different quantity, and the
+            // spawner's treasury roll-up sums them together. `false` means
+            // "this is not a net worth" — do not record it as one, and do not
+            // add it to anybody else's.
+            "net_worth_usd_complete": nw.complete,
+            // The decomposition, so the headline number is checkable from
+            // outside rather than merely asserted. NB: when the venue total
+            // already marks positions to market, `unrealized_pnl_usd` is
+            // already INSIDE `venue_total_usd` — never add these blindly.
+            "venue_total_usd": nw.venue_total_usd,
+            "unrealized_pnl_usd": nw.unrealized_pnl_usd,
+            "open_positions": nw.open_positions,
             "pnl_usd": self.pnl_dollars(),
             "signals_total": self.signals.load(Ordering::Relaxed),
             "trades_total": self.trades.load(Ordering::Relaxed),
@@ -435,6 +607,14 @@ pub fn observe_paper_event(v: &Value) {
                     mark_px: entry_px,
                     ret_pct: 0.0,
                     updated: now_secs(),
+                    // The brain already stamps `notional_usdt` on its CLOSE
+                    // records; when it stamps the ENTRY too, the open position
+                    // becomes valuable in dollars and the bot's net worth can
+                    // account for it. Absent → `None`, and the net worth
+                    // honestly reports itself incomplete.
+                    notional_usd: v["notional_usdt"]
+                        .as_f64()
+                        .filter(|n| n.is_finite() && *n > 0.0),
                 }),
             );
         }
@@ -559,7 +739,49 @@ mod tests {
             expected_venues: 2,
             venues: RwLock::new(BTreeMap::new()),
             positions: RwLock::new(BTreeMap::new()),
+            venue_total_marks_positions: RwLock::new(None),
             events: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// A futures venue that books REALIZED equity: cash only, no holdings.
+    /// This is the live funding bot's actual shape (observed 2026-08-02:
+    /// `cash == total_value == 11288.306994792156`, `holdings: []`).
+    fn cash_venue(name: &str, equity: f64) -> VenueStatus {
+        VenueStatus {
+            exchange: name.into(),
+            mode: "paper".into(),
+            cash_asset: "USDT".into(),
+            cash: equity,
+            total_value: equity,
+            max_drift: 0.0,
+            triggered: false,
+            last_rebalance: None,
+            updated: 1_785_603_708,
+            holdings: vec![],
+        }
+    }
+
+    /// Serialises the tests that drive the PROCESS-GLOBAL [`StatusState`] via
+    /// [`observe_paper_event`]. They share one counter set, so running them
+    /// concurrently makes `trades_before + 1` assertions race (observed: 4
+    /// spurious failures in 25 runs). Not a lock the bot ever takes.
+    static GLOBAL_STATUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_global() -> std::sync::MutexGuard<'static, ()> {
+        GLOBAL_STATUS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn open_pos(symbol: &str, ret_pct: f64, notional_usd: Option<f64>) -> PositionStatus {
+        PositionStatus {
+            symbol: symbol.into(),
+            dir: 1,
+            entry_px: 6.184,
+            entry_ts_ms: 1_785_628_855_628,
+            mark_px: 6.61,
+            ret_pct,
+            updated: 1_785_654_051,
+            notional_usd,
         }
     }
 
@@ -590,17 +812,221 @@ mod tests {
         let s = fresh();
         s.update_venue(venue("kraken", 100.0));
         // Only 1 of 2 venues reported → no baseline, PnL is realized-only.
-        assert_eq!(s.net_worth(), 100.0);
+        assert_eq!(s.net_worth().total_usd, 100.0);
         assert!(s.baseline.get().is_nan());
         assert_eq!(s.pnl_dollars(), 0.0);
 
         s.update_venue(venue("kucoin", 50.0));
-        assert_eq!(s.net_worth(), 150.0);
+        assert_eq!(s.net_worth().total_usd, 150.0);
         assert_eq!(s.baseline.get(), 150.0);
 
         // The venue's value moves → PnL is the drift from the baseline.
         s.update_venue(venue("kucoin", 60.0));
         assert!((s.pnl_dollars() - 10.0).abs() < 1e-9);
+    }
+
+    // ── net worth means ONE thing (2026-08-02, gap #11) ─────────────────────
+    /// A flat bot — the live SPOT bot's shape (`positions: []`). The venue sum
+    /// IS the net worth, byte-for-byte as before, and it is COMPLETE.
+    #[test]
+    fn a_flat_book_is_complete_and_unchanged() {
+        let s = fresh();
+        s.update_venue(venue("kraken", 100.0));
+        s.update_venue(venue("kucoin", 78.9053809138768));
+        let nw = s.net_worth();
+        assert_eq!(nw.total_usd, nw.venue_total_usd, "no positions to fold");
+        assert_eq!(nw.open_positions, 0);
+        assert_eq!(nw.unrealized_pnl_usd, Some(0.0));
+        assert!(nw.complete, "a flat book is fully accounted for");
+    }
+
+    /// The live PAPER FUNDING bot, exactly as observed 2026-08-02: venue
+    /// snapshot 11288.306994792156 (realized ledger equity, `holdings: []`),
+    /// one open AVAXUSDTM long at +6.888745% — and NO notional, because the
+    /// brain does not stamp one on its entry record.
+    ///
+    /// `ret_pct` is a ratio; it cannot be added to a balance. So the position
+    /// is unvaluable and the total must NOT claim to be a net worth.
+    #[test]
+    fn an_unvaluable_open_position_makes_the_total_incomplete() {
+        let s = fresh();
+        s.update_venue(cash_venue("kucoin-futures", 11_288.306_994_792_156));
+        s.set_position(
+            "AVAXUSDTM",
+            Some(open_pos("AVAXUSDTM", 6.888_745_148_771_025, None)),
+        );
+
+        let nw = s.net_worth();
+        assert_eq!(nw.open_positions, 1);
+        assert_eq!(
+            nw.unrealized_pnl_usd, None,
+            "a ret_pct with no notional cannot be valued in dollars"
+        );
+        assert_eq!(
+            nw.total_usd, 11_288.306_994_792_156,
+            "the figure is unchanged — what changes is that it stops CLAIMING to be net worth"
+        );
+        assert!(
+            !nw.complete,
+            "realized cash with an unaccounted open position is not a net worth"
+        );
+    }
+
+    /// The repair: once the brain supplies the notional (`book.notional_usdt()`
+    /// — 3000.0 on every one of this bot's ledger records) and declares that
+    /// its venue figure is realized CASH, the open position is marked to
+    /// market and the published net worth is the whole book.
+    #[test]
+    fn a_valued_open_position_is_marked_into_the_net_worth() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(false); // paper ledger = realized cash
+        s.update_venue(cash_venue("kucoin-futures", 11_288.306_994_792_156));
+        s.set_position(
+            "AVAXUSDTM",
+            Some(open_pos("AVAXUSDTM", 6.888_745_148_771_025, Some(3000.0))),
+        );
+
+        let nw = s.net_worth();
+        let expected_unrealized = 3000.0 * 6.888_745_148_771_025 / 100.0; // +206.66 USDT
+        assert!((nw.unrealized_pnl_usd.expect("valued") - expected_unrealized).abs() < 1e-9);
+        assert!((nw.total_usd - (11_288.306_994_792_156 + expected_unrealized)).abs() < 1e-9);
+        assert!(nw.complete);
+        assert!(
+            nw.total_usd > nw.venue_total_usd,
+            "the +207 USDT that was silently absent from the treasury is now in it"
+        );
+    }
+
+    /// THE operator consequence. The audit's own observation: AVAXUSDTM long,
+    /// entry 6.479, mark 6.446, −0.509% on 3000 notional. Before this change
+    /// the treasury recorded pre-trade cash and showed NO DRAWDOWN AT ALL
+    /// while the position bled — a flat line that is indistinguishable from a
+    /// bot that is doing fine.
+    #[test]
+    fn an_adverse_open_position_shows_a_drawdown_immediately() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(false);
+        s.update_venue(cash_venue("kucoin-futures", 11_251.55));
+        s.set_position(
+            "AVAXUSDTM",
+            Some(open_pos("AVAXUSDTM", -0.509, Some(3000.0))),
+        );
+
+        let nw = s.net_worth();
+        assert!(nw.complete);
+        assert!(
+            nw.total_usd < 11_251.55,
+            "an adverse open position must show as a drawdown, not as flat cash"
+        );
+        assert!((nw.total_usd - (11_251.55 - 15.27)).abs() < 1e-9);
+        // And `pnl_usd` in the same document must agree with `net_worth_usd`.
+        s.baseline.set(11_251.55);
+        assert!((s.pnl_dollars() - (-15.27)).abs() < 1e-9);
+    }
+
+    /// A LIVE futures venue reports exchange account equity, which ALREADY
+    /// includes unrealised PnL. Folding the position in again would
+    /// double-count it — a wrong number recorded as authoritative, which is
+    /// the very bug this change exists to stop.
+    #[test]
+    fn a_mark_to_market_venue_total_is_not_double_counted() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(true); // live exchange account equity
+        s.update_venue(cash_venue("kucoin-futures", 11_495.0));
+        s.set_position(
+            "AVAXUSDTM",
+            Some(open_pos("AVAXUSDTM", 6.888_745, Some(3000.0))),
+        );
+
+        let nw = s.net_worth();
+        assert_eq!(
+            nw.total_usd, 11_495.0,
+            "the exchange figure already marks the position — do not add it twice"
+        );
+        assert!(nw.complete, "and it IS a complete net worth");
+        assert!(
+            nw.unrealized_pnl_usd.is_some(),
+            "still published as a decomposition, just not as an addend"
+        );
+    }
+
+    /// The declaration is required, not assumed. An undeclared basis with an
+    /// open position could be either shape, so neither may be claimed — even
+    /// when the position happens to carry a notional.
+    #[test]
+    fn an_undeclared_basis_with_an_open_position_is_incomplete() {
+        let s = fresh(); // venue_total_marks_positions: None
+        s.update_venue(cash_venue("kucoin-futures", 11_288.31));
+        s.set_position(
+            "AVAXUSDTM",
+            Some(open_pos("AVAXUSDTM", 6.888_745, Some(3000.0))),
+        );
+        let nw = s.net_worth();
+        assert!(
+            !nw.complete,
+            "guessing the accounting basis is how a number acquires false authority"
+        );
+        assert_eq!(nw.total_usd, 11_288.31, "and nothing is silently folded in");
+    }
+
+    /// One unvaluable position poisons the whole book: a partial sum of the
+    /// open positions is a WRONG total, not a smaller one.
+    #[test]
+    fn one_unvaluable_position_makes_the_whole_book_unvaluable() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(false);
+        s.update_venue(cash_venue("kucoin-futures", 10_000.0));
+        s.set_position("AVAXUSDTM", Some(open_pos("AVAXUSDTM", 2.0, Some(3000.0))));
+        s.set_position("DOTUSDTM", Some(open_pos("DOTUSDTM", -5.0, None)));
+        let nw = s.net_worth();
+        assert_eq!(nw.open_positions, 2);
+        assert_eq!(nw.unrealized_pnl_usd, None);
+        assert!(!nw.complete);
+        assert_eq!(nw.total_usd, 10_000.0);
+    }
+
+    #[test]
+    fn status_json_publishes_the_decomposition() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(false);
+        s.update_venue(cash_venue("kucoin-futures", 10_000.0));
+        s.set_position("AVAXUSDTM", Some(open_pos("AVAXUSDTM", 2.0, None)));
+        let j = s.status_json();
+        assert_eq!(j["net_worth_usd"], 10_000.0);
+        assert_eq!(j["venue_total_usd"], 10_000.0);
+        assert_eq!(j["net_worth_usd_complete"], false);
+        assert!(j["unrealized_pnl_usd"].is_null(), "unknown is null, not 0");
+        assert_eq!(j["open_positions"], 1);
+
+        // Valued → the same document reports a complete, marked-to-market total.
+        s.set_position("AVAXUSDTM", Some(open_pos("AVAXUSDTM", 2.0, Some(3000.0))));
+        let j = s.status_json();
+        assert_eq!(j["net_worth_usd_complete"], true);
+        assert_eq!(j["net_worth_usd"], 10_060.0);
+        assert_eq!(j["unrealized_pnl_usd"], 60.0);
+    }
+
+    #[test]
+    fn metrics_expose_whether_the_net_worth_is_complete() {
+        let s = fresh();
+        s.set_venue_total_marks_positions(false);
+        s.update_venue(cash_venue("kucoin-futures", 10_000.0));
+        s.set_position("AVAXUSDTM", Some(open_pos("AVAXUSDTM", 2.0, None)));
+        let m = s.render_metrics();
+        assert!(
+            m.contains(r#"fks_bot_net_worth_complete{bot="test-bot",market="spot"} 0"#),
+            "an incomplete net worth must say so on the money channel:\n{m}"
+        );
+        assert!(
+            !m.contains("fks_bot_unrealized_pnl_usd"),
+            "an unvaluable book exports NO unrealized gauge rather than a fake 0:\n{m}"
+        );
+
+        s.set_position("AVAXUSDTM", Some(open_pos("AVAXUSDTM", 2.0, Some(3000.0))));
+        let m = s.render_metrics();
+        assert!(m.contains(r#"fks_bot_net_worth_complete{bot="test-bot",market="spot"} 1"#));
+        assert!(m.contains(r#"fks_bot_unrealized_pnl_usd{bot="test-bot",market="spot"} 60"#));
+        assert!(m.contains(r#"fks_bot_net_worth_usd{bot="test-bot",market="spot"} 10060"#));
     }
 
     #[test]
@@ -678,6 +1104,7 @@ mod tests {
                 mark_px: 2000.0,
                 ret_pct: 0.0,
                 updated: 0,
+                notional_usd: Some(3000.0),
             }),
         );
         // Short from 2000, mark 1900 → +5% signed return.
@@ -686,6 +1113,12 @@ mod tests {
             let map = s.positions.read().unwrap();
             let p = map.get("ETHUSDTM").unwrap();
             assert!((p.ret_pct - 5.0).abs() < 1e-9);
+            assert_eq!(
+                p.notional_usd,
+                Some(3000.0),
+                "re-marking must not drop the notional — losing it would silently \
+                 make the whole book unvaluable on every price tick"
+            );
         }
         s.set_position("ETHUSDTM", None);
         assert!(s.positions.read().unwrap().is_empty());
@@ -712,11 +1145,52 @@ mod tests {
     }
 
     #[test]
+    fn observe_paper_event_takes_the_notional_from_the_entry_record() {
+        // The brain already stamps `notional_usdt` on its CLOSE records; when
+        // it stamps the ENTRY too, the open position becomes valuable and the
+        // bot's net worth stops hiding it. Absent → None, never a guess.
+        let _guard = lock_global();
+        let s = init("notional-entry-status-test", "futures", 1);
+        observe_paper_event(&json!({
+            "sym": "NTLUSDTM", "action": "entry", "dir": 1, "entry_px": 6.184,
+            "t": 1785628855628_i64, "notional_usdt": 3000.0
+        }));
+        assert_eq!(
+            s.positions.read().unwrap()["NTLUSDTM"].notional_usd,
+            Some(3000.0)
+        );
+
+        observe_paper_event(&json!({
+            "sym": "NONOTIONAL", "action": "entry", "dir": 1, "entry_px": 6.184, "t": 1
+        }));
+        assert_eq!(
+            s.positions.read().unwrap()["NONOTIONAL"].notional_usd,
+            None,
+            "an entry record without a notional must not invent one"
+        );
+
+        // Junk is not a notional either.
+        observe_paper_event(&json!({
+            "sym": "ZERONOTIONAL", "action": "entry", "dir": 1,
+            "entry_px": 1.0, "t": 1, "notional_usdt": 0.0
+        }));
+        assert_eq!(
+            s.positions.read().unwrap()["ZERONOTIONAL"].notional_usd,
+            None
+        );
+
+        s.set_position("NTLUSDTM", None);
+        s.set_position("NONOTIONAL", None);
+        s.set_position("ZERONOTIONAL", None);
+    }
+
+    #[test]
     fn observe_paper_event_kill_exit_clears_phantom_position_and_books_the_round_trip() {
         // The H1 symptom on the spawner side: after a kill drill `/status` kept a
         // phantom open position and skipped the round-trip counters because
         // `kill_exit` was not in the close-action match. init() is the process
         // global; assert on the specific symbol so parallel tests can't perturb.
+        let _guard = lock_global();
         let s = init("kill-exit-status-test", "futures", 1);
         observe_paper_event(&json!({
             "sym": "KEXITUSDTM", "action": "entry", "dir": 1, "entry_px": 100.0, "t": 1
