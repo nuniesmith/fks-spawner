@@ -427,6 +427,70 @@ pub fn venue_set_is_complete(body: &str) -> Option<bool> {
     Some(venue_entries(&v).len() >= expected)
 }
 
+/// How many open positions does the bot report?
+///
+/// Prefers the published `open_positions` COUNT (crypto-bot-core status.rs)
+/// and falls back to the length of the `positions[]` array that older builds
+/// publish, so this reads both shapes.
+fn open_position_count(v: &serde_json::Value) -> usize {
+    if let Some(n) = v.get("open_positions").and_then(value_as_f64) {
+        return n.max(0.0) as usize;
+    }
+    v.get("positions")
+        .and_then(|a| a.as_array())
+        .map_or(0, Vec::len)
+}
+
+/// Does the bot hold open positions that its own net-worth figure does not
+/// account for?
+///
+/// `net_worth_usd` meant two different things depending on the bot's shape.
+/// The SPOT bot's venue totals are `cash + Σ holdings[].value` — a genuine
+/// mark-to-market portfolio value. The FUTURES/funding bot's venue snapshot is
+/// its paper ledger's REALIZED equity (`cash == total_value`, `holdings: []`),
+/// which moves only when a round trip closes; the open trade lives in a
+/// separate `positions[]` array the total never touched. `/treasury` and
+/// `check_net_worth_milestone` SUM THEM TOGETHER.
+///
+/// Observed on the live paper funding bot 2026-08-02: `net_worth_usd`
+/// 11288.31 with an open AVAXUSDTM long at +6.889% on 3000 USDT notional —
+/// ~207 USDT (1.8%) of the book missing from the recorded "net worth", and
+/// `positions[].updated` 14 hours fresher than `exchanges[].updated`. The
+/// direction is what makes it dangerous: an ADVERSE open position makes the
+/// treasury series show NO DRAWDOWN AT ALL until the trade closes — a flat
+/// line indistinguishable from a bot that is doing fine. Unbounded in
+/// principle, and precisely the shape of every other failure this week: a
+/// number that looks authoritative and is not what it claims.
+///
+/// The spawner CANNOT repair this from outside. `ret_pct` is a ratio, not
+/// dollars, and whether a venue total already marks positions to market is
+/// bot knowledge (a live exchange's account equity does; a paper ledger's
+/// booked equity does not) — inferring it would manufacture exactly the kind
+/// of plausible-looking figure this guard exists to refuse. So the bot
+/// declares, via `net_worth_usd_complete`, and this refuses what the bot
+/// cannot vouch for:
+///
+///   - `net_worth_usd_complete: false` — the bot says the figure omits an
+///     open position. Refuse.
+///   - field ABSENT with open positions — a build predating the contract. It
+///     cannot vouch for the figure either way, so refuse.
+///   - field absent, no open positions — the spot bot and every non-futures
+///     bot. Recorded exactly as before.
+///
+/// A gap in the series is honest; a treasury that cannot show a drawdown is
+/// not.
+pub fn open_positions_unaccounted(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    match v.get("net_worth_usd_complete").and_then(|c| c.as_bool()) {
+        // The bot vouches for its own figure (or says it cannot).
+        Some(complete) => !complete,
+        // No declaration: only a bot carrying open positions is at risk.
+        None => open_position_count(&v) > 0,
+    }
+}
+
 /// `updated` stamps for venues holding REAL money.
 ///
 /// The spot bot serves `exchanges: [{exchange, mode, total_value, updated}]`
@@ -523,8 +587,9 @@ mod sampler {
 
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
-        has_fake_paper_venue, milestone_baseline, now_epoch_secs, parse_status_net_worth,
-        parse_venue_freshness, reading_is_stale, running_status_targets, venue_set_is_complete,
+        has_fake_paper_venue, milestone_baseline, now_epoch_secs, open_positions_unaccounted,
+        parse_status_net_worth, parse_venue_freshness, reading_is_stale, running_status_targets,
+        venue_set_is_complete,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -755,6 +820,28 @@ mod sampler {
                 return None;
             }
 
+            // A bot holding open positions its own net-worth figure does not
+            // account for is publishing REALIZED CASH under the field the
+            // treasury reads as TOTAL PORTFOLIO VALUE — and summing that
+            // beside a spot bot's mark-to-market total. The worst case is the
+            // quiet one: while an open position bleeds, the recorded series
+            // stays perfectly flat and the treasury shows NO DRAWDOWN AT ALL
+            // until the trade closes.
+            if open_positions_unaccounted(&body) {
+                warn!(
+                    bot_id = %bot_id,
+                    "net-worth sampler: the bot reports OPEN POSITIONS its net-worth \
+                     figure does not account for (net_worth_usd_complete=false or \
+                     absent), so the figure is realized cash, not net worth. Skipping \
+                     — recording it would sum two different quantities into /treasury \
+                     and hide an open drawdown. Fix: have the brain stamp \
+                     notional_usdt on its ENTRY record and declare its venue basis \
+                     via set_venue_total_marks_positions()."
+                );
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL.inc();
+                return None;
+            }
+
             match parse_status_net_worth(&body) {
                 some @ Some(_) => some,
                 None => {
@@ -849,6 +936,72 @@ mod sampler {
             NotificationDispatcher::new(store).dispatch(ev).await;
         });
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // probe() wiring — a guard that is never CALLED is a guard that does
+    // nothing, and a pure-function suite structurally cannot see that. These
+    // drive the real HTTP path against a loopback /status server.
+    // ─────────────────────────────────────────────────────────────────────────
+    #[cfg(test)]
+    mod probe_tests {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Serve `body` once on a loopback port; returns its `/status` URL.
+        async fn serve_status_once(body: &'static str) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                }
+            });
+            format!("http://{addr}/status")
+        }
+
+        /// The live funding bot's real body: reachable, 200, parseable, and
+        /// past all five existing guards — so if probe() still hands back a
+        /// reading, the open-position guard is not wired in.
+        #[tokio::test]
+        async fn probe_refuses_a_status_whose_net_worth_omits_an_open_position() {
+            let url = serve_status_once(crate::net_worth::tests::LIVE_FUNDING_STATUS).await;
+            let got = NetWorthSampler::new().probe("crypto-funding", &url).await;
+            assert!(
+                got.is_none(),
+                "probe returned {got:?} — realized cash would have been recorded as net worth"
+            );
+        }
+
+        /// The same bot once it accounts for its book: recorded, with the open
+        /// position inside the figure.
+        #[tokio::test]
+        async fn probe_records_a_status_that_accounts_for_its_positions() {
+            const ACCOUNTED: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 11494.969349255287, "net_worth_usd_complete": true,
+                "venue_total_usd": 11288.306994792156,
+                "unrealized_pnl_usd": 206.66235446313075, "open_positions": 1,
+                "exchanges": [{"exchange": "kucoin-futures", "mode": "paper",
+                    "total_value": 11288.306994792156, "updated": 1785603708}],
+                "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 6.888745148771025}]}"#;
+            let url = serve_status_once(ACCOUNTED).await;
+            let got = NetWorthSampler::new()
+                .probe("crypto-funding", &url)
+                .await
+                .expect("an accounted figure must still be recorded");
+            assert!((got.net_worth - 11_494.969_349_255_287).abs() < 1e-9);
+        }
+    }
 }
 
 #[cfg(feature = "db")]
@@ -861,6 +1014,154 @@ pub use sampler::{NetWorthSampler, run_sampler};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── net worth meant two things (2026-08-02, gap #11) ────────────────────
+    /// The live PAPER FUNDING bot's ACTUAL `/status`, read from the container
+    /// on 2026-08-02 (events + a fresher `positions[].updated` trimmed for
+    /// width, values verbatim). `exchanges[0]` is its paper ledger's REALIZED
+    /// equity — `cash == total_value`, `holdings: []` — and the open AVAXUSDTM
+    /// long is nowhere in that number.
+    pub(super) const LIVE_FUNDING_STATUS: &str = r#"{
+        "bot": "kucoin-futures", "market": "futures", "mode": "paper",
+        "net_worth_usd": 11288.306994792156, "pnl_usd": 30.403891963142087,
+        "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper", "cash_asset": "USDT",
+             "cash": 11288.306994792156, "total_value": 11288.306994792156,
+             "holdings": [], "updated": 1785603708}
+        ],
+        "positions": [
+            {"symbol": "AVAXUSDTM", "dir": 1, "entry_px": 6.184, "mark_px": 6.61,
+             "ret_pct": 6.888745148771025, "entry_ts_ms": 1785628855628,
+             "updated": 1785654051}
+        ]
+    }"#;
+
+    /// ~207 USDT of open book (3000 notional × 6.889%) absent from a figure
+    /// that `/treasury` sums beside the spot bot's mark-to-market total.
+    #[test]
+    fn the_live_funding_bots_unaccounted_open_position_is_refused() {
+        assert!(
+            open_positions_unaccounted(LIVE_FUNDING_STATUS),
+            "realized cash published as net worth while a position is open"
+        );
+
+        // And prove EVERY other guard waves it straight through — which is
+        // exactly why this check has to exist separately.
+        assert!(
+            !has_fake_paper_venue(LIVE_FUNDING_STATUS),
+            "#39: a wholly paper bot's paper venue is legitimate"
+        );
+        assert_eq!(
+            venue_set_is_complete(LIVE_FUNDING_STATUS),
+            None,
+            "#38: no expected_venues → unknown, not incomplete"
+        );
+        let r = parse_status_net_worth(LIVE_FUNDING_STATUS).expect("parses");
+        assert_eq!(
+            r.updated, None,
+            "#35: a paper venue contributes no stamp — idle is not blind"
+        );
+        assert!(
+            !reading_is_stale(r.updated, 1_785_656_153, 600),
+            "#32: unverifiable reads as fresh"
+        );
+        assert_eq!(
+            r.net_worth, 11_288.306_994_792_156,
+            "and the figure the sampler would have written is the pre-trade cash"
+        );
+    }
+
+    /// The repair: once the bot marks its open positions into the figure it
+    /// publishes, it vouches for it and the sample is recorded again.
+    #[test]
+    fn a_bot_that_accounts_for_its_positions_is_recorded() {
+        let body = r#"{"mode": "paper", "net_worth_usd": 11494.97,
+            "net_worth_usd_complete": true, "venue_total_usd": 11288.306994792156,
+            "unrealized_pnl_usd": 206.66235446313075, "open_positions": 1,
+            "exchanges": [
+                {"exchange": "kucoin-futures", "mode": "paper", "total_value": 11288.306994792156,
+                 "updated": 1785603708}
+            ],
+            "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 6.888745148771025}]}"#;
+        assert!(!open_positions_unaccounted(body));
+        let r = parse_status_net_worth(body).expect("parses");
+        assert_eq!(
+            r.net_worth, 11_494.97,
+            "and the recorded figure now includes the open book"
+        );
+    }
+
+    /// A bot that says its own figure is incomplete is refused even if the
+    /// spawner can see no positions — the bot's own word beats our inference.
+    #[test]
+    fn an_explicit_incomplete_declaration_is_always_refused() {
+        let body = r#"{"net_worth_usd": 11288.31, "net_worth_usd_complete": false,
+            "open_positions": 1, "positions": []}"#;
+        assert!(open_positions_unaccounted(body));
+    }
+
+    /// The #35 regression guard, restated for this guard: the funding bot when
+    /// it is FLAT is perfectly correct and must keep being recorded. Refusing
+    /// a healthy bot is how its treasury series went dark for 15 hours.
+    #[test]
+    fn a_flat_paper_funding_bot_is_still_recorded() {
+        let flat = r#"{"bot": "kucoin-futures", "mode": "paper",
+            "net_worth_usd": 11288.306994792156, "positions": [],
+            "exchanges": [{"exchange": "kucoin-futures", "mode": "paper",
+                           "total_value": 11288.306994792156, "updated": 1785603708}]}"#;
+        assert!(
+            !open_positions_unaccounted(flat),
+            "a flat book is fully accounted for — do NOT blank an idle bot"
+        );
+        // Including the pre-contract build, which publishes no declaration.
+        let flat_new = r#"{"mode": "paper", "net_worth_usd": 11288.306994792156,
+            "net_worth_usd_complete": true, "open_positions": 0, "positions": []}"#;
+        assert!(!open_positions_unaccounted(flat_new));
+    }
+
+    /// The live SPOT bot — REAL MONEY, three live venues, `positions: []`.
+    /// Its venue totals are `cash + Σ holdings[].value`, already
+    /// mark-to-market, so this guard must be a complete no-op for it.
+    #[test]
+    fn the_live_spot_bot_is_untouched_by_the_position_guard() {
+        let live_spot = r#"{"bot": "spot-portfolio", "mode": "live",
+            "net_worth_usd": 178.9053809138768, "expected_venues": 3, "positions": [],
+            "exchanges": [
+                {"exchange": "Crypto.com",  "mode": "live", "total_value": 30.72607211026281,
+                 "cash": 4.867793328, "updated": 1785656078,
+                 "holdings": [{"asset": "BTC", "qty": 0.00016915, "value": 10.729536332}]},
+                {"exchange": "Kraken",      "mode": "live", "total_value": 76.656122085614,
+                 "cash": 15.1884, "updated": 1785656076,
+                 "holdings": [{"asset": "BTC", "qty": 0.00048515, "value": 30.76578725}]},
+                {"exchange": "KuCoin-spot", "mode": "live", "total_value": 71.52318671799999,
+                 "cash": 17.35702511, "updated": 1785656077,
+                 "holdings": [{"asset": "BTC", "qty": 0.00041014, "value": 26.039255418}]}
+            ]}"#;
+        assert!(
+            !open_positions_unaccounted(live_spot),
+            "the live REAL-MONEY spot series must not gain a new way to go dark"
+        );
+        // The bot-shape fixtures used by the other guards carry no `positions`
+        // key at all; none of them may start being refused.
+        assert!(!open_positions_unaccounted(LIVE_SPOT_STATUS));
+        assert!(!open_positions_unaccounted(r#"{"net_worth_usd": 165.0}"#));
+        assert!(!open_positions_unaccounted("not json"));
+        assert!(!open_positions_unaccounted(""));
+    }
+
+    /// The published COUNT is authoritative when present, so a bot may drop
+    /// the (potentially large) array without silently reading as flat.
+    #[test]
+    fn the_published_count_outranks_the_array() {
+        let counted = r#"{"net_worth_usd": 1.0, "open_positions": 2}"#;
+        assert!(open_positions_unaccounted(counted));
+        let zero = r#"{"net_worth_usd": 1.0, "open_positions": 0,
+                       "positions": [{"symbol": "GHOST"}]}"#;
+        assert!(
+            !open_positions_unaccounted(zero),
+            "an explicit 0 count is a statement, not a missing field"
+        );
+    }
 
     // ── fabricated paper cash on a live bot (2026-07-28, instance #5) ───────
     /// The botched-key-rotation shape: bot mode "live", but Kraken silently
