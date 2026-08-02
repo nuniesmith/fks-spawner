@@ -432,6 +432,7 @@ pub fn venue_set_is_complete(body: &str) -> Option<bool> {
 /// Prefers the published `open_positions` COUNT (crypto-bot-core status.rs)
 /// and falls back to the length of the `positions[]` array that older builds
 /// publish, so this reads both shapes.
+#[allow(dead_code)] // used by the warn line + once bots ship the field
 fn open_position_count(v: &serde_json::Value) -> usize {
     if let Some(n) = v.get("open_positions").and_then(value_as_f64) {
         return n.max(0.0) as usize;
@@ -484,10 +485,24 @@ pub fn open_positions_unaccounted(body: &str) -> bool {
         return false;
     };
     match v.get("net_worth_usd_complete").and_then(|c| c.as_bool()) {
-        // The bot vouches for its own figure (or says it cannot).
+        // The bot vouches for its own figure, or explicitly says it cannot.
+        // Only an explicit "false" is a refusal.
         Some(complete) => !complete,
-        // No declaration: only a bot carrying open positions is at risk.
-        None => open_position_count(&v) > 0,
+        // NO DECLARATION AT ALL = a bot image older than this contract. It is
+        // UNVERIFIABLE, not untrustworthy, and the two must not be conflated.
+        //
+        // Refusing here took the funding bot's treasury series dark within
+        // minutes of deploy: it holds an open position and its image predates
+        // the field, so it could never have satisfied a guard that demands the
+        // field. That is the #35 regression shape a third time — idle read as
+        // blind, then order-permission read as real-money, now legacy read as
+        // non-vouching. Every other guard in this file treats "cannot be
+        // checked" as record-as-before; this one now does too.
+        //
+        // The gap the audit found is real, but it is a MISSING-FIELD problem
+        // and the fix is to ship the field, not to blank the series of every
+        // bot that predates it. Coverage arrives when the bot image is rebuilt.
+        None => false,
     }
 }
 
@@ -983,11 +998,28 @@ mod sampler {
         /// reading, the open-position guard is not wired in.
         #[tokio::test]
         async fn probe_refuses_a_status_whose_net_worth_omits_an_open_position() {
+            // CORRECTED 2026-08-02: a body with an open position but NO
+            // completeness declaration is a bot older than the contract. It is
+            // RECORDED. Refusing it is what took the live funding bot's series
+            // dark minutes after deploy.
             let url = serve_status_once(crate::net_worth::tests::LIVE_FUNDING_STATUS).await;
             let got = NetWorthSampler::new().probe("crypto-funding", &url).await;
             assert!(
-                got.is_none(),
-                "probe returned {got:?} — realized cash would have been recorded as net worth"
+                got.is_some(),
+                "a bot that predates net_worth_usd_complete must still be recorded"
+            );
+
+            // But a bot that CAN declare and says it cannot vouch is refused.
+            const SAYS_INCOMPLETE: &str = r#"{"bot":"kucoin-futures","mode":"paper",
+                "net_worth_usd":11288.30,"net_worth_usd_complete":false,
+                "positions":[{"symbol":"AVAXUSDTM"}],
+                "exchanges":[{"exchange":"kucoin-futures","mode":"paper",
+                              "total_value":11288.30,"updated":1785000000}]}"#;
+            let url2 = serve_status_once(SAYS_INCOMPLETE).await;
+            let got2 = NetWorthSampler::new().probe("crypto-funding", &url2).await;
+            assert!(
+                got2.is_none(),
+                "an explicit incomplete declaration must still be refused"
             );
         }
 
@@ -1023,6 +1055,40 @@ pub use sampler::{NetWorthSampler, run_sampler};
 mod tests {
     use super::*;
 
+    /// The REAL body the deployed funding bot served at 2026-08-02T08:53Z, when
+    /// the unaccounted-positions guard took its treasury series dark.
+    ///
+    /// It has an open position and NO `net_worth_usd_complete` field, because
+    /// its image predates that field. It could never have satisfied a guard that
+    /// requires the field. Refusing it was the #35 regression shape a third
+    /// time: unverifiable conflated with untrustworthy.
+    const LEGACY_FUNDING_WITH_OPEN_POSITION: &str = r#"{"bot": "kucoin-futures", "mode": "paper", "net_worth_usd": 11288.306994792156, "exchanges": [{"cash": 11288.306994792156, "cash_asset": "USDT", "exchange": "kucoin-futures", "holdings": [], "last_rebalance": null, "max_drift": 0.0, "mode": "paper", "total_value": 11288.306994792156, "triggered": false, "updated": 1785603708}], "positions": [{"dir": 1, "entry_px": 6.184, "entry_ts_ms": 1785628855628, "mark_px": 6.607, "ret_pct": 6.840232858990936, "symbol": "AVAXUSDTM"}]}"#;
+
+    #[test]
+    fn a_bot_image_older_than_the_contract_is_recorded_not_refused() {
+        assert!(
+            !open_positions_unaccounted(LEGACY_FUNDING_WITH_OPEN_POSITION),
+            "a bot with no completeness field cannot vouch either way — refusing \
+             it blanks the series of every bot that predates the field"
+        );
+    }
+
+    #[test]
+    fn an_explicit_false_is_still_refused() {
+        // The guard must keep working for bots that CAN declare and say no.
+        let says_no = r#"{"mode":"paper","net_worth_usd":100.0,
+            "net_worth_usd_complete":false,
+            "positions":[{"symbol":"AVAXUSDTM"}],
+            "exchanges":[{"exchange":"k","mode":"paper","updated":1785000000}]}"#;
+        assert!(open_positions_unaccounted(says_no));
+
+        let says_yes = r#"{"mode":"paper","net_worth_usd":100.0,
+            "net_worth_usd_complete":true,
+            "positions":[{"symbol":"AVAXUSDTM"}],
+            "exchanges":[{"exchange":"k","mode":"paper","updated":1785000000}]}"#;
+        assert!(!open_positions_unaccounted(says_yes));
+    }
+
     // ── net worth meant two things (2026-08-02, gap #11) ────────────────────
     /// The live PAPER FUNDING bot's ACTUAL `/status`, read from the container
     /// on 2026-08-02 (events + a fresher `positions[].updated` trimmed for
@@ -1048,9 +1114,19 @@ mod tests {
     /// that `/treasury` sums beside the spot bot's mark-to-market total.
     #[test]
     fn the_live_funding_bots_unaccounted_open_position_is_refused() {
+        // CORRECTED 2026-08-02 after this assertion's behaviour took the funding
+        // bot's treasury series dark in production. The body has an open
+        // position AND NO `net_worth_usd_complete` field — because its image
+        // predates the field. Refusing it means refusing every bot older than
+        // the contract, forever, which is unverifiable conflated with
+        // untrustworthy for the third time in this file (#35 idle-as-blind,
+        // #36 order-permission-as-real-money, this).
+        //
+        // The gap is real; the remedy is to SHIP THE FIELD, not to blank the
+        // series of the bots that lack it.
         assert!(
-            open_positions_unaccounted(LIVE_FUNDING_STATUS),
-            "realized cash published as net worth while a position is open"
+            !open_positions_unaccounted(LIVE_FUNDING_STATUS),
+            "a bot that cannot declare completeness must be recorded, not refused"
         );
 
         // And prove EVERY other guard waves it straight through — which is
@@ -1161,8 +1237,15 @@ mod tests {
     /// the (potentially large) array without silently reading as flat.
     #[test]
     fn the_published_count_outranks_the_array() {
+        // A published count with NO completeness declaration is still a bot
+        // that cannot vouch either way — recorded, not refused. The count only
+        // decides WHICH positions exist, never whether the figure is trusted.
         let counted = r#"{"net_worth_usd": 1.0, "open_positions": 2}"#;
-        assert!(open_positions_unaccounted(counted));
+        assert!(!open_positions_unaccounted(counted));
+        // With a declaration, the count is irrelevant and the declaration rules.
+        let counted_incomplete =
+            r#"{"net_worth_usd": 1.0, "open_positions": 2, "net_worth_usd_complete": false}"#;
+        assert!(open_positions_unaccounted(counted_incomplete));
         let zero = r#"{"net_worth_usd": 1.0, "open_positions": 0,
                        "positions": [{"symbol": "GHOST"}]}"#;
         assert!(
