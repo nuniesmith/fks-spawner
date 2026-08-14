@@ -125,6 +125,56 @@ the fks repo).
   Anything out of range → `400 Bad Request`. (`cmd`/`entrypoint` overrides are
   still accepted — restricting those is a separate, behaviour-changing decision.)
 
+## Bot-status contract & the net-worth truth guards
+
+The net-worth sampler (`src/net_worth.rs`) polls each running bot's `/status`
+JSON (the `crypto-bot-core::status` HTTP server — see that crate's
+`src/status.rs`) and writes what it parses straight into the durable
+`net_worth_snapshots` treasury history. Because that table is the source of
+truth for real money, `sampler::probe()` runs every reading through a chain
+of REFUSAL guards before it is ever recorded — a guard skips the poll (log a
+gap, try again next tick) rather than let a plausible-looking-but-wrong figure
+through. As of this writing there are five (`metrics::refusal`: `stale`,
+`incomplete`, `fake_paper`, `unaccounted`, `not_ready`); each has its own
+Prometheus counter reason so `NetWorthSamplingPausedTooLong` never asserts a
+cause it can't back up. **A new guard extends this chain — it does not get
+added as a parallel check elsewhere.**
+
+- **`expected_venues`.** A bot declares this once, at `crypto_bot_core::status::init(bot,
+  market, expected_venues)` — a static count of how many venues it is
+  configured with (e.g. `spot-portfolio` passes `cfg.exchanges.len()`), fixed
+  for the process lifetime. `net_worth.rs::venue_set_is_complete` compares it
+  against the live venue array length to catch a PARTIAL sum (a venue that
+  never checked in looks perfectly fresh otherwise). Field absent → `None`
+  ("unknown", not "incomplete") so a bot that predates the field is still
+  recorded — unverifiable is not the same as untrustworthy (see the #35/#38
+  history in `net_worth.rs`). This is why `expected_venues` alone doesn't
+  close every gap: a bot that never publishes it (the deployed funding bot
+  does not) gets `None` from this guard for its entire life.
+
+- **Invariant: an empty per-venue array is NEVER a valid "checked, zero
+  venues" reading.** `crypto-bot-core`'s `/status` publishes the
+  `exchanges`/`venues` array key from the moment its HTTP server binds — an
+  uninitialised `BTreeMap` serialises to `[]`, not an absent key — so a bot
+  whose engine hasn't completed a single venue cycle yet (a respawn's
+  startup window, observed to take several real seconds) serves a body that
+  is byte-identical to "I checked every venue and have nothing to report":
+  `net_worth_usd` sums the empty set to `0.0`, nothing is stale (there's
+  nothing to be stale), nothing is paper, and a bot without
+  `expected_venues` reads as unknown-not-incomplete. **Every other guard
+  waves this through** — that's exactly what let it corrupt the treasury
+  series in production (confirmed live 2026-08-13). `net_worth.rs::venue_entries`
+  therefore returns `Option<Vec<VenueFreshness>>`, not a bare `Vec`: `None`
+  means the bot's `/status` shape has no per-venue breakdown at all (nothing
+  to check — a different, unaffected case), `Some(vec)` means the key IS
+  present and must be inspected — and `Some(vec![])` is refused
+  unconditionally by `venues_not_yet_populated`, because no real-money bot
+  legitimately has zero configured venues. **Any future bot-status field
+  that is "empty vs. not-yet-populated" ambiguous must preserve this
+  distinction — prefer an explicit absent-key/empty-array split (or a
+  dedicated readiness flag) over a bare `Vec`/default-empty value that a
+  downstream reader cannot tell apart from "not ready".**
+
 ## Common workflows
 
 ### Spawn a bot from curl

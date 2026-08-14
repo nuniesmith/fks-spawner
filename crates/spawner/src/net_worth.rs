@@ -397,6 +397,7 @@ pub fn has_fake_paper_venue(body: &str) -> bool {
         return false; // a paper bot's paper venues are legitimate
     }
     venue_entries(&v)
+        .unwrap_or_default()
         .into_iter()
         .any(|e| e.mode.eq_ignore_ascii_case("paper"))
 }
@@ -424,7 +425,7 @@ pub fn venue_set_is_complete(body: &str) -> Option<bool> {
     if expected == 0 {
         return None;
     }
-    Some(venue_entries(&v).len() >= expected)
+    Some(venue_entries(&v).unwrap_or_default().len() >= expected)
 }
 
 /// How many open positions does the bot report?
@@ -522,6 +523,7 @@ pub fn open_positions_unaccounted(body: &str) -> bool {
 /// rather than blanking the series.
 fn real_money_venue_stamps(v: &serde_json::Value) -> Vec<u64> {
     venue_entries(v)
+        .unwrap_or_default()
         .into_iter()
         .filter(|e| !e.mode.eq_ignore_ascii_case("paper"))
         .filter_map(|e| e.updated)
@@ -538,36 +540,84 @@ pub struct VenueFreshness {
 }
 
 /// Parse the per-venue array out of a `/status` body. Empty when the bot
-/// publishes no venue breakdown.
+/// publishes no venue breakdown (including an in-flight startup window — see
+/// [`venues_not_yet_populated`] for why that case is refused, not recorded).
 pub fn parse_venue_freshness(body: &str) -> Vec<VenueFreshness> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .map(|v| venue_entries(&v))
+        .and_then(|v| venue_entries(&v))
         .unwrap_or_default()
 }
 
-fn venue_entries(v: &serde_json::Value) -> Vec<VenueFreshness> {
+/// Parse the per-venue array out of a `/status` body, distinguishing "this
+/// bot's shape has no per-venue breakdown at all" from "it does, and right
+/// now the array is empty".
+///
+/// `None` — neither `exchanges` nor `venues` is a JSON array in this body.
+/// Either an older/simpler bot that only ever publishes a flat bot-level
+/// total (the root-stamp-fallback shape `parse_status_net_worth` already
+/// handles), or unparseable JSON. Nothing to check.
+///
+/// `Some(vec)` — the key IS present, so this bot's contract includes a
+/// per-venue breakdown. `vec` may be EMPTY: this is the case
+/// [`venues_not_yet_populated`] exists for. Every existing caller here treats
+/// `Some(vec![])` exactly like the old `Vec::new()` (a plain length/iterator
+/// check), so this change is behaviour-preserving for them; only the new
+/// guard cares about the `None`/`Some(empty)` distinction itself.
+fn venue_entries(v: &serde_json::Value) -> Option<Vec<VenueFreshness>> {
     const VENUE_ARRAY_KEYS: [&str; 2] = ["exchanges", "venues"];
-    VENUE_ARRAY_KEYS
+    let arr = VENUE_ARRAY_KEYS
         .iter()
-        .find_map(|k| v.get(*k).and_then(|a| a.as_array()))
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|e| {
-                    let exchange = first_string(e, &["exchange", "venue", "name"])?;
-                    Some(VenueFreshness {
-                        exchange,
-                        mode: first_string(e, &["mode"]).unwrap_or_else(|| "?".to_string()),
-                        updated: e
-                            .get("updated")
-                            .and_then(value_as_f64)
-                            .filter(|n| *n > 0.0)
-                            .map(|n| n as u64),
-                    })
+        .find_map(|k| v.get(*k).and_then(|a| a.as_array()))?;
+    Some(
+        arr.iter()
+            .filter_map(|e| {
+                let exchange = first_string(e, &["exchange", "venue", "name"])?;
+                Some(VenueFreshness {
+                    exchange,
+                    mode: first_string(e, &["mode"]).unwrap_or_else(|| "?".to_string()),
+                    updated: e
+                        .get("updated")
+                        .and_then(value_as_f64)
+                        .filter(|n| *n > 0.0)
+                        .map(|n| n as u64),
                 })
-                .collect()
-        })
-        .unwrap_or_default()
+            })
+            .collect(),
+    )
+}
+
+/// Has the bot's engine reported ANY venue yet?
+///
+/// A `present-but-empty` venue array is byte-identical on the wire whether
+/// the engine genuinely checked every venue and has nothing to show, or
+/// whether the process just bound its `/status` HTTP server and the trading
+/// engine has not completed a single cycle. `crypto-bot-core`'s status
+/// server publishes the `exchanges` key from the moment it starts listening
+/// (an empty `BTreeMap` serialises to `[]`, not an absent key) — so the
+/// startup window looks like a fully healthy "checked, zero venues" body:
+/// `net_worth_usd` sums an empty set to `0.0`, no venue is stale (nothing to
+/// be stale), no venue is paper, and (for bots that predate/omit
+/// `expected_venues`, e.g. the deployed funding bot) `venue_set_is_complete`
+/// returns `None` — unknown, not incomplete — and waves it straight through.
+/// Confirmed live 2026-08-13: a funding-bot respawn serves `/status` (200 OK)
+/// for several seconds with an empty venue array before its engine populates
+/// real balances, and none of the other four guards in this file are shaped
+/// to catch "zero venues reported" — they all wave an empty set through as
+/// either unverifiable-so-fresh or unknown-so-complete.
+///
+/// A real-money trading bot never legitimately has ZERO configured venues,
+/// so an empty array is treated as "not ready yet" unconditionally — there
+/// is no legitimate "checked, and there really are none" case to preserve.
+///
+/// A bot whose shape has NO venue breakdown at all (`venue_entries` returns
+/// `None`) is UNAFFECTED — that is a different bot shape, not a startup
+/// window, and its flat total is recorded as before.
+pub fn venues_not_yet_populated(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    matches!(venue_entries(&v), Some(entries) if entries.is_empty())
 }
 
 /// Build the `/status` URL for a bot from its container name + the bot metrics
@@ -604,7 +654,7 @@ mod sampler {
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
         has_fake_paper_venue, milestone_baseline, now_epoch_secs, open_positions_unaccounted,
         parse_status_net_worth, parse_venue_freshness, reading_is_stale, running_status_targets,
-        venue_set_is_complete,
+        venue_set_is_complete, venues_not_yet_populated,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -807,6 +857,29 @@ mod sampler {
             // alerts it feeds. A gauge that lies is worse than no gauge.
             metrics::set_venue_ages(bot_id, &ages);
 
+            // The startup window: the HTTP server is up but the engine has not
+            // completed a single venue cycle yet, so the published venue array
+            // is present but EMPTY — on the wire indistinguishable from a bot
+            // that genuinely checked every venue and has nothing to report.
+            // Every other guard below waves this through (nothing is stale,
+            // nothing is paper, and a bot without `expected_venues` reads as
+            // unknown-not-incomplete), so an unguarded net_worth_usd of 0.0
+            // would be written as an authoritative all-venues balance. Refuse
+            // it — a bot with a per-venue contract but zero entries is never
+            // ready, not merely unlucky. Checked FIRST, ahead of the other
+            // guards, because "not ready" is a more fundamental refusal than
+            // "ready but wrong".
+            if venues_not_yet_populated(&body) {
+                warn!(
+                    bot_id = %bot_id,
+                    "net-worth sampler: /status reports a venue breakdown with                      ZERO entries — the engine has not completed a venue cycle                      since this process started (startup window). Skipping                      rather than recording an empty-Vec net worth as an                      authoritative $0.00 across all venues."
+                );
+                metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                    .with_label_values(&[metrics::refusal::NOT_READY])
+                    .inc();
+                return None;
+            }
+
             // A real-money bot reporting a PAPER venue is a credential failure
             // wearing a healthy face: that venue holds fabricated cash which is
             // summed into net_worth_usd. Refuse before anything else looks at
@@ -994,7 +1067,7 @@ mod sampler {
         }
 
         /// The live funding bot's real body: reachable, 200, parseable, and
-        /// past all five existing guards — so if probe() still hands back a
+        /// past all six existing guards — so if probe() still hands back a
         /// reading, the open-position guard is not wired in.
         #[tokio::test]
         async fn probe_refuses_a_status_whose_net_worth_omits_an_open_position() {
@@ -1040,6 +1113,49 @@ mod sampler {
                 .await
                 .expect("an accounted figure must still be recorded");
             assert!((got.net_worth - 11_494.969_349_255_287).abs() < 1e-9);
+        }
+
+        /// THE BUG, reproduced end-to-end through the real HTTP + probe() path
+        /// (2026-08-13, confirmed live against a real funding-bot respawn).
+        ///
+        /// A respawn's `/status` server starts answering 200 OK before the
+        /// engine has completed a single venue cycle: `exchanges: []`,
+        /// `net_worth_usd: 0.0`, no `expected_venues` (the deployed funding
+        /// bot predates that field). On the OLD code path (`venue_entries`
+        /// returning a bare `Vec`, no `venues_not_yet_populated` guard) this
+        /// sailed through every other check and `probe()` handed back
+        /// `Some(NetWorthReading { net_worth: 0.0, .. })` — which
+        /// `sample_once` would then INSERT into `net_worth_snapshots` as a
+        /// real all-venues balance of $0.00, corrupting the treasury history
+        /// with a fake balance cliff.
+        ///
+        /// After the fix, `probe()` must refuse it — `None`, exactly like an
+        /// unreachable bot or a non-2xx response, so `sample_once` skips this
+        /// poll and tries again next tick instead of recording a zero.
+        #[tokio::test]
+        async fn probe_refuses_a_startup_window_status_instead_of_recording_zero() {
+            const STARTUP_WINDOW: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 0.0, "exchanges": []}"#;
+            let url = serve_status_once(STARTUP_WINDOW).await;
+            let got = NetWorthSampler::new().probe("crypto-funding", &url).await;
+            assert!(
+                got.is_none(),
+                "a startup-window body (venue array present but empty) must be                  refused, not recorded as an authoritative $0.00 net worth"
+            );
+
+            // Once the engine reports its first real venue, the SAME bot_id is
+            // recorded normally — proving this isn't a blanket ban on the bot,
+            // only on the not-ready window.
+            const READY: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 11190.0, "exchanges": [
+                {"exchange": "kucoin-futures", "mode": "paper",
+                 "total_value": 11190.0, "updated": 1785603708}]}"#;
+            let url2 = serve_status_once(READY).await;
+            let got2 = NetWorthSampler::new()
+                .probe("crypto-funding", &url2)
+                .await
+                .expect("once a venue has reported, the sample is recorded");
+            assert_eq!(got2.net_worth, 11190.0);
         }
     }
 }
@@ -1347,6 +1463,70 @@ mod tests {
             venue_set_is_complete(r#"{"expected_venues": 0, "exchanges": []}"#),
             None
         );
+    }
+
+    // ── startup window: empty venue array is NOT a checked zero (2026-08-13) ──
+    /// The exact shape the funding bot's `/status` serves for several seconds
+    /// after a respawn: the HTTP server is up (200 OK, valid JSON) but the
+    /// engine has not completed a single venue cycle, so `exchanges` is
+    /// published (crypto-bot-core always includes the key) as an EMPTY array
+    /// and `net_worth_usd` sums that empty set to 0.0. No `expected_venues`
+    /// field either — the deployed funding bot predates it — so
+    /// `venue_set_is_complete` reads this as unknown, not incomplete, and every
+    /// other guard in this file waves it through too (nothing to be stale,
+    /// nothing paper, no open positions to be unaccounted for). Before this
+    /// guard existed, that 0.0 would have been recorded as an authoritative
+    /// all-venues balance.
+    const STARTUP_WINDOW_STATUS: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+        "net_worth_usd": 0.0, "exchanges": []}"#;
+
+    #[test]
+    fn a_startup_window_body_is_not_yet_populated() {
+        assert!(
+            venues_not_yet_populated(STARTUP_WINDOW_STATUS),
+            "an empty-but-present venue array is the startup window, not a              checked-and-empty reading"
+        );
+        // Proof every OTHER guard waves it through — which is exactly why this
+        // check has to exist separately.
+        assert!(!has_fake_paper_venue(STARTUP_WINDOW_STATUS));
+        assert_eq!(
+            venue_set_is_complete(STARTUP_WINDOW_STATUS),
+            None,
+            "no expected_venues on this (real, deployed) body → unknown, not incomplete"
+        );
+        assert!(!open_positions_unaccounted(STARTUP_WINDOW_STATUS));
+        let r = parse_status_net_worth(STARTUP_WINDOW_STATUS).expect("parses");
+        assert_eq!(r.net_worth, 0.0, "the figure a naive sampler would have recorded");
+        assert!(
+            !reading_is_stale(r.updated, 1_785_656_153, 600),
+            "no stamp to check → unverifiable reads as fresh"
+        );
+    }
+
+    #[test]
+    fn a_bot_with_reported_venues_is_populated() {
+        // The normal case — at least one venue has reported — must NOT trip
+        // the new guard, or every healthy bot goes dark.
+        assert!(!venues_not_yet_populated(LIVE_SPOT_STATUS));
+        assert!(!venues_not_yet_populated(LIVE_FUNDING_STATUS));
+    }
+
+    #[test]
+    fn a_bot_with_no_venue_breakdown_at_all_is_unaffected() {
+        // A flat bot-level total with no `exchanges`/`venues` key is a
+        // DIFFERENT shape from the startup window — nothing to check, so it
+        // must not be refused as "not ready".
+        assert!(!venues_not_yet_populated(r#"{"net_worth_usd": 165.0}"#));
+        assert!(!venues_not_yet_populated("not json"));
+        assert!(!venues_not_yet_populated(""));
+    }
+
+    #[test]
+    fn an_empty_venues_key_is_also_caught() {
+        // Some bots publish `venues` rather than `exchanges` — must catch both.
+        assert!(venues_not_yet_populated(
+            r#"{"net_worth_usd": 0.0, "venues": []}"#
+        ));
     }
 
     // ── dry-run is REAL MONEY (2026-07-28 review finding) ───────────────────
