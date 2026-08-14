@@ -1496,7 +1496,10 @@ mod tests {
         );
         assert!(!open_positions_unaccounted(STARTUP_WINDOW_STATUS));
         let r = parse_status_net_worth(STARTUP_WINDOW_STATUS).expect("parses");
-        assert_eq!(r.net_worth, 0.0, "the figure a naive sampler would have recorded");
+        assert_eq!(
+            r.net_worth, 0.0,
+            "the figure a naive sampler would have recorded"
+        );
         assert!(
             !reading_is_stale(r.updated, 1_785_656_153, 600),
             "no stamp to check → unverifiable reads as fresh"
