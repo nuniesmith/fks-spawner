@@ -303,5 +303,35 @@ Hardened (auth + HTTP integration tests) and DB-backed in `fks_db`:
   phase); `EDGE_DECAY_INTERVAL_SECS` switches to a fixed-interval loop for
   testing. Schedule math + edge selection are pure and unit-tested; the loop is
   `db`-gated like the rest of the persistence layer.
+- **Boot-time bot reconciliation** (`src/boot_reconcile.rs`): closes the gap
+  found live 2026-08-13/14 — a host reboot brings every infra container back
+  via Docker's restart policy, but the spawner itself comes back tracking
+  ZERO bots, and live-money bot containers (spawned with no restart policy)
+  don't survive the reboot at all; nothing else re-read what was running and
+  brought it back, so a human had to notice and respawn both by hand. At
+  startup (awaited, right after the Postgres connect attempt and before the
+  HTTP listener starts), every active saved config with a `bot_id` has its
+  latest `bot_runs` row looked up **by container name** (`fks-bot-{bot_id}`
+  — the container may be gone entirely, so there is nothing left to
+  `inspect` by id). A row left OPEN (`running`/`spawning` — the exact signal
+  `supervisor::run_is_open` uses to tell a crash from a clean stop) means the
+  bot was never cleanly stopped via the API. Docker is asked for ground truth
+  BEFORE respawning anything: a bot already RUNNING is left untouched (so a
+  routine spawner-only redeploy, with the bots up the whole time, never
+  bounces them); a clean stop (`stopped`/`pruned`) is left down; an `error`
+  row (already handled by the crash-supervisor, restarted or deliberately
+  left down per that config's own `restart_policy`) is not second-guessed.
+  Respawns go through the SAME `respawn_from_config` path
+  `POST /configs/{name}/respawn` uses. DB-only, degrades to a logged no-op
+  without Postgres (never fails spawner boot); opt-out via
+  `BOOT_RECONCILE_ENABLED=false` (default on). Each respawn fires the
+  always-delivered `bot_restarted` notification with a boot-reconciliation
+  detail string, and increments `fks_spawner_boot_reconcile_respawns_total`.
+  The pure decision logic (`decide`) is unit-tested against the idempotency
+  (already-running), deliberate-decision (clean stop / already-errored), and
+  never-spawned cases. Does **not** eliminate the funding-bot
+  paper-journal-loss issue (container-local, no volume — separate, already
+  known) since a reconciled respawn still starts the bot fresh; it just does
+  so automatically instead of requiring a human to notice.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

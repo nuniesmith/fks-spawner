@@ -40,6 +40,12 @@
 //   EDGE_DECAY_WEEKDAY        weekly fire weekday, days-from-Sunday 0..=6 (default: 0 = Sun)
 //   EDGE_DECAY_HOUR_UTC       weekly fire hour, UTC 0..=23 (default: 16 = 12:00 EDT, before Sun 18:00 ET report)
 //   EDGE_DECAY_MINUTE_UTC     weekly fire minute, UTC 0..=59 (default: 0)
+//   BOOT_RECONCILE_ENABLED    boot-time bot reconciliation on/off (default: true; DB only).
+//                             Respawns any saved config's bot whose last bot_runs row was
+//                             left OPEN (never cleanly stopped via the API) and that is not
+//                             currently running in Docker — recovers live-money bots that a
+//                             host reboot removed outright (they run with no restart policy).
+//                             See crate::boot_reconcile
 //   RUST_LOG                  log level (default: info,spawner=debug)
 // =============================================================================
 
@@ -116,8 +122,42 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ── Shared handler state ───────────────────────────────────────────────────
+    // Built here (rather than just before the HTTP server) so boot-time
+    // reconciliation below — and every background task after it — can share
+    // ONE set of handles instead of the boot-reconcile path needing its own
+    // bespoke Docker/store plumbing.
+    #[cfg(feature = "db")]
+    let state = AppState {
+        docker,
+        config: config.clone(),
+        store,
+    };
+    #[cfg(not(feature = "db"))]
+    let state = AppState {
+        docker,
+        config: config.clone(),
+    };
+
+    // ── Boot-time bot reconciliation ─────────────────────────────────────────
+    // THE GAP THIS CLOSES: a host reboot brings every infra container back via
+    // Docker's restart policy, but the spawner comes back tracking ZERO bots —
+    // and live-money bot containers (spawned with no restart policy) don't
+    // survive the reboot at all. Nothing else re-reads what was running before
+    // and brings it back. Respawns any saved config's bot whose last bot_runs
+    // row was left OPEN (never cleanly stopped via the API) and that is not
+    // currently running in Docker — idempotent against a routine spawner-only
+    // redeploy (a bot Docker reports as already running is left untouched).
+    // DB-only; degrades to a logged no-op without Postgres. Opt-out via
+    // BOOT_RECONCILE_ENABLED=false (default on). See crate::boot_reconcile.
+    // Awaited (not detached) so the box is fully reconciled — or has clearly
+    // logged why it skipped — before the HTTP listener starts accepting
+    // traffic below.
+    #[cfg(feature = "db")]
+    spawner::boot_reconcile::run(&state).await;
+
     // ── Initial SD file write ──────────────────────────────────────────────────
-    prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
+    prometheus_sd::update_sd_file(state.docker.as_ref(), &config).await;
 
     // ── Background: net-worth sampler task ─────────────────────────────────────
     // Polls each running bot's /status endpoint on an interval and appends
@@ -125,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
     // and best-effort (a bot that doesn't expose net worth is skipped, never
     // fatal). See crate::net_worth for the contract.
     #[cfg(feature = "db")]
-    if let Some(store_sampler) = store.clone() {
-        let docker_sampler: Arc<dyn DockerOps> = docker.clone();
+    if let Some(store_sampler) = state.store.clone() {
+        let docker_sampler: Arc<dyn DockerOps> = state.docker.clone();
         let config_sampler = config.clone();
         // Supervised: a panic inside the sampler must not permanently stop
         // notification_log pruning + stale-backtest sweeps. The factory clones
@@ -161,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
     // Holds no keys — it can only READ. See crate::btc_watch.
     #[cfg(feature = "db")]
     if config.btc_watch.enabled() {
-        if let Some(store_btc) = store.clone() {
+        if let Some(store_btc) = state.store.clone() {
             let config_btc = config.clone();
             tokio::spawn(async move {
                 spawner::btc_watch::run_watcher(config_btc, store_btc).await;
@@ -192,7 +232,7 @@ async fn main() -> anyhow::Result<()> {
     // crate::rithmic_sampler.
     #[cfg(feature = "db")]
     if config.rithmic_sampler.enabled() {
-        if let Some(store_rithmic) = store.clone() {
+        if let Some(store_rithmic) = state.store.clone() {
             let config_rithmic = config.rithmic_sampler.clone();
             tokio::spawn(async move {
                 spawner::rithmic_sampler::run_sampler(config_rithmic, store_rithmic).await;
@@ -209,19 +249,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         info!("rithmic balance sampler disabled (set RITHMIC_SAMPLER_URL to enable)");
     }
-
-    // ── Shared handler state ───────────────────────────────────────────────────
-    #[cfg(feature = "db")]
-    let state = AppState {
-        docker,
-        config: config.clone(),
-        store,
-    };
-    #[cfg(not(feature = "db"))]
-    let state = AppState {
-        docker,
-        config: config.clone(),
-    };
 
     // ── Background: crash-aware reconcile + prune supervisor ────────────────────
     // Replaces the old naive auto-prune. Every `prune_interval_secs` it:
