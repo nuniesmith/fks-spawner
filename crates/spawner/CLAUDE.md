@@ -175,6 +175,35 @@ added as a parallel check elsewhere.**
   dedicated readiness flag) over a bare `Vec`/default-empty value that a
   downstream reader cannot tell apart from "not ready".**
 
+- **`source = bot_status_unverified` — a distinct provenance tag, not a sixth
+  refusal.** Every guard above either records or REFUSES a reading; this is
+  orthogonal — a reading passes every guard and IS recorded, but tagged
+  `NetWorthReading::unverified` when it could not be independently confirmed
+  against real-money evidence, so `NetWorthSnapshot::from_reading` writes
+  `source = bot_status_unverified` instead of the normal `bot_status`
+  (2026-07-31 audit gaps 5 & 11). Two cases set it: (1) no real-money venue
+  exists at all — a wholly-paper bot (the funding bot's only venue is
+  `mode=paper`), so `real_money_venue_stamps` is always empty and there is
+  nothing to independently confirm freshness against; before this, such a
+  bot's `updated` stamp fell straight to `None` and `reading_is_stale(None,
+  ..)` read that as fresh forever — confirmed live: 241 consecutive identical
+  rows over 20h01m, every guard green. (2) the bot holds an open position
+  materially fresher than its newest venue-total stamp with no
+  `net_worth_usd_complete` declaration (`positions_outrun_venue_total`) — the
+  figure may be realized cash silently missing unrealized PnL, the LEGACY half
+  of the `open_positions_unaccounted` guard's gap (that guard only refuses an
+  *explicit* `false`; an *absent* field is recorded per the #43 fix, and this
+  is what flags that recorded figure instead of asserting it as normal). For
+  case (1), `parse_status_net_worth` also now derives `updated` from the
+  freshest `positions[].updated` mark when no real-money stamp exists —
+  positions-ONLY, deliberately never folded in with a paper venue's own
+  `updated` (that would re-arm staleness on an idle-but-healthy flat paper
+  bot — the #35 regression). `fks_spawner_net_worth_unverifiable_total`
+  counts every row written this way, mirroring how `bot_status_stale` (015
+  migration) marks a frozen one — except this is written directly by the
+  sampler, never retroactively, and is NOT excluded from `/treasury`/`/profit`
+  reads (the figure is the best available one, just not broker-confirmed).
+
 ## Common workflows
 
 ### Spawn a bot from curl

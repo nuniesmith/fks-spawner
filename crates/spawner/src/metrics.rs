@@ -99,6 +99,28 @@ pub static BOOT_RECONCILE_RESPAWNS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Net-worth samples RECORDED (not refused) that could not be independently
+/// confirmed against real-money evidence — `source = bot_status_unverified`
+/// (2026-07-31 audit gap 5). Before this existed, a wholly-paper bot (the
+/// funding bot: its only venue is `mode=paper`) had NO way to be flagged
+/// stale OR flagged fresh-with-confidence — `reading_is_stale(None, ..)`
+/// silently read "nothing to check" as "fresh", and 241 consecutive
+/// identical rows were written over 20h01m with every guard green. This
+/// counter makes that distinct state visible and alertable instead of
+/// indistinguishable from a normally-verified reading. Also covers gap 11:
+/// an open position materially fresher than the newest venue-total stamp
+/// with no completeness declaration (the figure may be realized cash
+/// silently missing unrealized PnL). Query with
+/// `increase(fks_spawner_net_worth_unverifiable_total[1h])`.
+pub static NET_WORTH_UNVERIFIABLE_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "fks_spawner_net_worth_unverifiable_total",
+        "Net-worth rows recorded with source=bot_status_unverified — no real-money venue \
+         stamp to check, or an open position materially fresher than the venue total"
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Gauges
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,6 +330,7 @@ pub fn render() -> String {
     let _ = &*NOTIFY_FAILED_TOTAL;
     let _ = &*NET_WORTH_SNAPSHOTS_TOTAL;
     let _ = &*BOOT_RECONCILE_RESPAWNS_TOTAL;
+    let _ = &*NET_WORTH_UNVERIFIABLE_TOTAL;
     let _ = &*RUNNING_BOTS;
     let _ = &*LIVE_BOTS_RUNNING;
     let _ = &*CRASHED_BOTS;

@@ -73,6 +73,23 @@ pub struct NetWorthReading {
     /// publishes one. `None` = the bot does not report freshness, so the
     /// reading cannot be staleness-checked (recorded, as before).
     pub updated: Option<u64>,
+    /// Could this reading be independently confirmed against REAL-MONEY
+    /// evidence? `false` (verified) when at least one non-paper venue
+    /// supplied the `updated` stamp above, or when the bot explicitly
+    /// vouches for its figure (`net_worth_usd_complete: true`). `true` when
+    /// either: (gap #5) no real-money venue exists to check at all — a
+    /// wholly-paper bot's `updated` stamp above may still be `Some` (an open
+    /// position's mark, folded in below) but nothing here is a broker
+    /// balance; or (gap #11) the bot holds open positions materially
+    /// fresher than its newest venue-total stamp with no completeness
+    /// declaration, so the figure may be realized cash silently missing
+    /// unrealized PnL. Recorded either way — a gap in the series is honest,
+    /// refusing an unverifiable-but-plausible figure is the #35/#43
+    /// regression shape — but tagged `SOURCE_BOT_STATUS_UNVERIFIED` rather
+    /// than asserted as a normal, fully-verified `bot_status` row. See the
+    /// 2026-07-31 audit gaps 5 & 11 (241 identical rows over 20h; realized
+    /// cash silently standing in for net worth).
+    pub unverified: bool,
 }
 
 /// One row destined for `net_worth_snapshots`. `ts` is intentionally omitted —
@@ -106,6 +123,20 @@ pub const SOURCE_BOT_STATUS: &str = "bot_status";
 /// Retained for the audit trail; EXCLUDED from every read path so derived
 /// figures are computed only from readings that were actually fresh.
 pub const SOURCE_BOT_STATUS_STALE: &str = "bot_status_stale";
+/// A `bot_status` row the sampler recorded but could NOT independently
+/// confirm against real-money evidence (2026-07-31 audit gaps 5 & 11):
+/// either no real-money venue exists to check freshness against (a wholly
+/// paper bot — e.g. the deployed funding bot), or the bot holds open
+/// positions materially fresher than its newest venue-total stamp with no
+/// completeness declaration, so the figure may be realized cash missing
+/// unrealized PnL. UNLIKE `bot_status_stale`, this is written directly by
+/// the sampler (`NetWorthSnapshot::from_reading`) — never retroactively —
+/// and is NOT excluded from read paths: the figure is the best available
+/// one, just not broker-confirmed, so `/treasury` and `/profit` keep using
+/// it. It exists purely so a reader (or a future alert) can tell an
+/// observed-but-unverified figure from a normally-verified one, mirroring
+/// what `bot_status_stale` does for a frozen one.
+pub const SOURCE_BOT_STATUS_UNVERIFIED: &str = "bot_status_unverified";
 pub const SOURCE_ONCHAIN: &str = "onchain";
 pub const SOURCE_RITHMIC: &str = "rithmic";
 pub const SOURCE_MANUAL: &str = "manual";
@@ -188,14 +219,24 @@ pub fn milestone_baseline(current: f64, step: f64) -> f64 {
 
 impl NetWorthSnapshot {
     /// Build a snapshot row for `bot_id` from a parsed `/status` reading,
-    /// tagging it as sampler-sourced (`source = bot_status`).
+    /// tagging it `source = bot_status` — or `bot_status_unverified` when the
+    /// reading could not be independently confirmed against real-money
+    /// evidence (see [`NetWorthReading::unverified`]). Either way the row is
+    /// recorded; only the provenance tag differs, so a reader can tell an
+    /// observed-but-unverified figure from a normally-verified one instead of
+    /// the two being silently indistinguishable (2026-07-31 audit gap 5).
     pub fn from_reading(bot_id: impl Into<String>, reading: NetWorthReading) -> Self {
+        let source = if reading.unverified {
+            SOURCE_BOT_STATUS_UNVERIFIED
+        } else {
+            SOURCE_BOT_STATUS
+        };
         Self {
             bot_id: bot_id.into(),
             net_worth: reading.net_worth,
             currency: reading.currency,
             venue: reading.venue,
-            source: SOURCE_BOT_STATUS.to_string(),
+            source: source.to_string(),
         }
     }
 
@@ -354,18 +395,53 @@ pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     // Conflating the two took the funding bot's treasury series offline for
     // 15 hours on 2026-07-27: 176 consecutive skips against a stamp that was
     // 15.5h old BY DESIGN. Idle is not blind.
-    let updated = real_money_venue_stamps(&v).into_iter().min().or_else(|| {
+    let real_stamps = real_money_venue_stamps(&v);
+    let has_real_money_stamp = !real_stamps.is_empty();
+    // GAP #5 (2026-07-31 audit): when there is NO real-money venue at all — a
+    // wholly-paper bot, the funding bot's actual deployed shape — the block
+    // above has nothing to check, `updated` fell straight to `None`, and
+    // `reading_is_stale(None, ..)` reads that as FRESH forever. Confirmed
+    // live: 241 consecutive identical rows over 20h01m, every guard green,
+    // because none of them can see a paper-only bot's actual liveness.
+    //
+    // The bot's own payload carries better evidence sitting unused: an open
+    // position's `updated` mark, refreshed every price cycle independent of
+    // whether a trade closes (`positions[0].updated` was 68,394s FRESHER than
+    // the venue stamp the old code keyed off). Deliberately positions-ONLY,
+    // never folded in with a paper venue's own `updated` — that venue stamp
+    // only advances on a trade CLOSE, so using it here would re-arm
+    // staleness on an idle-but-healthy flat paper bot, which is the #35
+    // regression (15 hours dark) this file exists to prevent. A flat bot
+    // with no open positions has no new evidence and stays exactly as
+    // unrefuted as before — this fallback can only ever make a MARKING bot
+    // provably alive, never make an IDLE one newly blind.
+    let updated = if has_real_money_stamp {
+        real_stamps.into_iter().min()
+    } else {
+        freshest_position_mark(&v)
+    }
+    .or_else(|| {
         UPDATED_KEYS
             .iter()
             .find_map(|k| v.get(*k).and_then(value_as_f64))
             .filter(|n| *n > 0.0)
             .map(|n| n as u64)
     });
+    // GAP #11 (2026-07-31 audit): `open_positions_unaccounted` already
+    // refuses an explicit `net_worth_usd_complete: false`. This is the OTHER
+    // half — a LEGACY body (field absent, e.g. the currently-deployed
+    // funding bot) is still recorded by that guard, but if its open
+    // position's mark is materially fresher than the newest venue-total
+    // stamp, the figure is likely realized cash that hasn't picked up the
+    // position's unrealized swing. Still recorded (refusing it is the #43
+    // regression shape), just not asserted as normal fully-verified.
+    let unverified = !has_real_money_stamp || positions_outrun_venue_total(&v);
     Some(NetWorthReading {
         net_worth,
         currency,
         venue,
         updated,
+        unverified,
     })
 }
 
@@ -505,6 +581,85 @@ pub fn open_positions_unaccounted(body: &str) -> bool {
         // bot that predates it. Coverage arrives when the bot image is rebuilt.
         None => false,
     }
+}
+
+/// The freshest `positions[].updated` stamp in a `/status` body, or `None`
+/// when there are no open positions (or none carry a stamp).
+///
+/// This is the ONLY new liveness evidence folded into the no-real-money-stamp
+/// case (gap #5, 2026-07-31 audit). Venue stamps are deliberately EXCLUDED
+/// from this fallback even though `parse_status_net_worth` also examines
+/// them elsewhere: every venue present in that branch is, by construction,
+/// paper (`real_money_venue_stamps` was empty), and a paper venue's account
+/// snapshot only advances on a trade CLOSE — folding it in here would re-arm
+/// staleness on an idle-but-healthy FLAT paper bot, which is the #35
+/// regression (15 hours dark) this file exists to prevent. An open
+/// position's mark, by contrast, is refreshed on every price cycle
+/// independent of whether a trade closes — genuine, bot-supplied evidence of
+/// life that a flat bot simply does not have.
+fn freshest_position_mark(v: &serde_json::Value) -> Option<u64> {
+    v.get("positions")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.get("updated").and_then(value_as_f64))
+        .filter(|n| *n > 0.0)
+        .map(|n| n as u64)
+        .max()
+}
+
+/// How much fresher an open position's mark must be than the newest venue
+/// stamp before it counts as evidence the venue total is behind, not just
+/// clock/poll jitter. Gap #11's live example was 14–19 HOURS fresher;
+/// deliberately much smaller here so the tag catches genuine drift promptly
+/// rather than needing another multi-hour audit to notice it.
+const POSITION_MATERIALLY_FRESHER_SECS: u64 = 60;
+
+/// Does the bot report an open position materially fresher than the newest
+/// venue-total stamp, with no completeness declaration to say the total
+/// already accounts for it?
+///
+/// `open_positions_unaccounted` already refuses an explicit
+/// `net_worth_usd_complete: false` outright — this body would never reach
+/// here in that case (the guard chain returns first). A `true` declaration
+/// means the bot vouches for the figure, so this is a no-op for it too. The
+/// gap this covers is the LEGACY case — the field ABSENT entirely, e.g. the
+/// currently-deployed funding bot, whose image predates the field
+/// (`open_positions_unaccounted` records it, per the #43 fix). Its own
+/// payload still shows the tell: `positions[].updated` running fresher than
+/// `exchanges[].updated`, because the venue snapshot only moves on a CLOSE
+/// while the position marks every cycle (2026-08-02 live measurement: 14h;
+/// 2026-07-31 audit measurement: 19h). Recorded either way — refusing it is
+/// the #43 regression shape — but this signals the figure should be tagged
+/// unverified rather than asserted as normal.
+fn positions_outrun_venue_total(v: &serde_json::Value) -> bool {
+    if v.get("net_worth_usd_complete")
+        .and_then(|c| c.as_bool())
+        .is_some()
+    {
+        return false; // the bot vouched (true), or was already refused (false)
+    }
+    let Some(venues) = venue_entries(v) else {
+        return false; // no per-venue breakdown at all — nothing to compare against
+    };
+    let position_max = v
+        .get("positions")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.get("updated").and_then(value_as_f64))
+        .filter(|n| *n > 0.0)
+        .map(|n| n as u64)
+        .max();
+    let Some(position_max) = position_max else {
+        return false; // no open positions (or no stamped ones) — nothing to flag
+    };
+    let venue_max = venues
+        .into_iter()
+        .filter_map(|e| e.updated)
+        .max()
+        .unwrap_or(0);
+    position_max.saturating_sub(venue_max) > POSITION_MATERIALLY_FRESHER_SECS
 }
 
 /// `updated` stamps for venues holding REAL money.
@@ -651,10 +806,10 @@ mod sampler {
     use tracing::{debug, warn};
 
     use super::{
-        MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, detect_milestone,
-        has_fake_paper_venue, milestone_baseline, now_epoch_secs, open_positions_unaccounted,
-        parse_status_net_worth, parse_venue_freshness, reading_is_stale, running_status_targets,
-        venue_set_is_complete, venues_not_yet_populated,
+        MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, SOURCE_BOT_STATUS_UNVERIFIED,
+        detect_milestone, has_fake_paper_venue, milestone_baseline, now_epoch_secs,
+        open_positions_unaccounted, parse_status_net_worth, parse_venue_freshness,
+        reading_is_stale, running_status_targets, venue_set_is_complete, venues_not_yet_populated,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -750,9 +905,22 @@ mod sampler {
                 match store.record_net_worth(&snap).await {
                     Ok(()) => {
                         metrics::NET_WORTH_SNAPSHOTS_TOTAL.inc();
+                        if snap.source == SOURCE_BOT_STATUS_UNVERIFIED {
+                            // Gap #5/#11 (2026-07-31 audit): recorded, but
+                            // could not be confirmed against real-money
+                            // evidence — make that visible/alertable rather
+                            // than indistinguishable from a normal, fully
+                            // verified `bot_status` row. `eligible_readings`
+                            // already baked this into `snap.source` via
+                            // `NetWorthSnapshot::from_reading` — check the
+                            // tag directly rather than threading a second
+                            // `unverified` bool through the return type.
+                            metrics::NET_WORTH_UNVERIFIABLE_TOTAL.inc();
+                        }
                         debug!(
                             bot_id = %snap.bot_id,
                             currency = %snap.currency,
+                            source = %snap.source,
                             "net-worth sampler: snapshot recorded"
                         );
                         recorded.push((snap.bot_id, snap.net_worth));
@@ -1236,6 +1404,7 @@ mod sampler {
                 btc_watch: crate::btc_watch::BtcWatchConfig::default(),
                 rithmic_sampler: crate::rithmic_sampler::RithmicSamplerConfig::default(),
                 edge_decay: crate::edge_decay::EdgeDecayConfig::default(),
+                boot_reconcile_enabled: true,
             }
         }
 
@@ -1317,6 +1486,71 @@ mod sampler {
                 new, None,
                 "500 alone hasn't crossed the first 1000-step boundary — no false \
                  crossing fired off a row the guard chain refused to refresh"
+            );
+        }
+
+        /// GAP #5 (2026-07-31 audit), driven through the real HTTP + probe()
+        /// path: a paper-only bot with an open position. Before the fix,
+        /// `real_money_venue_stamps` was empty (the only venue is paper), so
+        /// `updated` fell straight to `None` — nothing to check, read as
+        /// fresh forever. The bot's own payload has better evidence sitting
+        /// unused: the open position's `updated` mark, refreshed every price
+        /// cycle independent of whether a trade closes. This proves `probe()`
+        /// now surfaces that evidence instead of handing back a reading with
+        /// nothing to check.
+        #[tokio::test]
+        async fn probe_establishes_liveness_from_an_open_positions_mark_when_no_venue_can_vouch() {
+            const FUNDING_WITH_OPEN_POSITION: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 11288.306994792156, "exchanges": [
+                {"exchange": "kucoin-futures", "mode": "paper",
+                 "total_value": 11288.306994792156, "updated": 1785603708}],
+                "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 6.888745148771025,
+                 "updated": 1785654051}]}"#;
+            let url = serve_status_once(FUNDING_WITH_OPEN_POSITION).await;
+            let got = NetWorthSampler::new()
+                .probe("crypto-funding", &url)
+                .await
+                .expect("a legacy body with an open position is still recorded (#43)");
+            assert_eq!(
+                got.updated,
+                Some(1_785_654_051),
+                "the position's own mark — not None — establishes liveness where the \
+                 old code had nothing to check at all"
+            );
+            assert!(
+                got.unverified,
+                "no real-money venue exists to confirm it, so it must be flagged"
+            );
+        }
+
+        /// THE 241-IDENTICAL-ROWS SCENARIO, reproduced end-to-end through the
+        /// real HTTP + probe() + snapshot-building path (2026-07-31 audit
+        /// gap 5, re-confirmed live: `crypto-funding` recorded the SAME
+        /// figure 241 times over 20h01m, every guard green, `source =
+        /// 'bot_status'` — indistinguishable from 241 independent
+        /// observations). This proves the row this scenario produces is now
+        /// tagged `bot_status_unverified`, not the plain `bot_status` a
+        /// reader would mistake for a normally-verified fresh figure.
+        #[tokio::test]
+        async fn probe_tags_the_241_identical_rows_scenario_as_unverified_not_plain_fresh() {
+            const FROZEN_LOOKING_FUNDING_BOT: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 11251.550536296350000000, "exchanges": [
+                {"exchange": "kucoin-futures", "mode": "paper",
+                 "total_value": 11251.550536296350000000, "updated": 1785402020}],
+                "positions": [{"symbol": "AVAXUSDTM", "ret_pct": -0.509,
+                 "updated": 1785470414}]}"#;
+            let url = serve_status_once(FROZEN_LOOKING_FUNDING_BOT).await;
+            let reading = NetWorthSampler::new()
+                .probe("crypto-funding", &url)
+                .await
+                .expect("recorded — a gap in the series is honest, but this reading is not one");
+            let snap = NetWorthSnapshot::from_reading("crypto-funding", reading);
+            assert_eq!(
+                snap.source,
+                crate::net_worth::SOURCE_BOT_STATUS_UNVERIFIED,
+                "this exact shape — paper-only venue, no real-money stamp — is what \
+                 wrote 241 rows tagged plain 'bot_status' in production; it must now \
+                 be visibly distinct instead of reading as normal verified-fresh data"
             );
         }
     }
@@ -1419,13 +1653,34 @@ mod tests {
             "#38: no expected_venues → unknown, not incomplete"
         );
         let r = parse_status_net_worth(LIVE_FUNDING_STATUS).expect("parses");
+        // UPDATED for gap #5 (2026-07-31 audit): the sole venue is still
+        // paper, so there is STILL no real-money stamp — but the open
+        // position's own mark (1785654051, fresher than the venue's
+        // 1785603708) is now consulted, so this is no longer blind. Before
+        // this fix `r.updated` was `None` here and the reading was
+        // unrefuted-not-verified; that was exactly the 241-identical-row gap.
         assert_eq!(
-            r.updated, None,
-            "#35: a paper venue contributes no stamp — idle is not blind"
+            r.updated,
+            Some(1_785_654_051),
+            "the freshest evidence available — the position's own mark, not \
+             the (older, paper-so-excluded) venue snapshot"
         );
         assert!(
-            !reading_is_stale(r.updated, 1_785_656_153, 600),
-            "#32: unverifiable reads as fresh"
+            r.unverified,
+            "no REAL-MONEY venue stamp exists, so the row is recorded but \
+             flagged, not silently asserted as verified fresh"
+        );
+        assert!(
+            !reading_is_stale(r.updated, 1_785_654_051 + 120, 600),
+            "close to the position's own mark — not stale"
+        );
+        // The 241-identical-rows scenario itself: 20+ hours later with NO new
+        // evidence anywhere (the bot has genuinely gone dark), this is now
+        // caught rather than reading as fresh forever.
+        assert!(
+            reading_is_stale(r.updated, 1_785_654_051 + 20 * 3600 + 61, 600),
+            "gap #5: 20+ hours with nothing new must be refused, not recorded \
+             as the 242nd identical row"
         );
         assert_eq!(
             r.net_worth, 11_288.306_994_792_156,
@@ -1529,6 +1784,74 @@ mod tests {
         assert!(
             !open_positions_unaccounted(zero),
             "an explicit 0 count is a statement, not a missing field"
+        );
+    }
+
+    // ── gap #11 continued: record-but-tag, not refuse (2026-07-31 audit) ────
+    /// `open_positions_unaccounted` records a LEGACY body (no
+    /// `net_worth_usd_complete` field). This is the OTHER half of gap #11:
+    /// that recorded figure is realized cash that dropped ~$15 of unrealized
+    /// PnL on a position marking 14–19h fresher than the venue total in the
+    /// live incidents — so it must be tagged unverified, not asserted as a
+    /// normal fully-verified reading.
+    #[test]
+    fn a_legacy_body_with_a_fresher_open_position_is_recorded_but_flagged() {
+        let body = r#"{"bot": "kucoin-futures", "mode": "paper",
+            "net_worth_usd": 11288.306994792156, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "paper",
+             "total_value": 11288.306994792156, "updated": 1785603708}],
+            "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 6.84,
+             "updated": 1785654051}]}"#;
+        assert!(
+            !open_positions_unaccounted(body),
+            "a bot that cannot declare completeness is still recorded (#43)"
+        );
+        let r = parse_status_net_worth(body).expect("parses");
+        assert!(
+            r.unverified,
+            "the position's mark (1785654051) is materially fresher than the \
+             venue total (1785603708) with no completeness declaration — the \
+             figure may be pre-trade cash, so it must be flagged"
+        );
+    }
+
+    /// A bot that explicitly VOUCHES for its figure (`net_worth_usd_complete:
+    /// true`) must not be flagged by the freshness heuristic — its word beats
+    /// our inference, exactly like the sibling guard.
+    #[test]
+    fn a_bot_that_vouches_is_not_flagged_by_the_freshness_heuristic() {
+        // A LIVE (real-money) bot so gap #5's own condition can't also be
+        // driving the flag — isolates gap #11 alone.
+        let body = r#"{"bot": "kucoin-futures", "mode": "live",
+            "net_worth_usd": 11494.97, "net_worth_usd_complete": true,
+            "exchanges": [{"exchange": "kucoin-futures", "mode": "live",
+             "total_value": 11288.306994792156, "updated": 1785603708}],
+            "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 6.888745148771025,
+             "updated": 1785654051}]}"#;
+        let r = parse_status_net_worth(body).expect("parses");
+        assert!(
+            !r.unverified,
+            "a real-money venue stamp exists AND the bot vouches — fully verified"
+        );
+    }
+
+    /// Positions that are NOT materially fresher than the venue total (same
+    /// tick, or the venue is actually the fresher one) are not flagged — this
+    /// heuristic exists to catch genuine drift, not to flag every open
+    /// position on principle.
+    #[test]
+    fn positions_no_fresher_than_the_venue_total_are_not_flagged() {
+        let body = r#"{"bot": "kucoin-futures", "mode": "live",
+            "net_worth_usd": 100.0, "exchanges": [
+            {"exchange": "kucoin-futures", "mode": "live",
+             "total_value": 100.0, "updated": 1785603708}],
+            "positions": [{"symbol": "AVAXUSDTM", "ret_pct": 1.0,
+             "updated": 1785603709}]}"#;
+        assert!(
+            !positions_outrun_venue_total(
+                &serde_json::from_str::<serde_json::Value>(body).unwrap()
+            ),
+            "one second fresher is jitter, not drift"
         );
     }
 
@@ -2016,6 +2339,7 @@ mod tests {
             currency: "USD".to_string(),
             venue: Some("kucoin".to_string()),
             updated: None,
+            unverified: false,
         };
         let snap = NetWorthSnapshot::from_reading("eth-scalper", reading);
         assert_eq!(snap.bot_id, "eth-scalper");
@@ -2023,6 +2347,22 @@ mod tests {
         assert_eq!(snap.currency, "USD");
         assert_eq!(snap.venue.as_deref(), Some("kucoin"));
         assert_eq!(snap.source, SOURCE_BOT_STATUS);
+    }
+
+    #[test]
+    fn snapshot_from_reading_tags_unverified_when_the_reading_says_so() {
+        // Gap #5/#11 (2026-07-31 audit): a reading the sampler could not
+        // confirm against real-money evidence must be tagged distinctly, not
+        // asserted as a normal, fully-verified `bot_status` row.
+        let reading = NetWorthReading {
+            net_worth: 11_288.31,
+            currency: "USD".to_string(),
+            venue: None,
+            updated: Some(1_785_654_051),
+            unverified: true,
+        };
+        let snap = NetWorthSnapshot::from_reading("crypto-funding", reading);
+        assert_eq!(snap.source, SOURCE_BOT_STATUS_UNVERIFIED);
     }
 
     #[test]
