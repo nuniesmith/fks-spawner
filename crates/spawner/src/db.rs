@@ -289,6 +289,33 @@ impl BotRunStore {
         Ok(row.map(|r| r.get::<String, _>("status")))
     }
 
+    /// Latest `bot_runs` status by container NAME (`fks-bot-{bot_id}`) — the
+    /// newest row across every container id that name has ever run under (a
+    /// respawn keeps the name but mints a fresh container_id). Mirrors
+    /// [`run_status`](Self::run_status), which keys on container_id instead.
+    ///
+    /// Used by boot-time reconciliation (`crate::boot_reconcile`): after a
+    /// host reboot, a bot container spawned with no restart policy is gone
+    /// entirely — there is no container left to `inspect`/look up by id, only
+    /// the ledger row naming it. This is how a still-open ("running") row is
+    /// found for a bot that no longer exists in Docker at all.
+    pub async fn latest_run_status_by_container_name(
+        &self,
+        container_name: &str,
+    ) -> Result<Option<String>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT status FROM bot_runs \
+             WHERE container_name = $1 \
+             ORDER BY started_at DESC \
+             LIMIT 1",
+        )
+        .bind(container_name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(row.map(|r| r.get::<String, _>("status")))
+    }
+
     /// Recent run history — newest first. Limit is clamped to 1..=500.
     pub async fn recent_runs(&self, limit: i64) -> Result<Vec<BotRunRow>, SpawnerError> {
         let limit = limit.clamp(1, 500);

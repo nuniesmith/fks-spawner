@@ -12,6 +12,8 @@
 
 pub mod api;
 pub mod auth;
+#[cfg(feature = "db")]
+pub mod boot_reconcile;
 pub mod btc_watch;
 pub mod config;
 #[cfg(feature = "db")]

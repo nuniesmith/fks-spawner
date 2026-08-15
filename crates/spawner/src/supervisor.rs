@@ -173,7 +173,12 @@ pub struct SweepPlan {
     pub crashed_present: usize,
 }
 
-fn run_is_open(status: Option<&str>) -> bool {
+/// An "open" `bot_runs` status — the row was never closed via a clean stop,
+/// prune, or crash-record, i.e. the bot looked running the last time anyone
+/// wrote to its ledger. Shared with `crate::boot_reconcile`, which uses the
+/// exact same signal to decide whether a bot was running when the process
+/// (or host) disappeared out from under it.
+pub(crate) fn run_is_open(status: Option<&str>) -> bool {
     matches!(status, Some("spawning") | Some("running"))
 }
 fn run_is_error(status: Option<&str>) -> bool {

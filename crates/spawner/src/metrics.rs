@@ -82,6 +82,23 @@ pub static NET_WORTH_SNAPSHOTS_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Bots auto-respawned by boot-time reconciliation (`crate::boot_reconcile`):
+/// a saved config whose last `bot_runs` row was left OPEN (never cleanly
+/// stopped via the API) and that was NOT already running in Docker when the
+/// spawner started. Non-zero after a boot means the process came back after
+/// something took its bots down out-of-band — a host reboot removing
+/// no-restart-policy live-money containers being the motivating case
+/// (2026-08-13/14). Zero on a routine spawner-only redeploy, where the bots
+/// were found already running and left untouched.
+pub static BOOT_RECONCILE_RESPAWNS_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "fks_spawner_boot_reconcile_respawns_total",
+        "Bots auto-respawned at spawner startup because their last known state was running \
+         but they were not found running in Docker (crash/reboot recovery, not a clean stop)"
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Gauges
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,6 +307,7 @@ pub fn render() -> String {
     let _ = &*NOTIFY_SENT_TOTAL;
     let _ = &*NOTIFY_FAILED_TOTAL;
     let _ = &*NET_WORTH_SNAPSHOTS_TOTAL;
+    let _ = &*BOOT_RECONCILE_RESPAWNS_TOTAL;
     let _ = &*RUNNING_BOTS;
     let _ = &*LIVE_BOTS_RUNNING;
     let _ = &*CRASHED_BOTS;
@@ -423,7 +441,13 @@ mod tests {
         // at alerts that cannot fire.
         const SRC: &str = include_str!("net_worth.rs");
 
-        for r in ["STALE", "INCOMPLETE", "FAKE_PAPER", "UNACCOUNTED", "NOT_READY"] {
+        for r in [
+            "STALE",
+            "INCOMPLETE",
+            "FAKE_PAPER",
+            "UNACCOUNTED",
+            "NOT_READY",
+        ] {
             assert!(
                 SRC.contains(&format!("refusal::{r}")),
                 "net_worth.rs must label a refusal with refusal::{r} — otherwise the \

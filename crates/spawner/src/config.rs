@@ -145,6 +145,17 @@ pub struct Config {
     /// on a weekly cadence so the advisor's Sunday report has a fresh point to
     /// compare. See `crate::edge_decay`.
     pub edge_decay: EdgeDecayConfig,
+
+    /// Boot-time bot reconciliation (`crate::boot_reconcile`). ON by default —
+    /// the whole point is safety-by-default: after a host reboot, live-money
+    /// bot containers spawned with no restart policy don't come back at all,
+    /// and nothing else re-reads what was running before and brings it back.
+    /// At startup, a saved config whose last `bot_runs` row was left OPEN
+    /// (never cleanly stopped via the API) and that isn't already running in
+    /// Docker is respawned from that config. Set `BOOT_RECONCILE_ENABLED=false`
+    /// to disable for a deploy scenario that wants manual control instead. Env:
+    /// BOOT_RECONCILE_ENABLED.
+    pub boot_reconcile_enabled: bool,
 }
 
 impl Config {
@@ -187,6 +198,7 @@ impl Config {
             btc_watch: BtcWatchConfig::from_env(),
             rithmic_sampler: RithmicSamplerConfig::from_env(),
             edge_decay: EdgeDecayConfig::from_env(),
+            boot_reconcile_enabled: env_parse_bool("BOOT_RECONCILE_ENABLED", true),
         }
     }
 
@@ -262,6 +274,7 @@ mod tests {
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
+            boot_reconcile_enabled: true,
         };
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8090");
         assert!(
@@ -301,6 +314,7 @@ mod tests {
             btc_watch: BtcWatchConfig::default(),
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
+            boot_reconcile_enabled: true,
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");
     }
