@@ -699,17 +699,29 @@ mod sampler {
         /// One sweep: list running bots, probe each for net worth, insert a row
         /// per bot that reports it. BEST-EFFORT throughout — every failure is
         /// logged (debug/warn) and swallowed; never returns an error.
+        ///
+        /// Returns exactly the `(bot_id, net_worth)` pairs that were ACTUALLY
+        /// WRITTEN this tick — passed every refusal guard in [`Self::probe`],
+        /// passed the staleness check below, AND the `record_net_worth` insert
+        /// itself succeeded. The caller (`run_sampler`) hands this list, and
+        /// ONLY this list, to `check_net_worth_milestone` — never a fresh
+        /// `list_net_worth` re-read of the table. A bot the guard chain refused
+        /// this tick is simply ABSENT here; if the milestone check went back to
+        /// the table instead, it would find that bot's last-good row from N
+        /// ticks ago and sum it in as if it were current, silently undoing the
+        /// refusal one layer up in the very same loop (2026-07-31 audit gap
+        /// 17). Latent today only because `NET_WORTH_MILESTONE_STEP` is unset.
         pub async fn sample_once(
             &self,
             docker: &dyn DockerOps,
             config: &Config,
             store: &BotRunStore,
-        ) {
+        ) -> Vec<(String, f64)> {
             let bots = match docker.list_bots().await {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(error = %e, "net-worth sampler: failed to list bots");
-                    return;
+                    return Vec::new();
                 }
             };
 
@@ -733,36 +745,8 @@ mod sampler {
                 "net-worth sampler: polling running bots"
             );
 
-            for (bot_id, url) in targets {
-                let Some(reading) = self.probe(&bot_id, &url).await else {
-                    // Bot doesn't expose net worth (or was unreachable) — skip.
-                    continue;
-                };
-                // Refuse a figure the BOT ITSELF stamps as old. Tolerate two
-                // sample intervals (a single missed cycle is normal jitter);
-                // beyond that the bot is serving a frozen value and writing it
-                // with ts=NOW() manufactures history. A GAP in the series is
-                // honest; a flat plateau that never happened is not.
-                let max_age = config.net_worth_sample_interval_secs.max(1) * 2;
-                if reading_is_stale(reading.updated, now_epoch_secs(), max_age) {
-                    let age = reading
-                        .updated
-                        .map(|u| now_epoch_secs().saturating_sub(u))
-                        .unwrap_or(0);
-                    warn!(
-                        bot_id = %bot_id,
-                        age_secs = age,
-                        max_age_secs = max_age,
-                        "net-worth sampler: /status figure is STALE — skipping rather than \
-                         recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
-                         which wrote 15 identical rows into the treasury series)"
-                    );
-                    metrics::NET_WORTH_STALE_SKIPPED_TOTAL
-                        .with_label_values(&[metrics::refusal::STALE])
-                        .inc();
-                    continue;
-                }
-                let snap = NetWorthSnapshot::from_reading(&bot_id, reading);
+            let mut recorded = Vec::new();
+            for snap in self.eligible_readings(targets, config).await {
                 match store.record_net_worth(&snap).await {
                     Ok(()) => {
                         metrics::NET_WORTH_SNAPSHOTS_TOTAL.inc();
@@ -771,9 +755,10 @@ mod sampler {
                             currency = %snap.currency,
                             "net-worth sampler: snapshot recorded"
                         );
+                        recorded.push((snap.bot_id, snap.net_worth));
                     }
                     Err(e) => {
-                        warn!(bot_id = %bot_id, error = %e, "net-worth sampler: insert failed");
+                        warn!(bot_id = %snap.bot_id, error = %e, "net-worth sampler: insert failed");
                     }
                 }
             }
@@ -808,6 +793,55 @@ mod sampler {
                 Ok(n) => debug!(pruned = n, "notification-log retention sweep"),
                 Err(e) => warn!(error = %e, "notification-log retention sweep failed"),
             }
+
+            recorded
+        }
+
+        /// For each `(bot_id, url)` target, probe it and — if the reading
+        /// clears every refusal guard in [`Self::probe`] AND the staleness
+        /// check below — return it as a snapshot ready to write. Touches
+        /// ONLY HTTP + pure checks, never Postgres, so this is the exact
+        /// tick-level "who is eligible" decision `sample_once` is built on,
+        /// independently testable without a database (see
+        /// `probe_tests::eligible_readings_excludes_a_guard_refused_bot`).
+        async fn eligible_readings(
+            &self,
+            targets: Vec<(String, String)>,
+            config: &Config,
+        ) -> Vec<NetWorthSnapshot> {
+            let mut eligible = Vec::new();
+            for (bot_id, url) in targets {
+                let Some(reading) = self.probe(&bot_id, &url).await else {
+                    // Bot doesn't expose net worth (or was unreachable) — skip.
+                    continue;
+                };
+                // Refuse a figure the BOT ITSELF stamps as old. Tolerate two
+                // sample intervals (a single missed cycle is normal jitter);
+                // beyond that the bot is serving a frozen value and writing it
+                // with ts=NOW() manufactures history. A GAP in the series is
+                // honest; a flat plateau that never happened is not.
+                let max_age = config.net_worth_sample_interval_secs.max(1) * 2;
+                if reading_is_stale(reading.updated, now_epoch_secs(), max_age) {
+                    let age = reading
+                        .updated
+                        .map(|u| now_epoch_secs().saturating_sub(u))
+                        .unwrap_or(0);
+                    warn!(
+                        bot_id = %bot_id,
+                        age_secs = age,
+                        max_age_secs = max_age,
+                        "net-worth sampler: /status figure is STALE — skipping rather than \
+                         recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
+                         which wrote 15 identical rows into the treasury series)"
+                    );
+                    metrics::NET_WORTH_STALE_SKIPPED_TOTAL
+                        .with_label_values(&[metrics::refusal::STALE])
+                        .inc();
+                    continue;
+                }
+                eligible.push(NetWorthSnapshot::from_reading(bot_id, reading));
+            }
+            eligible
         }
 
         /// GET one bot's `/status` and parse its net worth. `None` = unreachable,
@@ -963,41 +997,37 @@ mod sampler {
         let mut last_milestone: Option<f64> = None;
         loop {
             tokio::time::sleep(interval).await;
-            sampler.sample_once(docker.as_ref(), &config, &store).await;
-            check_net_worth_milestone(&config, &store, &mut last_milestone).await;
+            let recorded = sampler.sample_once(docker.as_ref(), &config, &store).await;
+            check_net_worth_milestone(&config, &store, &recorded, &mut last_milestone).await;
         }
     }
 
-    /// Roll up the freshest snapshot per account into a single total and run the
-    /// pure milestone detector against the in-memory anchor, dispatching a
-    /// `net_worth_milestone` event on a crossing. OFF unless
-    /// `NET_WORTH_MILESTONE_STEP > 0`. Best-effort throughout (never fatal).
-    async fn check_net_worth_milestone(
-        config: &Config,
-        store: &BotRunStore,
+    /// PURE core of the milestone check: sum THIS TICK's guard-approved
+    /// readings (never a DB re-read — see [`NetWorthSampler::sample_once`]'s
+    /// doc comment for why) and run the milestone detector against the
+    /// in-memory anchor. `recorded` empty ⇒ nothing passed the guard chain
+    /// this tick, so there is nothing honest to baseline or compare against —
+    /// a gap in the milestone series, same as a gap in the snapshot series,
+    /// is preferable to inventing a total. Returns the crossing to notify (if
+    /// any) alongside the total that crossed it; `last_milestone` is updated
+    /// in place exactly like the old code did.
+    ///
+    /// No I/O, so this is unit-testable without Postgres — see
+    /// `probe_tests::including_a_refused_bots_stale_row_would_fire_the_wrong_crossing`.
+    fn evaluate_milestone(
+        step: f64,
+        recorded: &[(String, f64)],
         last_milestone: &mut Option<f64>,
-    ) {
-        let step = config.net_worth_milestone_step;
+    ) -> Option<(f64, MilestoneCross)> {
         if step <= 0.0 {
-            return; // milestone detection disabled
+            return None; // milestone detection disabled
         }
-
-        // Freshest snapshot PER account (limit=1 windows one row per bot_id — the
-        // same per-account roll-up the /net-worth window query established), summed
-        // into the treasury total.
-        let rows = match store.list_net_worth(None, 1).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "milestone: net-worth roll-up query failed");
-                return;
-            }
-        };
-        if rows.is_empty() {
-            return; // no data yet — nothing to baseline against
+        if recorded.is_empty() {
+            return None; // nothing recorded this tick — nothing to baseline against
         }
-        let total: f64 = rows.iter().map(|r| r.net_worth).sum();
+        let total: f64 = recorded.iter().map(|(_, net_worth)| net_worth).sum();
         if !total.is_finite() {
-            return;
+            return None;
         }
 
         // First observation after (re)start: baseline the anchor, don't fire.
@@ -1007,15 +1037,30 @@ mod sampler {
                 let base = milestone_baseline(total, step);
                 *last_milestone = Some(base);
                 debug!(total, base, "milestone: baselined anchor (no notification)");
-                return;
+                return None;
             }
         };
 
         let hysteresis = step * MILESTONE_HYSTERESIS_FRAC;
         let update = detect_milestone(last, total, step, hysteresis);
         *last_milestone = Some(update.last);
+        update.cross.map(|cross| (total, cross))
+    }
 
-        let Some(cross) = update.cross else {
+    /// Thin async wrapper around [`evaluate_milestone`]: dispatches a
+    /// `net_worth_milestone` notification when it fires. OFF unless
+    /// `NET_WORTH_MILESTONE_STEP > 0`. Best-effort throughout (never fatal).
+    /// `recorded` MUST be exactly what `sample_once` returned THIS tick — see
+    /// that function's doc comment; this is gap 17 in the 2026-07-31 audit.
+    async fn check_net_worth_milestone(
+        config: &Config,
+        store: &BotRunStore,
+        recorded: &[(String, f64)],
+        last_milestone: &mut Option<f64>,
+    ) {
+        let Some((total, cross)) =
+            evaluate_milestone(config.net_worth_milestone_step, recorded, last_milestone)
+        else {
             return;
         };
         if !config.notify_enabled {
@@ -1156,6 +1201,123 @@ mod sampler {
                 .await
                 .expect("once a venue has reported, the sample is recorded");
             assert_eq!(got2.net_worth, 11190.0);
+        }
+
+        /// A minimal `Config` for tests that need one — every field mirrors
+        /// `Config::from_env()`'s own defaults (see `tests/integration.rs`'s
+        /// `test_config`) so a sampler bug can't hide behind an unrealistic
+        /// test setup.
+        fn test_config() -> Config {
+            Config {
+                host: "127.0.0.1".to_string(),
+                port: 8090,
+                allowed_image_prefix: "fks-bot-".to_string(),
+                max_concurrent_bots: 20,
+                allowed_network: "fks_network".to_string(),
+                default_cpu_limit: 1.0,
+                default_memory_bytes: 256 * 1024 * 1024,
+                default_cpu_shares: 1024,
+                max_cpu_limit: 8.0,
+                max_memory_mb: 16384,
+                prometheus_sd_path: "/tmp/spawner-test-sd.json".to_string(),
+                bot_metrics_port: 9091,
+                prune_after_secs: 300,
+                prune_live_after_secs: 604_800,
+                prune_interval_secs: 60,
+                net_worth_sample_interval_secs: 300,
+                net_worth_milestone_step: 0.0,
+                database_url: String::new(),
+                backtest_database_url: String::new(),
+                internal_token: String::new(),
+                require_internal_auth: false,
+                events_token: String::new(),
+                events_url: "http://fks_bot_spawner:8090/events".to_string(),
+                notify_enabled: true,
+                btc_watch: crate::btc_watch::BtcWatchConfig::default(),
+                rithmic_sampler: crate::rithmic_sampler::RithmicSamplerConfig::default(),
+                edge_decay: crate::edge_decay::EdgeDecayConfig::default(),
+            }
+        }
+
+        /// THE BUG, gap 17 (2026-07-31 audit, `net_worth.rs:792-826` at the
+        /// time): `check_net_worth_milestone` used to re-read
+        /// `net_worth_snapshots` for the freshest row per bot_id with no age
+        /// bound, so a bot the guard chain refused THIS tick still
+        /// contributed its last-good — now stale — row to the milestone
+        /// total, silently undoing the very refusal `sample_once` just made,
+        /// one layer up in the same loop. Latent only because
+        /// `NET_WORTH_MILESTONE_STEP` is unset.
+        ///
+        /// Reproduced through the real HTTP + guard-chain path: one bot
+        /// serves a startup-window body (`exchanges: []`, refused by
+        /// `venues_not_yet_populated`), the other serves a healthy, complete
+        /// reading. `eligible_readings` — the exact input `sample_once`
+        /// builds its `recorded` return value from — must contain ONLY the
+        /// healthy bot.
+        #[tokio::test]
+        async fn eligible_readings_excludes_a_guard_refused_bot() {
+            const STARTUP_WINDOW: &str = r#"{"bot": "kucoin-futures", "mode": "paper",
+                "net_worth_usd": 0.0, "exchanges": []}"#;
+            // No `updated` stamp: this bot's freshness is unverifiable, which
+            // reads as fresh (see `#32` elsewhere in this file) — the point of
+            // this test is the GUARD-CHAIN refusal, not the separate
+            // staleness check, so a fixed timestamp that ages out as the
+            // calendar moves on would make this test flaky for the wrong
+            // reason.
+            const HEALTHY: &str = r#"{"bot": "spot-portfolio", "mode": "live",
+                "net_worth_usd": 6000.0, "exchanges": [
+                {"exchange": "Kraken", "mode": "live", "total_value": 6000.0}]}"#;
+
+            let refused_url = serve_status_once(STARTUP_WINDOW).await;
+            let healthy_url = serve_status_once(HEALTHY).await;
+            let targets = vec![
+                ("crypto-funding".to_string(), refused_url),
+                ("spot-portfolio".to_string(), healthy_url),
+            ];
+
+            let eligible = NetWorthSampler::new()
+                .eligible_readings(targets, &test_config())
+                .await;
+            assert_eq!(
+                eligible.len(),
+                1,
+                "the guard-refused bot must not appear in this tick's eligible set"
+            );
+            assert_eq!(eligible[0].bot_id, "spot-portfolio");
+            assert_eq!(eligible[0].net_worth, 6000.0);
+        }
+
+        /// The other half of gap 17: even if a refused bot's stale row DID
+        /// make it back in (the old `list_net_worth` re-read), it would fire a
+        /// DIFFERENT, WRONG milestone crossing than the correct guard-scoped
+        /// total. `evaluate_milestone` never reads a table — it can only ever
+        /// see `recorded` — so this failure mode is now structurally
+        /// impossible, not just guarded against.
+        #[test]
+        fn including_a_refused_bots_stale_row_would_fire_the_wrong_crossing() {
+            // OLD behaviour: the milestone check re-read the table and got
+            // BOTH bots, including "stale-bot"'s $5,500 row from three ticks
+            // ago that this tick's guard chain refused to refresh.
+            let with_stale_row = vec![
+                ("good-bot".to_string(), 500.0),
+                ("stale-bot".to_string(), 5_500.0),
+            ];
+            let mut anchor_old = Some(0.0);
+            let old = evaluate_milestone(1_000.0, &with_stale_row, &mut anchor_old)
+                .expect("6000 crosses a 1000-step boundary");
+            assert_eq!(old, (6_000.0, MilestoneCross::Up(6_000.0)));
+
+            // NEW (fixed) behaviour: `stale-bot` was refused this tick, so
+            // `sample_once` never puts it in `recorded` — there is no table
+            // for `evaluate_milestone` to fall back to.
+            let guard_scoped = vec![("good-bot".to_string(), 500.0)];
+            let mut anchor_new = Some(0.0);
+            let new = evaluate_milestone(1_000.0, &guard_scoped, &mut anchor_new);
+            assert_eq!(
+                new, None,
+                "500 alone hasn't crossed the first 1000-step boundary — no false \
+                 crossing fired off a row the guard chain refused to refresh"
+            );
         }
     }
 }
