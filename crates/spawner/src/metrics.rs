@@ -441,7 +441,13 @@ mod tests {
         // at alerts that cannot fire.
         const SRC: &str = include_str!("net_worth.rs");
 
-        for r in ["STALE", "INCOMPLETE", "FAKE_PAPER", "UNACCOUNTED", "NOT_READY"] {
+        for r in [
+            "STALE",
+            "INCOMPLETE",
+            "FAKE_PAPER",
+            "UNACCOUNTED",
+            "NOT_READY",
+        ] {
             assert!(
                 SRC.contains(&format!("refusal::{r}")),
                 "net_worth.rs must label a refusal with refusal::{r} — otherwise the \
