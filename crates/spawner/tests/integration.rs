@@ -285,6 +285,7 @@ fn test_config(internal_token: &str) -> Config {
         prune_live_after_secs: 604_800,
         prune_interval_secs: 60,
         net_worth_sample_interval_secs: 300,
+        bot_mark_cadence_secs: std::collections::HashMap::new(),
         net_worth_milestone_step: 0.0,
         database_url: String::new(),
         backtest_database_url: String::new(),

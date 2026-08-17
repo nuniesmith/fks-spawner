@@ -204,6 +204,44 @@ added as a parallel check elsewhere.**
   sampler, never retroactively, and is NOT excluded from `/treasury`/`/profit`
   reads (the figure is the best available one, just not broker-confirmed).
 
+- **The `stale` guard's tolerance is per-bot CADENCE-aware, not one global
+  constant.** `eligible_readings` used to refuse a reading once its age
+  exceeded `net_worth_sample_interval_secs * 2` (600s at the 300s default) —
+  conflating how often WE poll `/status` with how often the BOT refreshes its
+  own freshness stamp. Those happen to be similar magnitudes for the spot bot
+  (live venues refresh ~90s) but the funding bot's assets are configured
+  `granularity = "60"` MINUTES (`funding.toml` in `fks-state/bots/crypto-futures`,
+  a separate READ-ONLY repo), so its `positions[].updated` mark — its only
+  liveness evidence per the `unverified` case above — only advances once an
+  HOUR by design. Measured live 2026-08-16/17: 2-3 `net_worth_snapshots` rows
+  at the top of every hour, then a 50-60 minute gap, `reason="stale"` climbing
+  ~9/hour with no ceiling, pinning `NetWorthSamplingPausedTooLong` permanently
+  on a bot that was never actually blind. `net_worth.rs::expected_mark_cadence_secs`
+  now resolves a bot's expected marking interval from `Config::bot_mark_cadence_secs`
+  (per-bot override, env `NET_WORTH_BOT_CADENCE_SECS` — `bot_id=seconds[,...]`,
+  e.g. `crypto-funding=3600`) and `net_worth.rs::max_reading_age_secs` tolerates
+  2x that cadence (unchanged multiplier) — `reading_is_stale` itself is
+  untouched, only what `eligible_readings` passes as `max_age_secs`. A bot
+  ABSENT from the override map falls back to `net_worth_sample_interval_secs`
+  (the pre-existing, tighter default) — the fail-toward-conservative half of
+  the design: an unconfigured/unknown cadence must never become MORE tolerant
+  than before. **Deliberately NOT a new `/status` field** (that would require
+  a `crypto-bot-core`/bot rebuild+redeploy just to close this gap, and an
+  unshipped field would recreate the exact "unverifiable read as untrustworthy
+  OR fail-open" trap the guards above already learned the hard way) — a config-side
+  override is the safe-by-default mechanism until the bots can declare their
+  own cadence. A genuine stall (marks stop advancing entirely) is still
+  refused, within a bound proportional to the bot's OWN cadence — 10 minutes
+  for the unchanged 5-minute-cadence bots, 2 hours for an hourly one — so
+  cadence-awareness widens WHEN a bot is judged, never removes the judgment.
+  `metrics::NET_WORTH_STALE_STREAK` (`fks_spawner_net_worth_consecutive_stale_ticks`,
+  labelled `bot_id`) additionally tracks consecutive `reason=stale` refusals
+  per bot, resetting to 0 on every recorded reading and retired when the bot
+  stops running — so a PERMANENTLY-refusing bot (climbs without bound) is
+  distinguishable from an INTERMITTENTLY-refusing one (oscillates back to 0),
+  which the aggregate `NET_WORTH_STALE_SKIPPED_TOTAL` counter alone cannot
+  express per-bot.
+
 ## Common workflows
 
 ### Spawn a bot from curl

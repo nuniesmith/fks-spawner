@@ -5,6 +5,7 @@
 // Set these in docker-compose.yml or the .env file.
 // =============================================================================
 
+use std::collections::HashMap;
 use std::env;
 
 use crate::btc_watch::BtcWatchConfig;
@@ -69,6 +70,30 @@ pub struct Config {
     /// design (years-horizon backbone, not a live tick). Env:
     /// NET_WORTH_SAMPLE_INTERVAL_SECS. Only runs when the DB is configured.
     pub net_worth_sample_interval_secs: u64,
+
+    /// Per-bot override for how often THAT bot is expected to refresh its own
+    /// `/status` freshness stamp (`updated` / `positions[].updated`) — the
+    /// bot's marking cadence, which is NOT the same thing as
+    /// `net_worth_sample_interval_secs` (how often WE poll it). Keyed by
+    /// `fks.bot_id`. Parsed from `NET_WORTH_BOT_CADENCE_SECS`:
+    /// `bot_id=seconds[,bot_id=seconds...]`, e.g.
+    /// `crypto-funding=3600` for a bot whose candle-driven position marks
+    /// only advance once an hour by design (`granularity = "60"` minutes in
+    /// its own config — see `crate::net_worth::expected_mark_cadence_secs`
+    /// and the 2026-08-16/17 measurement in that module's doc comment: the
+    /// funding bot's readings were refused as stale for ~50 minutes of every
+    /// hour because the sampler judged an hourly-marking bot against a
+    /// 10-minute tolerance derived from the global 300s poll interval).
+    ///
+    /// A `bot_id` ABSENT from this map falls back to
+    /// `net_worth_sample_interval_secs` — the pre-existing, TIGHTER default —
+    /// not to something more tolerant: an unrecognised/unconfigured cadence
+    /// must fail toward the conservative behaviour that predates this field
+    /// (refuse promptly), never toward infinite patience. Malformed entries
+    /// (non-numeric, zero, or an empty bot_id) are dropped individually
+    /// rather than invalidating the whole map, and a dropped entry falls back
+    /// to the same conservative default.
+    pub bot_mark_cadence_secs: HashMap<String, u64>,
 
     /// Milestone step (in the net-worth currency, USD) for the
     /// `net_worth_milestone` event: the sampler notifies when total net worth
@@ -184,6 +209,9 @@ impl Config {
                 "NET_WORTH_SAMPLE_INTERVAL_SECS",
                 crate::net_worth::DEFAULT_SAMPLE_INTERVAL_SECS,
             ),
+            bot_mark_cadence_secs: parse_bot_cadence_map(
+                &env::var("NET_WORTH_BOT_CADENCE_SECS").unwrap_or_default(),
+            ),
             net_worth_milestone_step: env_parse_f64("NET_WORTH_MILESTONE_STEP", 0.0),
             database_url: env::var("SPAWNER_DATABASE_URL")
                 .or_else(|_| env::var("DATABASE_URL"))
@@ -219,6 +247,42 @@ fn env_parse_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse `NET_WORTH_BOT_CADENCE_SECS` — a comma-separated `bot_id=seconds`
+/// list — into the per-bot cadence override map. Pure so it is unit-testable
+/// without mutating process env (see the `bot_cadence_map_*` tests below).
+///
+/// Each entry is validated independently: an empty/whitespace-only bot_id, an
+/// unparsable seconds value, or a zero/negative value is DROPPED rather than
+/// poisoning the whole map — a fat-fingered single entry degrades that one
+/// bot to the conservative default (see `Config::bot_mark_cadence_secs`),
+/// never to a map so broken every bot loses its override. Later duplicate
+/// bot_ids overwrite earlier ones (last-wins, matching `env`/`labels`
+/// parsing elsewhere in this crate).
+fn parse_bot_cadence_map(raw: &str) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((bot_id, secs)) = entry.split_once('=') else {
+            continue;
+        };
+        let bot_id = bot_id.trim();
+        if bot_id.is_empty() {
+            continue;
+        }
+        let Ok(secs) = secs.trim().parse::<u64>() else {
+            continue;
+        };
+        if secs == 0 {
+            continue;
+        }
+        map.insert(bot_id.to_string(), secs);
+    }
+    map
 }
 
 /// Parse a boolean env flag. Accepts the common truthy/falsey spellings
@@ -263,6 +327,7 @@ mod tests {
             prune_live_after_secs: 604_800,
             prune_interval_secs: 60,
             net_worth_sample_interval_secs: 300,
+            bot_mark_cadence_secs: HashMap::new(),
             net_worth_milestone_step: 0.0,
             database_url: String::new(),
             backtest_database_url: String::new(),
@@ -303,6 +368,7 @@ mod tests {
             prune_live_after_secs: 604_800,
             prune_interval_secs: 0,
             net_worth_sample_interval_secs: 0,
+            bot_mark_cadence_secs: HashMap::new(),
             net_worth_milestone_step: 0.0,
             database_url: String::new(),
             backtest_database_url: String::new(),
@@ -317,5 +383,42 @@ mod tests {
             boot_reconcile_enabled: true,
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");
+    }
+
+    // ── NET_WORTH_BOT_CADENCE_SECS parsing ──────────────────────────────────
+
+    #[test]
+    fn bot_cadence_map_parses_valid_pairs() {
+        let map = parse_bot_cadence_map("crypto-funding=3600,crypto-spot=300");
+        assert_eq!(map.get("crypto-funding"), Some(&3600));
+        assert_eq!(map.get("crypto-spot"), Some(&300));
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn bot_cadence_map_empty_string_is_empty_map() {
+        assert!(parse_bot_cadence_map("").is_empty());
+        assert!(parse_bot_cadence_map("   ").is_empty());
+    }
+
+    #[test]
+    fn bot_cadence_map_drops_malformed_entries_without_poisoning_the_rest() {
+        // No '=', empty bot_id, non-numeric seconds, and a zero cadence are
+        // each dropped individually; the one well-formed entry still lands.
+        let map = parse_bot_cadence_map(
+            "crypto-funding=3600, no-equals-sign, =900, crypto-broken=abc, crypto-zero=0",
+        );
+        assert_eq!(
+            map.len(),
+            1,
+            "only the well-formed entry should survive: {map:?}"
+        );
+        assert_eq!(map.get("crypto-funding"), Some(&3600));
+    }
+
+    #[test]
+    fn bot_cadence_map_last_duplicate_wins() {
+        let map = parse_bot_cadence_map("crypto-funding=3600,crypto-funding=7200");
+        assert_eq!(map.get("crypto-funding"), Some(&7200));
     }
 }

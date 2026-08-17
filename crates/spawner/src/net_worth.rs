@@ -367,6 +367,74 @@ pub fn reading_is_stale(updated: Option<u64>, now_secs: u64, max_age_secs: u64) 
     }
 }
 
+/// How many multiples of a bot's OWN marking cadence its reading is allowed
+/// to age before it is refused as stale. Unchanged from the original
+/// `net_worth_sample_interval_secs * 2` formula's multiplier — a single
+/// missed cycle is normal jitter, two in a row is a genuine stall.
+pub const STALE_TOLERANCE_MULTIPLIER: u64 = 2;
+
+/// The staleness tolerance (`max_age_secs` for [`reading_is_stale`]) derived
+/// from a bot's OWN marking cadence, rather than the single global constant
+/// this replaced (`net_worth_sample_interval_secs * 2`).
+///
+/// That old formula conflated two unrelated quantities: how often WE poll
+/// `/status` (`NET_WORTH_SAMPLE_INTERVAL_SECS`, 300s default) and how often
+/// the BOT refreshes its own freshness stamp. Those happen to sit in the same
+/// ballpark for the spot bot (real venues refresh on the order of ~90s), so
+/// the conflation was invisible — until the funding bot. Its assets are
+/// configured `granularity = "60"` MINUTES (`funding.toml` in
+/// `fks-state/bots/crypto-futures`, READ-ONLY from this repo) and its
+/// candle-driven `mark_position` call — and therefore `positions[].updated`,
+/// the ONLY liveness evidence a wholly-paper bot has (see `unverified` above)
+/// — only advances once an HOUR, BY DESIGN. Measured live 2026-08-16/17
+/// against the deployed funding bot: 2-3 `net_worth_snapshots` rows at the
+/// top of every hour, then a 50-60 minute gap, repeating; a reading's age
+/// climbs from ~0s to just under 3600s every hour before the next mark resets
+/// it. Judged against the OLD flat 600s tolerance, that bot was refused
+/// (`reason="stale"`) for roughly 50 of every 60 minutes — climbing ~9
+/// refusals/hour with NO ceiling, which pinned `NetWorthSamplingPausedTooLong`
+/// permanently and trained exactly the alert-blindness that let a real
+/// 43-hour treasury blackout go unnoticed two days before this measurement.
+///
+/// `cadence_secs` is the bot's expected mark interval: an explicit per-bot
+/// override (`Config::bot_mark_cadence_secs`, keyed by bot_id) when the
+/// operator has declared one, else `net_worth_sample_interval_secs` (see
+/// [`expected_mark_cadence_secs`]) — the SAME default every bot effectively
+/// used before this existed, so an unconfigured bot's tolerance is unchanged.
+/// `STALE_TOLERANCE_MULTIPLIER` (2x) bounds detection: a bot whose marks stop
+/// advancing entirely is refused once its reading's age exceeds twice its OWN
+/// cadence — 10 minutes for the unchanged 5-minute-cadence spot bots, 2 hours
+/// for an hourly-cadence bot. A HEALTHY bot's naturally-occurring age never
+/// exceeds ~1 cadence between marks (it resets on every fresh mark), so 2x
+/// cadence never fires on legitimate operation while still catching a genuine
+/// stall within a bounded, cadence-proportional window — not "big enough that
+/// nothing is ever stale" (that would silently re-open the 2026-07-22 DNS
+/// blackout gap `reading_is_stale` exists to close).
+pub fn max_reading_age_secs(cadence_secs: u64) -> u64 {
+    cadence_secs.max(1) * STALE_TOLERANCE_MULTIPLIER
+}
+
+/// A bot's expected marking cadence: the operator-declared override for
+/// `bot_id` in `overrides` (`Config::bot_mark_cadence_secs`, parsed from
+/// `NET_WORTH_BOT_CADENCE_SECS`) when one exists, else `default_secs`
+/// (`net_worth_sample_interval_secs`).
+///
+/// This is the fail-toward-conservative half of the design: a bot this repo
+/// has never heard of — a new bot, a typo'd bot_id in the override env var,
+/// or simply an operator who hasn't configured anything — gets EXACTLY the
+/// tolerance every bot had before this feature existed, not a more generous
+/// one. Loosening the default for the unconfigured case would silently
+/// re-open the frozen-value gap [`reading_is_stale`]'s doc comment describes;
+/// only an EXPLICIT per-bot override may widen the window, and only for the
+/// bot it names.
+pub fn expected_mark_cadence_secs(
+    bot_id: &str,
+    overrides: &std::collections::HashMap<String, u64>,
+    default_secs: u64,
+) -> u64 {
+    overrides.get(bot_id).copied().unwrap_or(default_secs)
+}
+
 pub fn parse_status_net_worth(body: &str) -> Option<NetWorthReading> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     let net_worth = NET_WORTH_KEYS
@@ -807,9 +875,10 @@ mod sampler {
 
     use super::{
         MILESTONE_HYSTERESIS_FRAC, MilestoneCross, NetWorthSnapshot, SOURCE_BOT_STATUS_UNVERIFIED,
-        detect_milestone, has_fake_paper_venue, milestone_baseline, now_epoch_secs,
-        open_positions_unaccounted, parse_status_net_worth, parse_venue_freshness,
-        reading_is_stale, running_status_targets, venue_set_is_complete, venues_not_yet_populated,
+        detect_milestone, expected_mark_cadence_secs, has_fake_paper_venue, max_reading_age_secs,
+        milestone_baseline, now_epoch_secs, open_positions_unaccounted, parse_status_net_worth,
+        parse_venue_freshness, reading_is_stale, running_status_targets, venue_set_is_complete,
+        venues_not_yet_populated,
     };
     use crate::config::Config;
     use crate::db::BotRunStore;
@@ -983,12 +1052,24 @@ mod sampler {
                     // Bot doesn't expose net worth (or was unreachable) — skip.
                     continue;
                 };
-                // Refuse a figure the BOT ITSELF stamps as old. Tolerate two
-                // sample intervals (a single missed cycle is normal jitter);
-                // beyond that the bot is serving a frozen value and writing it
-                // with ts=NOW() manufactures history. A GAP in the series is
-                // honest; a flat plateau that never happened is not.
-                let max_age = config.net_worth_sample_interval_secs.max(1) * 2;
+                // Refuse a figure the BOT ITSELF stamps as old. Tolerate two of
+                // THIS BOT'S OWN marking cadences (a single missed cycle is
+                // normal jitter; beyond that it is serving a frozen value and
+                // writing it with ts=NOW() manufactures history) — NOT two
+                // sample intervals. Those are different things: the sample
+                // interval is how often WE poll, the cadence is how often the
+                // BOT marks. An hourly-marking bot judged against a
+                // 5-minute-poll-derived tolerance is stale for ~50 of every
+                // 60 minutes despite being perfectly healthy (measured live,
+                // 2026-08-16/17 — see `max_reading_age_secs`'s doc comment). A
+                // GAP in the series is honest; a flat plateau that never
+                // happened is not.
+                let cadence = expected_mark_cadence_secs(
+                    &bot_id,
+                    &config.bot_mark_cadence_secs,
+                    config.net_worth_sample_interval_secs,
+                );
+                let max_age = max_reading_age_secs(cadence);
                 if reading_is_stale(reading.updated, now_epoch_secs(), max_age) {
                     let age = reading
                         .updated
@@ -998,6 +1079,7 @@ mod sampler {
                         bot_id = %bot_id,
                         age_secs = age,
                         max_age_secs = max_age,
+                        cadence_secs = cadence,
                         "net-worth sampler: /status figure is STALE — skipping rather than \
                          recording a frozen value as fresh (see the 2026-07-22 DNS blackout, \
                          which wrote 15 identical rows into the treasury series)"
@@ -1005,8 +1087,21 @@ mod sampler {
                     metrics::NET_WORTH_STALE_SKIPPED_TOTAL
                         .with_label_values(&[metrics::refusal::STALE])
                         .inc();
+                    // Consecutive-stale-tick streak (bot-labelled), so an
+                    // operator can tell a PERMANENTLY refusing bot (this
+                    // climbs without bound) from an INTERMITTENTLY refusing
+                    // one (this keeps resetting to 0 below) — the aggregate
+                    // counter above cannot distinguish the two, and that gap
+                    // is exactly what trained the alert-blindness this fix
+                    // exists to end.
+                    metrics::NET_WORTH_STALE_STREAK
+                        .with_label_values(&[bot_id.as_str()])
+                        .inc();
                     continue;
                 }
+                metrics::NET_WORTH_STALE_STREAK
+                    .with_label_values(&[bot_id.as_str()])
+                    .set(0.0);
                 eligible.push(NetWorthSnapshot::from_reading(bot_id, reading));
             }
             eligible
@@ -1257,7 +1352,12 @@ mod sampler {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         /// Serve `body` once on a loopback port; returns its `/status` URL.
-        async fn serve_status_once(body: &'static str) -> String {
+        /// `impl Into<String>` (rather than `&'static str`) so cadence tests
+        /// can build a body with a timestamp computed at test-run time
+        /// (`now_epoch_secs() - N`) while every existing `const` call site
+        /// keeps working unchanged (`&str` satisfies `Into<String>` too).
+        async fn serve_status_once(body: impl Into<String>) -> String {
+            let body = body.into();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind loopback");
@@ -1393,6 +1493,7 @@ mod sampler {
                 prune_live_after_secs: 604_800,
                 prune_interval_secs: 60,
                 net_worth_sample_interval_secs: 300,
+                bot_mark_cadence_secs: std::collections::HashMap::new(),
                 net_worth_milestone_step: 0.0,
                 database_url: String::new(),
                 backtest_database_url: String::new(),
@@ -1551,6 +1652,158 @@ mod sampler {
                 "this exact shape — paper-only venue, no real-money stamp — is what \
                  wrote 241 rows tagged plain 'bot_status' in production; it must now \
                  be visibly distinct instead of reading as normal verified-fresh data"
+            );
+        }
+
+        // ── per-bot marking cadence (2026-08-16/17 funding-bot measurement) ──
+        //
+        // Drives `eligible_readings` — the exact tick-level decision
+        // `sample_once` is built on — through the real HTTP + guard-chain
+        // path, the same level `eligible_readings_excludes_a_guard_refused_bot`
+        // above tests at, so a regression here is caught at the same altitude
+        // the original bug was found at.
+
+        /// A wholly-paper bot's body (like the deployed funding bot) whose
+        /// ONLY liveness evidence is `positions[].updated` — see
+        /// `probe_establishes_liveness_from_an_open_positions_mark_when_no_venue_can_vouch`
+        /// above. The venue's own `updated` is fixed/irrelevant: it is paper,
+        /// so `real_money_venue_stamps` excludes it and `freshest_position_mark`
+        /// is the only source of `NetWorthReading::updated`.
+        fn funding_body_with_position_mark(updated: u64) -> String {
+            format!(
+                r#"{{"bot": "kucoin-futures", "mode": "paper",
+                    "net_worth_usd": 11288.30, "exchanges": [
+                    {{"exchange": "kucoin-futures", "mode": "paper",
+                      "total_value": 11288.30, "updated": 1785603708}}],
+                    "positions": [{{"symbol": "AVAXUSDTM", "ret_pct": 6.88,
+                      "updated": {updated}}}]}}"#
+            )
+        }
+
+        /// A real-money bot (like the deployed spot bot) whose live venue
+        /// carries its own `updated` stamp, so `real_money_venue_stamps` is
+        /// non-empty and `NetWorthReading::updated` comes straight from it.
+        fn live_venue_body_with_mark(updated: u64) -> String {
+            format!(
+                r#"{{"bot": "spot-portfolio", "mode": "live",
+                    "net_worth_usd": 6000.0, "exchanges": [
+                    {{"exchange": "Kraken", "mode": "live", "total_value": 6000.0,
+                      "updated": {updated}}}]}}"#
+            )
+        }
+
+        /// A bot declared with an HOURLY cadence override, healthy: its
+        /// position mark is 50 minutes old — comfortably inside 2x its own
+        /// 3600s cadence (7200s) — must be RECORDED. Judged against the OLD
+        /// global `net_worth_sample_interval_secs * 2` formula (600s at the
+        /// 300s default) this exact reading would have been refused, which is
+        /// the measured production bug (~9 refusals/hour, permanent page).
+        #[tokio::test]
+        async fn hourly_marking_bot_healthy_is_recorded() {
+            let mut config = test_config();
+            config
+                .bot_mark_cadence_secs
+                .insert("crypto-funding".to_string(), 3600);
+
+            let updated = now_epoch_secs().saturating_sub(50 * 60); // 50 min ago
+            let url = serve_status_once(funding_body_with_position_mark(updated)).await;
+            let targets = vec![("crypto-funding".to_string(), url)];
+
+            let eligible = NetWorthSampler::new()
+                .eligible_readings(targets, &config)
+                .await;
+            assert_eq!(
+                eligible.len(),
+                1,
+                "an hourly-marking bot 50 minutes into its cycle is healthy, not stale"
+            );
+        }
+
+        /// The same hourly-cadence bot, but its mark genuinely stopped
+        /// advancing 3 hours ago — past 2x its own 3600s cadence (7200s) —
+        /// must still be REFUSED. Cadence-awareness must not become "nothing
+        /// is ever stale"; a real stall has to keep tripping this guard,
+        /// just at a bound proportional to the bot's own cadence instead of
+        /// the sampler's poll interval.
+        #[tokio::test]
+        async fn hourly_marking_bot_stalled_is_refused() {
+            let mut config = test_config();
+            config
+                .bot_mark_cadence_secs
+                .insert("crypto-funding".to_string(), 3600);
+
+            let updated = now_epoch_secs().saturating_sub(3 * 3600); // 3h ago
+            let url = serve_status_once(funding_body_with_position_mark(updated)).await;
+            let targets = vec![("crypto-funding".to_string(), url)];
+
+            let eligible = NetWorthSampler::new()
+                .eligible_readings(targets, &config)
+                .await;
+            assert!(
+                eligible.is_empty(),
+                "a mark frozen for 3h (> 2x the declared 3600s cadence) is a genuine \
+                 stall and must still be refused"
+            );
+        }
+
+        /// The existing 5-minute-cadence bots (no override; `test_config()`'s
+        /// `net_worth_sample_interval_secs = 300`, same as the shipped
+        /// default) must keep their CURRENT, tighter behaviour: 550s old is
+        /// fresh, 650s old is stale — unchanged from the pre-cadence-aware
+        /// `300 * 2 = 600s` formula.
+        #[tokio::test]
+        async fn five_minute_bot_behaviour_is_unchanged() {
+            let config = test_config();
+            assert!(config.bot_mark_cadence_secs.is_empty());
+
+            let fresh_updated = now_epoch_secs().saturating_sub(550);
+            let fresh_url = serve_status_once(live_venue_body_with_mark(fresh_updated)).await;
+            let eligible_fresh = NetWorthSampler::new()
+                .eligible_readings(vec![("spot-portfolio".to_string(), fresh_url)], &config)
+                .await;
+            assert_eq!(
+                eligible_fresh.len(),
+                1,
+                "550s old must still pass at 300s cadence"
+            );
+
+            let stale_updated = now_epoch_secs().saturating_sub(650);
+            let stale_url = serve_status_once(live_venue_body_with_mark(stale_updated)).await;
+            let eligible_stale = NetWorthSampler::new()
+                .eligible_readings(vec![("spot-portfolio".to_string(), stale_url)], &config)
+                .await;
+            assert!(
+                eligible_stale.is_empty(),
+                "650s old must still be refused at 300s cadence — tightening must not \
+                 have loosened"
+            );
+        }
+
+        /// A bot with NO declared cadence — absent from
+        /// `bot_mark_cadence_secs` entirely, including a map that is
+        /// non-empty for OTHER bots (proving this is a real per-bot lookup
+        /// miss, not just an empty map) — must fail toward the conservative
+        /// default (`net_worth_sample_interval_secs`), never toward
+        /// permissiveness. A reading old enough to fail the tight 300s-based
+        /// default (650s) must still be refused even though a cadence map
+        /// exists in the config.
+        #[tokio::test]
+        async fn unknown_cadence_bot_falls_back_to_conservative_default() {
+            let mut config = test_config();
+            // A DIFFERENT bot has an override; "spot-portfolio" does not.
+            config
+                .bot_mark_cadence_secs
+                .insert("crypto-funding".to_string(), 3600);
+
+            let stale_updated = now_epoch_secs().saturating_sub(650);
+            let url = serve_status_once(live_venue_body_with_mark(stale_updated)).await;
+            let eligible = NetWorthSampler::new()
+                .eligible_readings(vec![("spot-portfolio".to_string(), url)], &config)
+                .await;
+            assert!(
+                eligible.is_empty(),
+                "an undeclared bot must NOT inherit another bot's — or an infinitely \
+                 tolerant — cadence; it falls back to the tight global default"
             );
         }
     }
@@ -2229,6 +2482,88 @@ mod tests {
         assert!(!reading_is_stale(None, now, 600));
         // Clock skew putting the stamp ahead must NOT blank the series.
         assert!(!reading_is_stale(Some(now + 120), now, 600));
+    }
+
+    // ── per-bot cadence-aware staleness tolerance ───────────────────────────
+    // (measured live 2026-08-16/17: the funding bot's hourly `granularity =
+    // "60"` minutes marking cadence vs. the old flat `sample_interval * 2`
+    // formula — see `max_reading_age_secs`'s doc comment for the full story)
+
+    #[test]
+    fn max_reading_age_scales_with_cadence_not_the_sample_interval() {
+        // The pre-existing 5-minute-cadence behaviour, reproduced through the
+        // new function: unchanged at 600s.
+        assert_eq!(max_reading_age_secs(300), 600);
+        // An hourly cadence gets an hourly-proportional tolerance, not the
+        // 600s a global constant would have imposed.
+        assert_eq!(max_reading_age_secs(3600), 7200);
+        // Zero/absurdly-small cadence is clamped to at least 1s * multiplier
+        // rather than producing a zero-tolerance guard that refuses every
+        // reading including a genuinely fresh one.
+        assert_eq!(max_reading_age_secs(0), 2);
+    }
+
+    #[test]
+    fn expected_cadence_prefers_the_per_bot_override_and_falls_back_conservatively() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("crypto-funding".to_string(), 3600u64);
+
+        // A declared bot gets its own cadence.
+        assert_eq!(
+            expected_mark_cadence_secs("crypto-funding", &overrides, 300),
+            3600
+        );
+        // An UNDECLARED bot — even with a non-empty map for OTHER bots — must
+        // fall back to `default_secs` (the pre-existing, tighter behaviour),
+        // never inherit another bot's more generous cadence.
+        assert_eq!(
+            expected_mark_cadence_secs("crypto-spot", &overrides, 300),
+            300
+        );
+        // An entirely empty map behaves identically — the conservative
+        // fallback, not a permissive one.
+        assert_eq!(
+            expected_mark_cadence_secs("crypto-spot", &std::collections::HashMap::new(), 300),
+            300
+        );
+    }
+
+    #[test]
+    fn hourly_cadence_stall_bound_is_two_hours_not_ten_minutes() {
+        // The exact scenario the task measured: a bot whose position mark
+        // legitimately refreshes once an hour. Judged against the OLD global
+        // formula (300s sample interval * 2 = 600s) this reading — barely 50
+        // minutes old, i.e. still mid-cycle for an hourly bot — would already
+        // be refused. Judged against ITS OWN cadence it is comfortably fresh.
+        let now = 1_785_000_000u64;
+        let cadence = 3600u64;
+        let old_global_max_age = 600u64; // what every bot used before this fix
+        let cadence_aware_max_age = max_reading_age_secs(cadence); // 7200
+
+        let fifty_minutes_old = now - 50 * 60;
+        assert!(
+            reading_is_stale(Some(fifty_minutes_old), now, old_global_max_age),
+            "sanity check: the OLD formula really did refuse this healthy reading \
+             — this is the measured production bug, not a hypothetical"
+        );
+        assert!(
+            !reading_is_stale(Some(fifty_minutes_old), now, cadence_aware_max_age),
+            "the SAME reading must be accepted once judged against its own cadence"
+        );
+
+        // The stall bound: exactly at 2x cadence is still tolerated (matches
+        // the existing inclusive-boundary convention), one second past it is
+        // refused.
+        assert!(!reading_is_stale(
+            Some(now - 2 * cadence),
+            now,
+            cadence_aware_max_age
+        ));
+        assert!(reading_is_stale(
+            Some(now - 2 * cadence - 1),
+            now,
+            cadence_aware_max_age
+        ));
     }
 
     #[test]

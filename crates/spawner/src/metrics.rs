@@ -199,6 +199,37 @@ pub static NET_WORTH_STALE_SKIPPED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Consecutive sampler ticks IN A ROW a bot's net-worth reading has been
+/// refused for `reason="stale"` specifically — labelled by `bot_id`. Set to
+/// `0` the moment a reading for that bot is recorded again (any source), and
+/// removed entirely once the bot stops running (`retire_absent_bots`), the
+/// same GaugeVec-plus-retirement shape as `VENUE_STATUS_AGE`/`SEEN` above.
+///
+/// `NET_WORTH_STALE_SKIPPED_TOTAL{reason="stale"}` alone cannot tell a
+/// PERMANENTLY-refusing bot from an INTERMITTENTLY-refusing one: both produce
+/// a counter that goes up. That distinction was exactly the operator-facing
+/// failure in the funding-bot hourly-cadence incident (2026-08-16/17) — the
+/// counter climbed ~9/hour and `NetWorthSamplingPausedTooLong` paged
+/// permanently, and nobody could tell from the counter alone whether that was
+/// one bot stuck forever or several bots each intermittently (and
+/// harmlessly) missing a cycle. This gauge answers that directly: a bot whose
+/// series only climbs (never resets to 0) is genuinely stuck; a bot whose
+/// series oscillates back to 0 is healthy jitter. Query with
+/// `fks_spawner_net_worth_consecutive_stale_ticks > <bound>` for "has been
+/// stuck for at least that many ticks in a row" — a query the bare counter
+/// cannot express per-bot at all.
+pub static NET_WORTH_STALE_STREAK: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!(
+        "fks_spawner_net_worth_consecutive_stale_ticks",
+        "Consecutive sampler ticks a bot's net-worth reading has been refused as stale \
+         (reason=stale only); resets to 0 when a reading is recorded again, so a \
+         permanently-stuck bot (never resets) is distinguishable from an intermittently \
+         refusing one (oscillates back to 0)",
+        &["bot_id"]
+    )
+    .expect("metric registration failed")
+});
+
 /// The refusal reasons, so a call site cannot invent a label string.
 pub mod refusal {
     pub const STALE: &str = "stale";
@@ -268,6 +299,10 @@ pub fn retire_absent_bots(running: &[String]) {
     };
     for bot_id in gone {
         set_venue_ages(&bot_id, &[]);
+        // A stopped bot must not leave its stale-streak series frozen at
+        // whatever count it last reached — same "absent, not frozen-looking-
+        // fine" discipline as the venue-age gauges above.
+        let _ = NET_WORTH_STALE_STREAK.remove_label_values(&[bot_id.as_str()]);
         if let Ok(mut seen) = SEEN.lock() {
             seen.remove(&bot_id);
         }
@@ -336,6 +371,7 @@ pub fn render() -> String {
     let _ = &*CRASHED_BOTS;
     let _ = &*VENUE_STATUS_AGE;
     let _ = &*NET_WORTH_STALE_SKIPPED_TOTAL;
+    let _ = &*NET_WORTH_STALE_STREAK;
     let _ = &*SPAWN_DURATION;
 
     let encoder = TextEncoder::new();
@@ -494,5 +530,45 @@ mod tests {
         let _g = serial();
         retire_venue_ages("test-never-seen");
         assert_eq!(series_for("test-never-seen"), 0);
+    }
+
+    #[test]
+    fn stale_streak_climbs_then_resets_on_a_fresh_reading() {
+        let _g = serial();
+        let bot = "test-streak-climb-reset";
+        // Three consecutive stale ticks (what net_worth.rs's eligible_readings
+        // does on each `reason=stale` refusal).
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).inc();
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).inc();
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).inc();
+        assert_eq!(NET_WORTH_STALE_STREAK.with_label_values(&[bot]).get(), 3.0);
+
+        // A reading is recorded again — the streak must fall back to 0, not
+        // merely stop climbing, so an intermittent bot reads as intermittent.
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).set(0.0);
+        assert_eq!(NET_WORTH_STALE_STREAK.with_label_values(&[bot]).get(), 0.0);
+    }
+
+    #[test]
+    fn a_bot_that_stops_running_has_its_stale_streak_retired() {
+        let _g = serial();
+        let bot = "test-streak-retired-on-stop";
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).inc();
+        NET_WORTH_STALE_STREAK.with_label_values(&[bot]).inc();
+        assert_eq!(NET_WORTH_STALE_STREAK.with_label_values(&[bot]).get(), 2.0);
+        // Register it in SEEN the way `set_venue_ages` would from a real probe,
+        // so `retire_absent_bots` has something to consider "gone" below.
+        set_venue_ages(bot, &[("Kraken".into(), "live".into(), 1.0)]);
+
+        retire_absent_bots(&[]); // bot no longer in the running set
+
+        // A frozen-at-2 series would read as "stuck two ticks ago" forever —
+        // the same lying-gauge failure mode `retire_venue_ages` exists for.
+        assert_eq!(
+            NET_WORTH_STALE_STREAK.with_label_values(&[bot]).get(),
+            0.0,
+            "with_label_values re-creates a fresh (0) child after removal — the \
+             retirement must have actually removed the old, non-zero series"
+        );
     }
 }
