@@ -110,7 +110,9 @@ async fn main() -> anyhow::Result<()> {
             "api_key" => Some(creds.api_key.clone()),
             "api_secret" => Some(creds.api_secret.clone()),
             "api_passphrase" => creds.api_passphrase.clone(),
-            other => anyhow::bail!("unknown field '{other}' (want api_key/api_secret/api_passphrase)"),
+            other => {
+                anyhow::bail!("unknown field '{other}' (want api_key/api_secret/api_passphrase)")
+            }
         };
         match value {
             // .env-shaped: strip any embedded newline so one credential can
