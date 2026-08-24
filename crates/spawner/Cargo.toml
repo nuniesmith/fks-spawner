@@ -23,6 +23,11 @@ description = "FKS Bot Spawner — Docker container lifecycle manager for isolat
 name = "spawner"
 path = "src/main.rs"
 
+[[bin]]
+name = "export-secret-env"
+path = "src/bin/export_secret_env.rs"
+required-features = ["db"]
+
 [dependencies]
 # Async runtime
 tokio        = { version = "1.48", features = ["full"] }
