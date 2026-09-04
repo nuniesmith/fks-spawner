@@ -1517,7 +1517,22 @@ pub async fn respawn_from_config(
         let secrets = std::mem::take(&mut spawn_req.secrets);
         inject_secrets(store, &secrets, &mut spawn_req.env).await?;
     }
-    // 4. Concurrency cap — count RUNNING bots EXCLUDING the container we are
+    // 4. Declared mode vs requested capability, on the FULLY RESOLVED env.
+    //
+    // `spawn_bot` has always applied this, but respawn reaches the shared spawn
+    // path only AFTER teardown — so a contradictory saved config passed
+    // preflight, had its running bot stopped and removed, and was only then
+    // rejected, leaving no replacement. External review (Sol, 2026-09-04, R4)
+    // found that ordering. A guard that fires after the destructive step
+    // converts a refusable request into an outage.
+    //
+    // Checked here, after secrets injection, so it sees the same env the
+    // container would actually receive.
+    if let Err(why) = reject_contradictory_execution_mode(&spawn_req.mode, &spawn_req.env) {
+        return Err(SpawnerError::InvalidRequest(why));
+    }
+
+    // 5. Concurrency cap — count RUNNING bots EXCLUDING the container we are
     //    about to remove (removing it frees its slot), matching exactly what
     //    `DockerClient::spawn` will see after the removal. A respawn of a
     //    running bot therefore never false-trips its own cap.

@@ -1728,6 +1728,50 @@ async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
     .expect("seed spawn");
 }
 
+/// NO-SILENT-DEAD-BOT, applied to the execution-mode contradiction.
+///
+/// A saved config declaring `mode=paper` while its env arms real orders is
+/// refused by `spawn_bot` — but respawn only reaches the shared spawn path
+/// AFTER teardown. Before this check moved into the pre-flight, such a config
+/// passed pre-flight, had its running bot stopped and removed, and was only
+/// then rejected: a refusable request turned into an outage.
+///
+/// Asserts the invariant the way it actually matters — the live container is
+/// STILL THERE afterwards, which is only true if zero remove calls happened.
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_contradictory_config_is_refused_before_the_running_bot_is_touched() {
+    use spawner::api::respawn_from_config;
+    use spawner::docker_client::DockerOps;
+
+    let (state, mock) = build_state(test_config(""));
+    seed_running(&mock, "fks-bot-spot:latest", "crypto-spot-live").await;
+    assert_eq!(mock.list_bots().await.unwrap().len(), 1, "seeded bot is up");
+
+    let mut cfg = config_row("fks-bot-spot:latest", "crypto-spot-live", vec![]);
+    cfg.mode = "paper".to_string();
+    cfg.env.insert("SPOT_LIVE".to_string(), "1".to_string());
+
+    let err = respawn_from_config(&state, &cfg, "crypto-spot-live".to_string())
+        .await
+        .expect_err("a paper-labelled config that arms live orders must be refused");
+    assert!(
+        format!("{err:?}").contains("SPOT_LIVE"),
+        "the refusal should name the offending variable, got: {err:?}"
+    );
+
+    // THE POINT: the bot that was running is still running. A rejection after
+    // teardown would leave zero.
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(
+        bots.len(),
+        1,
+        "the live bot must survive a refused respawn — found {} container(s)",
+        bots.len()
+    );
+    assert_eq!(bots[0].name, "fks-bot-crypto-spot-live");
+}
+
 #[cfg(feature = "db")]
 #[tokio::test]
 async fn respawn_from_config_removes_old_and_spawns_new() {
