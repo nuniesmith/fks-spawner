@@ -72,9 +72,31 @@ struct Venue {
     /// whole holding, so a fully-unsettled small trade on a large position is still
     /// caught). `None` when nothing is awaiting verification.
     pending_reconcile: Option<HashMap<String, (f64, f64)>>,
+    /// Set when a submission's outcome could not be established. While this is
+    /// `Some`, the venue places NO further orders — not after the cooldown
+    /// expires, not on a deposit, and not for the rest of the batch the
+    /// ambiguity occurred in.
+    ///
+    /// A cooldown is a TIMER; this is a HOLD. The distinction is the whole
+    /// point: a timer expires on its own and hands the venue back without
+    /// anyone having established what happened, which is precisely the
+    /// condition under which a duplicate gets placed.
+    unresolved: Option<UnresolvedSubmission>,
     /// Latest total value this venue reported (last successful cycle). Feeds the
     /// portfolio drawdown breaker so a transient per-venue error doesn't blind it.
     last_value: Option<f64>,
+}
+
+/// A submission whose outcome was never established.
+///
+/// Carries what was attempted so the alert and the journal can name it, and so
+/// a human can look it up on the exchange.
+#[derive(Clone, Debug)]
+struct UnresolvedSubmission {
+    asset: String,
+    side: Side,
+    usd: f64,
+    at_secs: u64,
 }
 
 /// What actually happened to one rebalance trade — distinguishes a real fill
@@ -239,6 +261,7 @@ impl Engine {
                 paper,
                 live: venue_live,
                 pending_reconcile: None,
+                unresolved: None,
                 last_value: None,
             });
         }
@@ -516,7 +539,32 @@ async fn run_cycle(
     {
         let actual: HashMap<String, f64> =
             holdings.iter().map(|h| (h.name.clone(), h.qty)).collect();
-        for (asset, exp_qty, act_qty, div) in reconcile_check(&expected, &actual, tol) {
+        let mismatches = reconcile_check(&expected, &actual, tol);
+
+        // CLEARING THE HOLD. Reconciliation is the only automatic path out:
+        // the balances agreed with what we expected, so the book is describable
+        // again. A hold is never cleared by time passing, because nothing about
+        // waiting establishes what happened to the order.
+        //
+        // Note this can only fire when there was something to reconcile. A hold
+        // taken on the FIRST trade of a batch leaves no expectation behind, so
+        // it persists until an operator acts — which is the correct asymmetry:
+        // the less we know, the longer we hold.
+        if mismatches.is_empty() && venue.unresolved.is_some() {
+            let u = venue.unresolved.take();
+            if let Some(u) = u {
+                info!(
+                    venue = venue.ex.name(), asset = %u.asset,
+                    "hold CLEARED — balances reconciled to expectation"
+                );
+                alerter.notify(format!(
+                    "✅ {} hold cleared — balances reconciled after the unconfirmed {:?} {}. Trading resumes.",
+                    venue.ex.name(), u.side, u.asset
+                ));
+            }
+        }
+
+        for (asset, exp_qty, act_qty, div) in mismatches {
             warn!(
                 venue = venue.ex.name(), asset = %asset,
                 expected = format!("{exp_qty:.8}"), actual = format!("{act_qty:.8}"),
@@ -630,6 +678,42 @@ async fn run_cycle(
                 })
                 .collect(),
         });
+    }
+
+    // 4b. THE UNRESOLVED HOLD.
+    //
+    // Deliberately ahead of BOTH deposit detection and the cooldown check,
+    // because those were the two routes around it. A deposit explicitly
+    // "bypasses the cooldown", and the cooldown expires on its own — so a hold
+    // expressed as a cooldown is not a hold at all. Placing it here means no
+    // timer and no cash event can hand the venue back.
+    //
+    // Clearing is deliberately NOT automatic on a timer: it happens when
+    // reconciliation shows the balance matches expectation (§2b), or when an
+    // operator acts. Uncertainty does not resolve by waiting.
+    if let Some(u) = venue.unresolved.clone() {
+        let age = now_secs().saturating_sub(u.at_secs);
+        warn!(
+            venue = venue.ex.name(), asset = %u.asset, side = ?u.side,
+            usd = format!("{:.2}", u.usd), held_for_secs = age,
+            "VENUE HELD — a submission's outcome was never established; placing no orders"
+        );
+        // Re-alert on a slow cadence so a hold cannot be forgotten, without
+        // paging every poll.
+        if age.is_multiple_of(3600) {
+            alerter.notify(format!(
+                "⛔ {} STILL HELD after {}m — {:?} {} (~${:.2}) was never confirmed. \
+                 No orders are being placed on this venue. Reconcile it against the \
+                 exchange, then restart the bot to clear the hold.",
+                venue.ex.name(),
+                age / 60,
+                u.side,
+                u.asset,
+                u.usd
+            ));
+        }
+        // The venue's value is still a true reading — only ORDERS are held.
+        return Ok(p.total_value);
     }
 
     // 5. Deposit detection: a cash jump since the previous (non-trading) cycle
@@ -750,9 +834,28 @@ async fn run_cycle(
                     }
                     TradeOutcome::Simulated => acted += 1,
                     // Not counted as `acted` — nothing is KNOWN to have moved,
-                    // so there is no delta to reconcile against. But it must
-                    // stop the venue being freed for an immediate retry.
-                    TradeOutcome::Unknown => unknown_outcome = true,
+                    // so there is no delta to reconcile against.
+                    //
+                    // BREAKS the batch. The remaining trades in this plan were
+                    // sized against a book we can no longer describe: if the
+                    // ambiguous order did fill, every subsequent trade is
+                    // computed from a stale balance. Continuing the loop was
+                    // the first of the three gaps in this design.
+                    TradeOutcome::Unknown => {
+                        unknown_outcome = true;
+                        venue.unresolved = Some(UnresolvedSubmission {
+                            asset: tr.name.clone(),
+                            side: tr.side,
+                            usd: tr.usd,
+                            at_secs: now_secs(),
+                        });
+                        warn!(
+                            venue = venue.ex.name(), asset = %tr.name,
+                            remaining = p.trades.len(),
+                            "HOLDING the venue — abandoning the rest of this batch"
+                        );
+                        break;
+                    }
                 }
             }
             // Only arm the cooldown + reconciliation when a trade genuinely went
@@ -1144,39 +1247,6 @@ mod tests {
         assert!(slippage_exceeds(planned, 105.0, 0.001).is_some());
     }
 
-    /// An UNKNOWN submission must not leave the venue free to resubmit.
-    ///
-    /// The scenario: a market buy is sent, the broker accepts it, and the
-    /// response is lost to a timeout. The old code called that `Failed`
-    /// ("nothing happened"), did not arm the cooldown, and the next cycle saw
-    /// the same drift — because the balance had not caught up — and placed the
-    /// same order again. Two fills, one intended trade.
-    ///
-    /// This pins the arming rule rather than the enum shape, because the rule
-    /// is the part that prevents the duplicate.
-    #[test]
-    fn an_unknown_outcome_arms_the_cooldown_even_though_nothing_is_confirmed() {
-        // `acted` counts only what is KNOWN to have moved, so an unknown
-        // submission leaves it at zero...
-        let acted = 0usize;
-        let unknown_outcome = true;
-        // ...and the cooldown must still be armed off the unknown flag.
-        let cooldown_armed = unknown_outcome || acted > 0;
-        assert!(
-            cooldown_armed,
-            "an unknown submission must hold the venue; freeing it is what \
-             allows a second order for one intended trade"
-        );
-        // A genuinely idle cycle (nothing attempted, nothing unknown) must NOT
-        // hold the venue — the hold is a response to uncertainty, not a default.
-        let idle_unknown = false;
-        let idle_acted = 0usize;
-        assert!(
-            !(idle_unknown || idle_acted > 0),
-            "a cycle that attempted nothing must stay free to trade next cycle"
-        );
-    }
-
     /// A fill's provenance must survive into the record, because the journal is
     /// what every later performance and reconciliation claim is computed from.
     #[test]
@@ -1316,5 +1386,183 @@ mod tests {
         // disabled (threshold 0) or bad planned price → never flags.
         assert!(slippage_exceeds(100.0, 200.0, 0.0).is_none());
         assert!(slippage_exceeds(0.0, 200.0, 0.02).is_none());
+    }
+
+    // ── The unresolved hold, exercised through the real `run_cycle` ─────────
+    //
+    // The previous version of this test asserted a locally computed boolean,
+    // which the external reviewer correctly pointed out proves nothing about
+    // the production transitions. These drive `run_cycle` against a fake
+    // exchange and count actual submissions.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Counts submissions and can be told to fail them (producing `Unknown`).
+    struct FakeExchange {
+        submissions: Arc<AtomicUsize>,
+        fail_submissions: bool,
+        cash: f64,
+    }
+
+    #[async_trait::async_trait]
+    impl SpotExchange for FakeExchange {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn has_keys(&self) -> bool {
+            true
+        }
+        fn cash_asset(&self) -> &str {
+            "USD"
+        }
+        async fn balances(&self) -> Result<Vec<crate::spot::exchange::Balance>> {
+            Ok(vec![
+                crate::spot::exchange::Balance {
+                    asset: "USD".into(),
+                    free: self.cash,
+                },
+                crate::spot::exchange::Balance {
+                    asset: "BTC".into(),
+                    free: 0.0,
+                },
+                crate::spot::exchange::Balance {
+                    asset: "ETH".into(),
+                    free: 0.0,
+                },
+            ])
+        }
+        async fn price(&self, _asset: &str) -> Result<f64> {
+            Ok(100.0)
+        }
+        async fn market_buy(&self, _asset: &str, _quote_usd: f64) -> Result<Fill> {
+            self.submissions.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.fail_submissions {
+                anyhow::bail!("simulated transport timeout after broker acceptance");
+            }
+            Ok(Fill {
+                asset: "BTC".into(),
+                side: Side::Buy,
+                base_qty: 1.0,
+                avg_price: 100.0,
+                quote_usd: 100.0,
+                resolved: true,
+            })
+        }
+        async fn market_sell(&self, _asset: &str, _base_qty: f64) -> Result<Fill> {
+            self.submissions.fetch_add(1, AtomicOrdering::SeqCst);
+            anyhow::bail!("simulated transport timeout after broker acceptance")
+        }
+    }
+
+    fn held_venue(submissions: Arc<AtomicUsize>, cash: f64, fail: bool) -> Venue {
+        Venue {
+            ex: Box::new(FakeExchange {
+                submissions,
+                fail_submissions: fail,
+                cash,
+            }),
+            targets: vec![
+                Target {
+                    name: "BTC".into(),
+                    weight: 0.5,
+                },
+                Target {
+                    name: "ETH".into(),
+                    weight: 0.5,
+                },
+            ],
+            reserve_pct: 0.0,
+            band: 0.01,
+            cooldown_secs: 300,
+            min_trade_usd: 1.0,
+            deposit_trigger_usd: 10.0,
+            last_rebalance: None,
+            last_cash: None,
+            traded_last: false,
+            stuck_cycles: 0,
+            paper: None,
+            live: true,
+            pending_reconcile: None,
+            unresolved: None,
+            last_value: None,
+        }
+    }
+
+    async fn cycle(v: &mut Venue) {
+        let _ = run_cycle(
+            v,
+            true,
+            None,
+            0.0,
+            None,
+            None,
+            &Alerter::new(None),
+            &EventClient::new(None, None),
+            "test",
+            &Journal::new(None),
+        )
+        .await;
+    }
+
+    /// GAP 1 — the rest of the batch must not be submitted.
+    #[tokio::test]
+    async fn an_unknown_outcome_abandons_the_rest_of_the_batch() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut v = held_venue(n.clone(), 10_000.0, true);
+        cycle(&mut v).await;
+        assert_eq!(
+            n.load(AtomicOrdering::SeqCst),
+            1,
+            "two targets are adrift, so the plan holds two trades; only the FIRST \
+             may be submitted once its outcome is unknown"
+        );
+        assert!(v.unresolved.is_some(), "the venue must be held");
+    }
+
+    /// GAP 2 — a deposit explicitly bypasses the cooldown; it must not bypass the hold.
+    #[tokio::test]
+    async fn a_deposit_does_not_release_the_hold() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut v = held_venue(n.clone(), 10_000.0, true);
+        cycle(&mut v).await;
+        let after_first = n.load(AtomicOrdering::SeqCst);
+        assert!(v.unresolved.is_some());
+
+        // Simulate cash arriving: the deposit path fires on a jump since the
+        // previous non-trading cycle.
+        v.traded_last = false;
+        v.last_cash = Some(10.0);
+        v.ex = Box::new(FakeExchange {
+            submissions: n.clone(),
+            fail_submissions: true,
+            cash: 500_000.0,
+        });
+        cycle(&mut v).await;
+        assert_eq!(
+            n.load(AtomicOrdering::SeqCst),
+            after_first,
+            "a deposit must not place an order while the venue is held"
+        );
+    }
+
+    /// GAP 3 — the cooldown expires on its own; the hold must not.
+    #[tokio::test]
+    async fn cooldown_expiry_does_not_release_the_hold() {
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut v = held_venue(n.clone(), 10_000.0, true);
+        cycle(&mut v).await;
+        let after_first = n.load(AtomicOrdering::SeqCst);
+        assert!(v.unresolved.is_some());
+
+        // Push the cooldown far into the past — as if hours had elapsed.
+        v.last_rebalance = Some(now_secs().saturating_sub(86_400));
+        cycle(&mut v).await;
+        assert_eq!(
+            n.load(AtomicOrdering::SeqCst),
+            after_first,
+            "an expired cooldown must not place an order while the venue is held; \
+             a timer running out establishes nothing about the earlier order"
+        );
     }
 }
