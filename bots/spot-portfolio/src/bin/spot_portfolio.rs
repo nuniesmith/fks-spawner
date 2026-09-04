@@ -38,50 +38,66 @@ async fn main() -> Result<()> {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // ── The declared mode has to agree with the capability being used ────────
-    //
-    // `FKS_BOT_MODE` is what the spawner stamps on the container, what the
-    // `fks.mode` label says, and what the `live_flip` notification keys off.
-    // Until now this process never read it: `SPOT_LIVE=1` armed real orders
-    // regardless, so a container labelled `paper` could trade live and the
-    // alert that exists to announce that would report "paper".
-    //
-    // A label nobody checks is not a boundary, it is a comment. This makes the
-    // two agree or refuses to start.
-    //
-    // An UNSET mode is refused too, and that is the deliberate part. The
-    // spawner always sets it, so unset means "not launched by the platform" —
-    // and treating absence as permission is the exact shape that makes every
-    // other check bypassable by removing a variable. The escape hatch is to
-    // state the capability you are using: `FKS_BOT_MODE=live`.
-    if spot_live_env {
-        match std::env::var("FKS_BOT_MODE").ok().as_deref() {
-            Some("live") => {}
-            Some(other) => {
-                anyhow::bail!(
-                    "REFUSING TO START: SPOT_LIVE=1 arms real orders, but this process is \
-                     declared FKS_BOT_MODE={other}. The label and the capability must agree — \
-                     a container labelled '{other}' that places real orders is invisible to \
-                     the live_flip alert and to anyone reading `docker ps`. Either spawn it \
-                     with mode=live, or drop SPOT_LIVE."
-                );
-            }
-            None => {
-                anyhow::bail!(
-                    "REFUSING TO START: SPOT_LIVE=1 arms real orders but FKS_BOT_MODE is unset, \
-                     so nothing declares what this process is. Absence is not permission. Set \
-                     FKS_BOT_MODE=live to state the capability being used."
-                );
-            }
-        }
-    }
-
     if spot_live_env && !cfg.live {
         tracing::warn!(
             "SPOT_LIVE=1 — arming LIVE trading (real orders on real balances). \
              Config baked live=false; env override in effect."
         );
         cfg.live = true;
+    }
+
+    // ── The declared mode must agree with the EFFECTIVE capability ───────────
+    //
+    // `FKS_BOT_MODE` is what the spawner stamps on the container, what the
+    // `fks.mode` label says, and what the `live_flip` notification keys off.
+    // This process never read it: live orders were armed regardless, so a
+    // container labelled `paper` could trade live and the alert that exists to
+    // announce that would report "paper". A label nobody checks is not a
+    // boundary, it is a comment.
+    //
+    // CHECKED AFTER THE OVERRIDE IS APPLIED, deliberately. An earlier version
+    // of this guard keyed on `SPOT_LIVE` — the arming VARIABLE — which meant a
+    // supplied TOML carrying `live = true` walked straight past it with no
+    // override set at all. External review (Sol, 2026-09-04, R4) found that.
+    // The question is not "was the override used", it is "is this process
+    // going to place real orders", and only the resolved config answers it.
+    //
+    // An UNSET mode is refused too. The spawner always sets it, so unset means
+    // "not launched by the platform" — and treating absence as permission is
+    // the exact shape that makes every other check bypassable by removing a
+    // variable. The escape hatch is to state the capability: FKS_BOT_MODE=live.
+    if cfg.live {
+        let declared = std::env::var("FKS_BOT_MODE").ok();
+        match declared.as_deref() {
+            Some("live") => {}
+            Some(other) => {
+                anyhow::bail!(
+                    "REFUSING TO START: this process is configured to place REAL ORDERS \
+                     (live=true{}), but it is declared FKS_BOT_MODE={other}. The label and \
+                     the capability must agree — a container labelled '{other}' that trades \
+                     live is invisible to the live_flip alert and to anyone reading \
+                     `docker ps`. Either spawn it with mode=live, or make it not live.",
+                    if spot_live_env {
+                        " via SPOT_LIVE"
+                    } else {
+                        " from config"
+                    }
+                );
+            }
+            None => {
+                anyhow::bail!(
+                    "REFUSING TO START: this process is configured to place REAL ORDERS \
+                     (live=true{}) but FKS_BOT_MODE is unset, so nothing declares what it \
+                     is. Absence is not permission. Set FKS_BOT_MODE=live to state the \
+                     capability being used.",
+                    if spot_live_env {
+                        " via SPOT_LIVE"
+                    } else {
+                        " from config"
+                    }
+                );
+            }
+        }
     }
 
     // Status/metrics server (FKS bot contract): /health, /metrics, /status on
