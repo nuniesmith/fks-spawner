@@ -263,6 +263,47 @@ async fn spawn_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
+/// Env vars that arm REAL ORDERS in a bot, whatever its declared mode says.
+///
+/// Kept as a list because the failure is per-bot: each bot family has its own
+/// arming switch, and a new one that is not listed here re-opens the gap
+/// silently. Adding a bot with a live override means adding it here.
+const LIVE_ARMING_ENV: &[&str] = &["SPOT_LIVE"];
+
+/// Refuse a spawn whose declared mode contradicts the capability it requests.
+///
+/// Pure so the decision is testable without Docker. Returns the operator-facing
+/// reason on refusal.
+///
+/// Only `mode = "live"` may carry a live-arming variable. Everything else —
+/// `paper`, `dry-run`, `backtest`, or a mode nobody has invented yet — is
+/// refused, deliberately by allowlist rather than by blocking a list of known
+/// non-live modes: a new mode string must not silently inherit permission to
+/// trade.
+fn reject_contradictory_execution_mode(
+    mode: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let armed: Vec<&str> = LIVE_ARMING_ENV
+        .iter()
+        .copied()
+        .filter(|k| {
+            env.get(*k)
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        })
+        .collect();
+    if armed.is_empty() || mode == "live" {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to spawn: mode='{mode}' but {} arms real orders. A container \
+         labelled '{mode}' that trades live is invisible to the live_flip alert \
+         and to anyone reading `docker ps`. Spawn it with mode='live', or drop \
+         the override.",
+        armed.join(", ")
+    ))
+}
+
 /// Resolve each requested exchange's stored credentials and inject them into
 /// `env` as `{EXCHANGE}_API_KEY` / `_API_SECRET` (+ `_API_PASSPHRASE` when
 /// stored). Shared by the `/spawn` path and the respawn PRE-FLIGHT so both
@@ -351,6 +392,23 @@ pub fn inject_events_env(config: &Config, env: &mut std::collections::HashMap<St
 /// Returns the `SpawnResponse`; the HTTP handlers wrap it in their status code.
 async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse, SpawnerError> {
     let t = Instant::now();
+
+    // ── The declared mode must agree with the capability being requested ────
+    //
+    // `mode` is what becomes the `fks.mode` label, `FKS_BOT_MODE`, and the key
+    // the `live_flip` notification fires on. It described the container without
+    // constraining it: a spawn with `mode: "paper"` and `SPOT_LIVE=1` in `env`
+    // produced a container labelled paper that placed real orders, and the one
+    // alert that exists to announce live arming reported "paper".
+    //
+    // Refused at admission so no such container is ever created. The bot also
+    // re-checks at startup, because this guard only covers what comes through
+    // the spawner — the process must refuse the same contradiction when run by
+    // hand.
+    if let Err(why) = reject_contradictory_execution_mode(&req.mode, &req.env) {
+        return Err(SpawnerError::InvalidRequest(why));
+    }
+
     let image_prefix = req
         .image
         .split(':')
@@ -2353,6 +2411,60 @@ async fn logs_sse_handler(
 
 #[cfg(test)]
 mod tests {
+    use super::reject_contradictory_execution_mode as check;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// The defect: a container labelled `paper` that places real orders. It is
+    /// invisible to the live_flip alert (which keys off the label) and to
+    /// anyone reading `docker ps`.
+    #[test]
+    fn a_paper_spawn_may_not_arm_live_orders() {
+        let e = env(&[("SPOT_LIVE", "1")]);
+        assert!(check("paper", &e).is_err());
+        assert!(check("dry-run", &e).is_err());
+        // Allowlist, not blocklist: a mode nobody has invented yet must not
+        // inherit permission to trade just because it is unrecognised.
+        assert!(check("some-new-mode", &e).is_err());
+    }
+
+    /// Truthiness must match how the bot itself reads the variable, or the two
+    /// layers disagree about what "armed" means.
+    #[test]
+    fn the_arming_check_matches_the_bots_own_parsing() {
+        assert!(check("paper", &env(&[("SPOT_LIVE", "true")])).is_err());
+        assert!(check("paper", &env(&[("SPOT_LIVE", "TRUE")])).is_err());
+        // Anything else is not arming, so it is not a contradiction.
+        assert!(check("paper", &env(&[("SPOT_LIVE", "0")])).is_ok());
+        assert!(check("paper", &env(&[("SPOT_LIVE", "")])).is_ok());
+    }
+
+    /// The cases that MUST keep working — both live bots on this host are
+    /// internally consistent and must be unaffected.
+    #[test]
+    fn consistent_spawns_are_untouched() {
+        // The live spot bot: mode=live + SPOT_LIVE=1.
+        assert!(check("live", &env(&[("SPOT_LIVE", "1")])).is_ok());
+        // The paper funding bot: mode=paper, no override.
+        assert!(check("paper", &env(&[])).is_ok());
+        // A live-labelled bot that has not armed anything is fine too.
+        assert!(check("live", &env(&[])).is_ok());
+    }
+
+    /// The refusal has to tell the operator what to do about it.
+    #[test]
+    fn the_refusal_names_the_variable_and_the_fix() {
+        let why = check("paper", &env(&[("SPOT_LIVE", "1")])).unwrap_err();
+        assert!(why.contains("SPOT_LIVE"), "{why}");
+        assert!(why.contains("mode='live'"), "{why}");
+    }
+
     use super::resolve_respawn_bot_id;
 
     #[test]
