@@ -814,13 +814,52 @@ async fn execute_trade(
             base_qty: tr.volume,
             avg_price: tr.price,
             quote_usd: tr.usd,
+            // dry-run stand-in: nothing was submitted, so nothing is confirmed
+            resolved: false,
         }
     };
+
+    // UNCONFIRMED EXECUTION. The adapter could not resolve this order against
+    // the venue and returned the values we asked for. Something may have
+    // filled, partially filled, or not filled at all; the numbers below are an
+    // assumption, not a measurement, and the position is now unknown.
+    //
+    // Alert-only for now, deliberately: refusing to journal it would lose the
+    // record entirely, and halting here is a bigger behavioural change than
+    // belongs in a detection fix. The full repair is an order lifecycle with an
+    // explicit unknown state and reconciliation before new risk is taken.
+    if real && !fill.resolved {
+        warn!(
+            venue = venue.ex.name(), asset = %tr.name, side = ?tr.side,
+            assumed_usd = format!("{:.2}", fill.quote_usd),
+            assumed_qty = format!("{:.8}", fill.base_qty),
+            "UNCONFIRMED FILL — venue lookup failed; journalled values are REQUESTED, not executed"
+        );
+        alerter.notify(format!(
+            "⚠️ UNCONFIRMED FILL on {} — {:?} {} could not be confirmed with the venue. \
+             Journalled ~${:.2} @ {:.2} are the values we ASKED for, not a measured execution. \
+             Reconcile against the exchange before trusting the position.",
+            venue.ex.name(),
+            tr.side,
+            tr.name,
+            fill.quote_usd,
+            fill.avg_price
+        ));
+    }
 
     // Slippage / bad-fill anomaly alert: a real fill whose average price strayed
     // far from the planned price signals thin liquidity, a stale quote, or a
     // mispriced order. Alert-only — the fill already happened; this surfaces it.
-    if real && let Some(slip) = slippage_exceeds(tr.price, fill.avg_price, max_slippage_pct) {
+    //
+    // Gated on `fill.resolved` because slippage is `planned vs filled`, and on
+    // an unresolved fill those are literally the same number — the check would
+    // report a reassuring 0.00% at exactly the moment the fill is least
+    // trustworthy. A vacuous pass is worse than no check: it is evidence of
+    // nothing that reads as evidence of correctness.
+    if real
+        && fill.resolved
+        && let Some(slip) = slippage_exceeds(tr.price, fill.avg_price, max_slippage_pct)
+    {
         warn!(
             venue = venue.ex.name(), asset = %tr.name,
             planned = format!("{:.2}", tr.price), filled = format!("{:.2}", fill.avg_price),
@@ -842,6 +881,11 @@ async fn execute_trade(
         "event": "rebalance_trade", "venue": venue.ex.name(), "live": real,
         "asset": fill.asset, "side": format!("{:?}", fill.side),
         "volume": fill.base_qty, "usd": fill.quote_usd, "price": fill.avg_price,
+        // Provenance of the three numbers above. `false` means the venue could
+        // not confirm the order and these are the REQUESTED values — the row is
+        // an intent record, not an execution record. Anything computing
+        // performance or reconciliation from this journal must filter on it.
+        "fill_confirmed": fill.resolved,
     }));
     if let Some(status) = status::get() {
         status.record_trade();
@@ -1012,6 +1056,55 @@ fn reconcile_check(
 
 #[cfg(test)]
 mod tests {
+    /// WHY THE SLIPPAGE CHECK IS GATED ON `fill.resolved`.
+    ///
+    /// An unresolved fill carries the REQUESTED price as its average price, so
+    /// `planned` and `filled` are the same number and slippage is exactly zero
+    /// — no matter how badly the real order actually executed, or whether it
+    /// executed at all. Ungated, the check would report a reassuring 0.00%
+    /// precisely when the fill is least trustworthy.
+    ///
+    /// This pins that arithmetic so nobody "simplifies" the gate away later.
+    #[test]
+    fn an_unresolved_fill_makes_the_slippage_check_vacuous() {
+        let planned = 100.0;
+        // What an unresolved fill looks like: avg_price IS the planned price,
+        // because the adapter had nothing better to report.
+        let unresolved_filled = planned;
+        assert_eq!(
+            slippage_exceeds(planned, unresolved_filled, 0.001),
+            None,
+            "an unresolved fill can never trip the slippage alert — that is why \
+             the caller must gate on fill.resolved rather than trusting a pass"
+        );
+
+        // A genuinely resolved fill at the same threshold DOES trip it, so the
+        // check is not simply inert.
+        assert!(slippage_exceeds(planned, 105.0, 0.001).is_some());
+    }
+
+    /// A fill's provenance must survive into the record, because the journal is
+    /// what every later performance and reconciliation claim is computed from.
+    #[test]
+    fn fill_provenance_distinguishes_measured_from_assumed() {
+        let confirmed = Fill {
+            asset: "BTC".into(),
+            side: Side::Buy,
+            base_qty: 0.5,
+            avg_price: 100.0,
+            quote_usd: 50.0,
+            resolved: true,
+        };
+        let assumed = Fill {
+            resolved: false,
+            ..confirmed.clone()
+        };
+        // Identical numbers, different epistemic status — which is exactly the
+        // failure mode: they are indistinguishable without this flag.
+        assert_eq!(confirmed.base_qty, assumed.base_qty);
+        assert_eq!(confirmed.avg_price, assumed.avg_price);
+        assert!(confirmed.resolved && !assumed.resolved);
+    }
     use super::*;
 
     #[test]

@@ -230,6 +230,8 @@ async fn resolve_fill(
                                 base_qty: vol_exec,
                                 avg_price: cost / vol_exec,
                                 quote_usd: cost,
+                                // broker-confirmed: vol_exec/cost from the closed order
+                                resolved: true,
                             };
                         }
                     }
@@ -250,5 +252,7 @@ async fn resolve_fill(
         base_qty: req_qty,
         avg_price: req_price,
         quote_usd: req_qty * req_price,
+        // UNRESOLVED: closed-orders lookup failed, these are the REQUESTED values
+        resolved: false,
     }
 }
