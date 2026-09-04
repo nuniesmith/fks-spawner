@@ -550,7 +550,17 @@ async fn run_cycle(
         // taken on the FIRST trade of a batch leaves no expectation behind, so
         // it persists until an operator acts — which is the correct asymmetry:
         // the less we know, the longer we hold.
-        if mismatches.is_empty() && venue.unresolved.is_some() {
+        // The clean reconciliation must COVER THE UNRESOLVED ASSET. `expected`
+        // only ever holds CONFIRMED trades — the unknown one broke the batch
+        // before it was added — so without this check, trade A reconciling
+        // cleanly released trade B's hold having proven nothing whatsoever
+        // about B. External review (Sol, 2026-09-04) found that; it was a hold
+        // that any subsequent confirmed trade could open.
+        let covers_unresolved = venue
+            .unresolved
+            .as_ref()
+            .is_some_and(|u| expected.contains_key(&u.asset));
+        if mismatches.is_empty() && covers_unresolved {
             let u = venue.unresolved.take();
             if let Some(u) = u {
                 info!(
@@ -936,6 +946,30 @@ async fn execute_trade(
             Side::Sell => venue.ex.market_sell(&tr.name, tr.volume).await,
         };
         match res {
+            // An `Ok` carrying `resolved: false` is NOT a fill. The adapter
+            // returned the values we ASKED for because it could not establish
+            // what executed — epistemically identical to an error, and the case
+            // F1 is actually about. It was reported and then traded straight
+            // past: it became `Filled`, seeded reconciliation expectations from
+            // requested values, and never armed the hold.
+            Ok(f) if real && !f.resolved => {
+                warn!(
+                    venue = venue.ex.name(), asset = %tr.name, side = ?tr.side,
+                    assumed_usd = format!("{:.2}", f.quote_usd),
+                    "UNCONFIRMED FILL — holding the venue; the reported values are \
+                     what we asked for, not what executed"
+                );
+                alerter.notify(format!(
+                    "⚠️ UNCONFIRMED FILL on {} — {:?} {} (~${:.2}) could not be confirmed \
+                     with the venue. It may have filled. This venue is HELD; reconcile \
+                     against the exchange before trading it by hand.",
+                    venue.ex.name(),
+                    tr.side,
+                    tr.name,
+                    tr.usd
+                ));
+                return TradeOutcome::Unknown;
+            }
             Ok(f) => {
                 info!(
                     venue = venue.ex.name(), asset = %tr.name, side = ?tr.side,
@@ -1402,6 +1436,9 @@ mod tests {
     struct FakeExchange {
         submissions: Arc<AtomicUsize>,
         fail_submissions: bool,
+        /// Return Ok(..) with `resolved: false` — the adapter could not
+        /// establish what executed and fell back to requested values.
+        unresolved_fills: bool,
         cash: f64,
     }
 
@@ -1440,6 +1477,16 @@ mod tests {
             if self.fail_submissions {
                 anyhow::bail!("simulated transport timeout after broker acceptance");
             }
+            if self.unresolved_fills {
+                return Ok(Fill {
+                    asset: "BTC".into(),
+                    side: Side::Buy,
+                    base_qty: 1.0,
+                    avg_price: 100.0,
+                    quote_usd: 100.0,
+                    resolved: false,
+                });
+            }
             Ok(Fill {
                 asset: "BTC".into(),
                 side: Side::Buy,
@@ -1460,6 +1507,7 @@ mod tests {
             ex: Box::new(FakeExchange {
                 submissions,
                 fail_submissions: fail,
+                unresolved_fills: false,
                 cash,
             }),
             targets: vec![
@@ -1520,6 +1568,55 @@ mod tests {
         assert!(v.unresolved.is_some(), "the venue must be held");
     }
 
+    /// An UNRESOLVED FILL must hold the venue, not pass as a trade.
+    ///
+    /// `Ok(Fill { resolved: false })` is the adapter saying "here are the
+    /// values you asked for, because I could not establish what executed". That
+    /// is epistemically identical to an error and is the case F1 is actually
+    /// about — yet it became `Filled`, seeded reconciliation expectations from
+    /// requested values, and never armed the hold. Found by external review
+    /// (Sol, 2026-09-04) after I had described the hold as covering F2.
+    #[tokio::test]
+    async fn an_unresolved_fill_holds_the_venue_like_an_error_does() {
+        let n = Arc::new(AtomicUsize::new(0));
+        // `unresolved_fills: true` returns Ok(..) with resolved=false.
+        let mut v = held_venue(n.clone(), 10_000.0, false);
+        v.ex = Box::new(FakeExchange {
+            submissions: n.clone(),
+            fail_submissions: false,
+            unresolved_fills: true,
+            cash: 10_000.0,
+        });
+        cycle(&mut v).await;
+        assert!(
+            v.unresolved.is_some(),
+            "an unconfirmed fill must hold the venue"
+        );
+        assert_eq!(
+            n.load(AtomicOrdering::SeqCst),
+            1,
+            "and must abandon the rest of the batch, exactly like an error"
+        );
+    }
+
+    /// One trade reconciling must not release ANOTHER trade's hold.
+    ///
+    /// `expected` only ever holds CONFIRMED trades, so a clean reconciliation
+    /// of trade A was clearing trade B's hold having proven nothing about B.
+    #[test]
+    fn a_hold_is_only_cleared_by_reconciling_the_asset_it_is_about() {
+        use std::collections::HashMap;
+        let mut expected: HashMap<String, (f64, f64)> = HashMap::new();
+        expected.insert("BTC".into(), (1.0, 1.0)); // trade A confirmed
+        let unresolved_asset = "ETH"; // trade B unknown — never in `expected`
+
+        assert!(
+            !expected.contains_key(unresolved_asset),
+            "the unknown trade is absent from expectations by construction — \
+             that is exactly why its hold must not be cleared by them"
+        );
+    }
+
     /// GAP 2 — a deposit explicitly bypasses the cooldown; it must not bypass the hold.
     #[tokio::test]
     async fn a_deposit_does_not_release_the_hold() {
@@ -1536,6 +1633,7 @@ mod tests {
         v.ex = Box::new(FakeExchange {
             submissions: n.clone(),
             fail_submissions: true,
+            unresolved_fills: false,
             cash: 500_000.0,
         });
         cycle(&mut v).await;
