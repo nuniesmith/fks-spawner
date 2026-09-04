@@ -38,3 +38,10 @@ logs/
 # Archives
 *.zip
 *.tar.gz
+
+# Timestamped backups of the live-money config. The Dockerfile stages configs
+# with the glob `spot-portfolio*.toml*` — the trailing `*` means a
+# `spot-portfolio.toml.bak.<stamp>` MATCHES and would be copied into the build.
+# It is never the file the bot loads, so it can only ship a stale copy of live
+# allocations into an image. Keep it out of the context entirely.
+bots/spot-portfolio/spot-portfolio.toml.bak.*

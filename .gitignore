@@ -33,6 +33,13 @@ target/
 # committed.
 bots/spot-portfolio/spot-portfolio.toml
 
+# ...and its timestamped backups. The base file above is ignored because it is
+# LIVE-MONEY operational config (allocations, live_venues, deposit triggers)
+# that belongs on the host, not in a public repo — but a `*.bak.<stamp>` copy
+# of it carries exactly the same contents and was NOT covered by that line, so
+# it sat untracked in `git status` inviting a routine `git add -A`.
+bots/spot-portfolio/spot-portfolio.toml.bak.*
+
 # --- Logs / journals ---
 *.log
 *.jsonl
