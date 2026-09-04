@@ -36,6 +36,27 @@ pub struct Fill {
     pub avg_price: f64,
     /// Cash (quote) value moved = `base_qty * avg_price`.
     pub quote_usd: f64,
+    /// Whether the numbers above came from BROKER CONFIRMATION (`true`) or are
+    /// the values we asked for / estimated because confirmation could not be
+    /// resolved (`false`).
+    ///
+    /// WHY THIS FIELD EXISTS. Every adapter has a path where the closed-order
+    /// lookup fails and it returns the REQUESTED quantity and the price fetched
+    /// BEFORE submission, shaped exactly like a real fill. Downstream that is
+    /// consumed as an execution: it is journalled as one, it seeds
+    /// reconciliation expectations, and it is what the slippage check measures.
+    ///
+    /// That last one is the trap. Slippage is `planned vs filled`, and on an
+    /// unresolved fill those are THE SAME NUMBER — so the check that exists to
+    /// catch a bad fill reports exactly 0.00% precisely when the fill is least
+    /// trustworthy. A fabricated fill is not merely unverified, it is actively
+    /// self-certifying.
+    ///
+    /// This flag does not fix that. It makes it VISIBLE, so an unconfirmed
+    /// execution can be seen in the journal and alerted on, rather than being
+    /// indistinguishable from a confirmed one. The real repair is an order
+    /// lifecycle with an explicit unknown state; this is the detection half.
+    pub resolved: bool,
 }
 
 /// A normalized spot-trading interface over one exchange. Each venue's bespoke

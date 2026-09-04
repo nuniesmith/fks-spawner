@@ -144,6 +144,8 @@ impl KucoinSpot {
                                 base_qty: deal_size,
                                 avg_price: deal_funds / deal_size,
                                 quote_usd: deal_funds,
+                                // broker-confirmed: dealSize/dealFunds from the filled order
+                                resolved: true,
                             };
                         }
                     }
@@ -168,6 +170,8 @@ impl KucoinSpot {
             base_qty: est_base,
             avg_price: avg,
             quote_usd: est_quote,
+            // UNRESOLVED: estimated from the request, not confirmed by the venue
+            resolved: false,
         }
     }
 }

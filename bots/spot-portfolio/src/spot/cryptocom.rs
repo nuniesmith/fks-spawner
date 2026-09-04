@@ -174,6 +174,8 @@ impl SpotExchange for CryptocomSpot {
             base_qty: base,
             avg_price: price,
             quote_usd: base * price,
+            // UNRESOLVED: place_order's response is discarded; these are the REQUESTED values
+            resolved: false,
         })
     }
 
@@ -196,6 +198,8 @@ impl SpotExchange for CryptocomSpot {
             base_qty: base,
             avg_price: price,
             quote_usd: base * price,
+            // UNRESOLVED: place_order's response is discarded; these are the REQUESTED values
+            resolved: false,
         })
     }
 }
