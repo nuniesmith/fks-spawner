@@ -263,18 +263,6 @@ async fn spawn_handler(
     Ok((StatusCode::CREATED, Json(resp)))
 }
 
-/// Resolve each requested exchange's stored credentials and inject them into
-/// `env` as `{EXCHANGE}_API_KEY` / `_API_SECRET` (+ `_API_PASSPHRASE` when
-/// stored). Shared by the `/spawn` path and the respawn PRE-FLIGHT so both
-/// resolve secrets through the identical validation + store lookup.
-///
-/// Fails loudly (never silently starts a keyless bot that asked for keys) when
-/// an exchange name is malformed, more than 10 are requested, or an exchange
-/// has no stored credentials — the exact rotate-then-respawn footgun: keys
-/// stored under a mismatched name MUST surface as an error here, before the
-/// respawn tears down the running container. Existing `env` entries win
-/// (`or_insert`). Logs only the exchange name — never the credential values.
-#[cfg(feature = "db")]
 /// Env vars that arm REAL ORDERS in a bot, whatever its declared mode says.
 ///
 /// Kept as a list because the failure is per-bot: each bot family has its own
@@ -316,6 +304,18 @@ fn reject_contradictory_execution_mode(
     ))
 }
 
+/// Resolve each requested exchange's stored credentials and inject them into
+/// `env` as `{EXCHANGE}_API_KEY` / `_API_SECRET` (+ `_API_PASSPHRASE` when
+/// stored). Shared by the `/spawn` path and the respawn PRE-FLIGHT so both
+/// resolve secrets through the identical validation + store lookup.
+///
+/// Fails loudly (never silently starts a keyless bot that asked for keys) when
+/// an exchange name is malformed, more than 10 are requested, or an exchange
+/// has no stored credentials — the exact rotate-then-respawn footgun: keys
+/// stored under a mismatched name MUST surface as an error here, before the
+/// respawn tears down the running container. Existing `env` entries win
+/// (`or_insert`). Logs only the exchange name — never the credential values.
+#[cfg(feature = "db")]
 async fn inject_secrets(
     store: &BotRunStore,
     secrets: &[String],
