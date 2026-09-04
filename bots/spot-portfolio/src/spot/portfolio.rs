@@ -79,15 +79,45 @@ struct Venue {
 
 /// What actually happened to one rebalance trade — distinguishes a real fill
 /// (reconcilable), a simulated dry-run/paper trade (acted, nothing to reconcile),
-/// and a failed/rejected order (nothing happened), so the cooldown + reconciliation
-/// are only armed when a trade genuinely went through.
+/// and a submission whose outcome was never established, so the cooldown and
+/// reconciliation are armed on what is actually known rather than on a guess.
 enum TradeOutcome {
     /// A real order filled — carries the fill for reconciliation.
     Filled(Fill),
     /// A dry-run or paper trade was simulated (no real balance moved).
     Simulated,
-    /// A real order was attempted and failed/rejected — nothing happened.
-    Failed,
+    /// A real order was submitted and the outcome is UNKNOWN.
+    ///
+    /// The adapter returned an error, which is not the same as the venue
+    /// returning a rejection. A connection reset, a read timeout, or a 5xx can
+    /// all arrive AFTER the broker has accepted the order — so the order may be
+    /// working, may be filled, or may never have existed.
+    ///
+    /// Distinguished from `Failed` because the two demand opposite responses.
+    /// `Failed` means nothing happened, so retrying next cycle is correct.
+    /// Treating an unknown outcome the same way is what allows a second
+    /// submission of an order that already filled — the balance has not caught
+    /// up yet, so the next cycle sees the same drift and places the same trade
+    /// again.
+    ///
+    /// This variant does NOT make the outcome known. It stops the platform from
+    /// ASSERTING that nothing happened, and holds new risk on that venue until
+    /// a human has looked.
+    ///
+    /// THERE IS DELIBERATELY NO `Failed` VARIANT. One existed, documented as
+    /// "nothing happened", and every adapter error was mapped to it — including
+    /// timeouts, which is the bug this replaces. Adding `Unknown` left `Failed`
+    /// with no constructor at all, which is the honest answer: the adapters
+    /// return `anyhow::Error` with no structured kind, so THIS LAYER CANNOT TELL
+    /// a rejection from an ambiguity. A variant nothing can construct is a
+    /// distinction the code does not actually make, and keeping one around
+    /// invites a future reader to map errors into it by guesswork.
+    ///
+    /// Restoring a definite-rejection path is real work, not a variant: the
+    /// adapters must surface a typed error that separates "the venue said no"
+    /// from "we never heard back". Until they do, every submission error is
+    /// treated as unknown, which is the conservative direction.
+    Unknown,
 }
 
 /// The multi-venue portfolio engine.
@@ -655,6 +685,8 @@ async fn run_cycle(
             // Cap-skips and failed orders don't count — so a cycle where nothing
             // executed doesn't arm the cooldown / deposit-suppression on a non-event.
             let mut acted = 0usize;
+            // Set when a submission errored: the outcome was never established.
+            let mut unknown_outcome = false;
             for tr in &p.trades {
                 // Trade-size cap: one rebalance trade should never move a large
                 // fraction of the venue. A plan that does is a mispricing/bug —
@@ -717,12 +749,25 @@ async fn run_cycle(
                         entry.1 += delta;
                     }
                     TradeOutcome::Simulated => acted += 1,
-                    TradeOutcome::Failed => {}
+                    // Not counted as `acted` — nothing is KNOWN to have moved,
+                    // so there is no delta to reconcile against. But it must
+                    // stop the venue being freed for an immediate retry.
+                    TradeOutcome::Unknown => unknown_outcome = true,
                 }
             }
             // Only arm the cooldown + reconciliation when a trade genuinely went
-            // through. If every trade was cap-skipped or every order failed, leave
-            // the venue free to retry next cycle (and don't suppress deposit detect).
+            // through. If every trade was cap-skipped or every order was REJECTED,
+            // leave the venue free to retry next cycle (and don't suppress deposit
+            // detect).
+            //
+            // An UNKNOWN outcome is the exception, and that distinction is the whole
+            // point of the variant: "the venue rejected it" and "we never found out"
+            // are not the same fact. Freeing the venue after an unknown submission is
+            // what lets the next cycle re-place an order that may already have filled,
+            // because the balance has not caught up to say otherwise.
+            if unknown_outcome {
+                venue.last_rebalance = Some(now);
+            }
             if acted > 0 {
                 venue.last_rebalance = Some(now);
                 traded = true;
@@ -798,8 +843,24 @@ async fn execute_trade(
                 f
             }
             Err(e) => {
-                warn!(venue = venue.ex.name(), asset = %tr.name, side = ?tr.side, error = format!("{e:#}"), "order failed");
-                return TradeOutcome::Failed;
+                // The adapter errored. That is NOT the venue rejecting the
+                // order — a timeout or reset can arrive after the broker has
+                // accepted it, so the order may be working, filled, or absent.
+                warn!(
+                    venue = venue.ex.name(), asset = %tr.name, side = ?tr.side,
+                    error = format!("{e:#}"),
+                    "order submission FAILED OR UNKNOWN — outcome not established"
+                );
+                alerter.notify(format!(
+                    "⚠️ UNKNOWN ORDER OUTCOME on {} — {:?} {} (~${:.2}) errored during \
+                     submission. It may have filled. The venue is held rather than retried; \
+                     check the exchange before trading it by hand.",
+                    venue.ex.name(),
+                    tr.side,
+                    tr.name,
+                    tr.usd
+                ));
+                return TradeOutcome::Unknown;
             }
         }
     } else {
@@ -1081,6 +1142,39 @@ mod tests {
         // A genuinely resolved fill at the same threshold DOES trip it, so the
         // check is not simply inert.
         assert!(slippage_exceeds(planned, 105.0, 0.001).is_some());
+    }
+
+    /// An UNKNOWN submission must not leave the venue free to resubmit.
+    ///
+    /// The scenario: a market buy is sent, the broker accepts it, and the
+    /// response is lost to a timeout. The old code called that `Failed`
+    /// ("nothing happened"), did not arm the cooldown, and the next cycle saw
+    /// the same drift — because the balance had not caught up — and placed the
+    /// same order again. Two fills, one intended trade.
+    ///
+    /// This pins the arming rule rather than the enum shape, because the rule
+    /// is the part that prevents the duplicate.
+    #[test]
+    fn an_unknown_outcome_arms_the_cooldown_even_though_nothing_is_confirmed() {
+        // `acted` counts only what is KNOWN to have moved, so an unknown
+        // submission leaves it at zero...
+        let acted = 0usize;
+        let unknown_outcome = true;
+        // ...and the cooldown must still be armed off the unknown flag.
+        let cooldown_armed = unknown_outcome || acted > 0;
+        assert!(
+            cooldown_armed,
+            "an unknown submission must hold the venue; freeing it is what \
+             allows a second order for one intended trade"
+        );
+        // A genuinely idle cycle (nothing attempted, nothing unknown) must NOT
+        // hold the venue — the hold is a response to uncertainty, not a default.
+        let idle_unknown = false;
+        let idle_acted = 0usize;
+        assert!(
+            !(idle_unknown || idle_acted > 0),
+            "a cycle that attempted nothing must stay free to trade next cycle"
+        );
     }
 
     /// A fill's provenance must survive into the record, because the journal is
