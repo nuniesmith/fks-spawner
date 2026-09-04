@@ -221,16 +221,33 @@ async fn resolve_fill(
             match pc.get_closed_orders().await {
                 Ok(co) => {
                     if let Some(o) = co.closed.get(txid) {
+                        // BOTH figures must parse. `cost` used to fall back to
+                        // `vol_exec * req_price` — the REQUESTED price — while
+                        // still returning `resolved: true`, so a confirmed
+                        // QUANTITY with an unparseable price produced a fill
+                        // whose avg_price was the planned price, flagged as
+                        // broker-confirmed.
+                        //
+                        // That is the exact trap `resolved` exists to close:
+                        // the slippage check is gated on the flag and compares
+                        // planned against filled, so it would read 0.00% and
+                        // pass. External review (Sol, 2026-09-04) found it.
+                        //
+                        // A partially-parseable order is not a resolved fill.
+                        // Falling through continues the retry loop and, failing
+                        // that, reaches the unresolved path — which now holds
+                        // the venue rather than inventing a number.
                         let vol_exec = o.vol_exec.parse::<f64>().unwrap_or(0.0);
-                        if o.status == "closed" && vol_exec > 0.0 {
-                            let cost = o.cost.parse::<f64>().unwrap_or(vol_exec * req_price);
+                        let cost = o.cost.parse::<f64>().unwrap_or(0.0);
+                        if o.status == "closed" && vol_exec > 0.0 && cost > 0.0 {
                             return Fill {
                                 asset: asset.to_string(),
                                 side,
                                 base_qty: vol_exec,
                                 avg_price: cost / vol_exec,
                                 quote_usd: cost,
-                                // broker-confirmed: vol_exec/cost from the closed order
+                                // broker-confirmed: BOTH vol_exec and cost came
+                                // from the closed order and both parsed.
                                 resolved: true,
                             };
                         }
@@ -254,5 +271,42 @@ async fn resolve_fill(
         quote_usd: req_qty * req_price,
         // UNRESOLVED: closed-orders lookup failed, these are the REQUESTED values
         resolved: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `resolved: true` is a claim that the numbers came from the broker. It
+    /// must not survive a figure that did not parse.
+    ///
+    /// The removed fallback substituted the REQUESTED price for an unparseable
+    /// `cost` and still flagged the fill confirmed — which then made the
+    /// slippage check (gated on that flag) compare planned against planned and
+    /// report a reassuring 0.00%. Pins the GUARD rather than the arithmetic,
+    /// because the guard is what stops the flag lying.
+    #[test]
+    fn a_confirmed_fill_requires_both_figures_to_parse() {
+        let confirmable = |vol: &str, cost: &str| {
+            let v = vol.parse::<f64>().unwrap_or(0.0);
+            let c = cost.parse::<f64>().unwrap_or(0.0);
+            v > 0.0 && c > 0.0
+        };
+        assert!(confirmable("0.5", "50.0"), "both parse -> confirmable");
+        assert!(
+            !confirmable("0.5", ""),
+            "unparseable cost is not confirmable"
+        );
+        assert!(
+            !confirmable("0.5", "n/a"),
+            "garbage cost is not confirmable"
+        );
+        assert!(
+            !confirmable("", "50.0"),
+            "unparseable qty is not confirmable"
+        );
+        assert!(
+            !confirmable("0.5", "0"),
+            "a zero cost is not a real execution"
+        );
     }
 }
