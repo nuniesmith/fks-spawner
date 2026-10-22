@@ -1376,6 +1376,28 @@ fn load_templates(state: &AppState) -> TemplateSet {
     )
 }
 
+/// Make sure a template's image is on this host before a container is made
+/// from it. The spawner pulls it itself (nothing else pulls template images),
+/// so a template's new image takes effect on the instance's next start. If the
+/// registry can't be reached but the image is already here, go ahead with a
+/// warning: a registry outage must never stop a recorder from coming back.
+/// Refused only when the image is neither pullable nor here, and always
+/// before anything is torn down.
+async fn ensure_template_image(state: &AppState, image: &str) -> Result<(), SpawnerError> {
+    match state.docker.pull_image(image).await {
+        Ok(()) => Ok(()),
+        Err(pull_err) => match state.docker.image_present(image).await {
+            Ok(true) => {
+                warn!(image = %image, error = %pull_err, "couldn't pull; using the image already on this host");
+                Ok(())
+            }
+            _ => Err(SpawnerError::InvalidRequest(format!(
+                "can't pull {image} ({pull_err}), and it isn't on this host"
+            ))),
+        },
+    }
+}
+
 /// A plan failure as the response a form can show: 404 for an unknown
 /// template, 400 with one line per problem otherwise.
 fn plan_failure(e: PlanError) -> (StatusCode, Json<serde_json::Value>) {
@@ -1467,6 +1489,7 @@ async fn create_instance_handler(
         Err(SpawnerError::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
+    ensure_template_image(&state, &plan.image).await?;
     if let Some(dir) = &plan.data_dir
         && let Err(why) =
             instances::prepare_data_dir(dir, Some(state.config.instances.lake_min_free_gb))
@@ -1819,6 +1842,7 @@ pub async fn respawn_from_config(
                 lines.join("; ")
             )),
         })?;
+        ensure_template_image(state, &plan.image).await?;
         if let Some(dir) = &plan.data_dir {
             instances::prepare_data_dir(dir, None).map_err(SpawnerError::InvalidRequest)?;
         }

@@ -21,9 +21,9 @@ use bollard::{
     container::LogOutput,
     models::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig},
     query_parameters::{
-        CreateContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-        RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder, StatsOptionsBuilder,
-        StopContainerOptionsBuilder,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder,
+        StatsOptionsBuilder, StopContainerOptionsBuilder,
     },
 };
 use chrono::{DateTime, Datelike, Utc};
@@ -79,6 +79,13 @@ pub trait DockerOps: Send + Sync + 'static {
 
     /// One-shot live resource stats (CPU% + memory) for a single container.
     async fn stats(&self, id: &str) -> SpawnerResult<ContainerStats>;
+
+    /// Pull an image from its registry, anonymously. A template names the
+    /// image of every instance made from it, and nothing else pulls those.
+    async fn pull_image(&self, image: &str) -> SpawnerResult<()>;
+
+    /// Whether the image is on this host.
+    async fn image_present(&self, image: &str) -> SpawnerResult<bool>;
 
     /// Returns a stream of log lines for `id`, optionally tailing the
     /// last `tail` lines first.
@@ -601,6 +608,26 @@ impl DockerOps for DockerClient {
 
     async fn stats(&self, id: &str) -> SpawnerResult<ContainerStats> {
         DockerClient::stats(self, id).await
+    }
+
+    async fn pull_image(&self, image: &str) -> SpawnerResult<()> {
+        let opts = CreateImageOptionsBuilder::new().from_image(image).build();
+        let mut progress = self.docker.create_image(Some(opts), None, None);
+        while let Some(step) = progress.next().await {
+            step?;
+        }
+        info!(image = %image, "pulled image");
+        Ok(())
+    }
+
+    async fn image_present(&self, image: &str) -> SpawnerResult<bool> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn stream_logs(&self, id: &str, tail: Option<String>) -> LogStream {

@@ -97,6 +97,12 @@ struct MockState {
     /// What the most recent spawn asked for, for assertions on the parts the
     /// container info doesn't carry (the data folder, the env).
     last_spawn: Option<RecordedSpawn>,
+    /// Images pulled, in order.
+    pulled: Vec<String>,
+    /// Images on the "host": every successful pull adds one.
+    local_images: std::collections::HashSet<String>,
+    /// When set, every pull fails (a registry outage).
+    pull_fails: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +265,27 @@ impl DockerOps for MockDockerClient {
     async fn list_bots(&self) -> SpawnerResult<Vec<ContainerInfo>> {
         let state = self.state.lock().expect("MockState mutex poisoned");
         Ok(state.containers.values().cloned().collect())
+    }
+
+    async fn pull_image(&self, image: &str) -> SpawnerResult<()> {
+        let mut state = self.state.lock().expect("MockState mutex poisoned");
+        if state.pull_fails {
+            return Err(SpawnerError::Other(format!(
+                "registry unreachable pulling {image}"
+            )));
+        }
+        state.pulled.push(image.to_string());
+        state.local_images.insert(image.to_string());
+        Ok(())
+    }
+
+    async fn image_present(&self, image: &str) -> SpawnerResult<bool> {
+        Ok(self
+            .state
+            .lock()
+            .expect("MockState mutex poisoned")
+            .local_images
+            .contains(image))
     }
 
     async fn stats(&self, id: &str) -> SpawnerResult<ContainerStats> {
@@ -3167,6 +3194,44 @@ async fn respawning_an_instance_rebuilds_it_from_the_template_with_its_data_fold
         expected_dir.is_dir(),
         "the data folder exists before the container starts"
     );
+    assert_eq!(
+        mock.state.lock().unwrap().pulled,
+        vec!["ghcr.io/nuniesmith/fks-bot-recorder:latest".to_string()],
+        "the spawner pulls the template's image itself"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_registry_outage_uses_the_local_image_and_refuses_only_without_one() {
+    use spawner::api::respawn_from_config;
+    let dirs = InstanceDirs::new();
+    let (state, mock) = build_state(dirs.config());
+    seed_running(&mock, "ghcr.io/nuniesmith/fks-bot-recorder:latest", "btc").await;
+    mock.state.lock().unwrap().pull_fails = true;
+    let cfg = instance_row(
+        "btc",
+        "recorder.binance-usdm",
+        "ghcr.io/nuniesmith/fks-bot-recorder:latest",
+    );
+
+    // Not pullable and not here: refused, and the running recorder is left alone.
+    let err = respawn_from_config(&state, &cfg, "btc".to_string())
+        .await
+        .expect_err("no image");
+    assert!(format!("{err:?}").contains("isn't on this host"), "{err:?}");
+    assert_eq!(mock.list_bots().await.unwrap().len(), 1);
+
+    // Not pullable but already here: the respawn goes ahead on the local image.
+    mock.state
+        .lock()
+        .unwrap()
+        .local_images
+        .insert("ghcr.io/nuniesmith/fks-bot-recorder:latest".to_string());
+    let (_, resp) = respawn_from_config(&state, &cfg, "btc".to_string())
+        .await
+        .expect("local image");
+    assert_eq!(resp.image, "ghcr.io/nuniesmith/fks-bot-recorder:latest");
 }
 
 #[cfg(feature = "db")]
