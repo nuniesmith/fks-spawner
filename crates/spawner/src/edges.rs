@@ -236,6 +236,7 @@ pub fn build_backtest_spawn_request(
         ("BACKTEST_DB_URL".to_string(), db_url.to_string()),
     ]);
     SpawnRequest {
+        data_dir: None,
         image: image.to_string(),
         bot_id: Some(backtest_bot_id(edge_id, run_id)),
         mode: "backtest".to_string(),

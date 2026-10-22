@@ -181,6 +181,48 @@ pub struct Config {
     /// to disable for a deploy scenario that wants manual control instead. Env:
     /// BOOT_RECONCILE_ENABLED.
     pub boot_reconcile_enabled: bool,
+
+    /// Templates and the instances made from them (`crate::instances`).
+    pub instances: InstancesConfig,
+}
+
+/// Where templates are read from and where recorders' files go.
+#[derive(Debug, Clone)]
+pub struct InstancesConfig {
+    /// The template folder (the fks repo's `templates/`, mounted read-only).
+    /// Env: TEMPLATES_DIR.
+    pub templates_dir: std::path::PathBuf,
+    /// The data lake: each recorder instance writes only to its own folder,
+    /// `raw/<venue>/<market>/<instance>`, under this. Mounted into the
+    /// spawner at the SAME path as on the host, because Docker resolves a
+    /// bind's source on the host. Env: LAKE_ROOT.
+    pub lake_root: std::path::PathBuf,
+    /// A new recorder is refused when the lake's disk has less free than
+    /// this (GB). Env: LAKE_MIN_FREE_GB.
+    pub lake_min_free_gb: u64,
+}
+
+impl Default for InstancesConfig {
+    fn default() -> Self {
+        Self {
+            templates_dir: "/templates".into(),
+            lake_root: "/srv/fks-lake".into(),
+            lake_min_free_gb: 120,
+        }
+    }
+}
+
+impl InstancesConfig {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        Self {
+            templates_dir: env::var("TEMPLATES_DIR")
+                .map(Into::into)
+                .unwrap_or(d.templates_dir),
+            lake_root: env::var("LAKE_ROOT").map(Into::into).unwrap_or(d.lake_root),
+            lake_min_free_gb: env_parse("LAKE_MIN_FREE_GB", d.lake_min_free_gb),
+        }
+    }
 }
 
 impl Config {
@@ -227,6 +269,7 @@ impl Config {
             rithmic_sampler: RithmicSamplerConfig::from_env(),
             edge_decay: EdgeDecayConfig::from_env(),
             boot_reconcile_enabled: env_parse_bool("BOOT_RECONCILE_ENABLED", true),
+            instances: InstancesConfig::from_env(),
         }
     }
 
@@ -340,6 +383,7 @@ mod tests {
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
             boot_reconcile_enabled: true,
+            instances: InstancesConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8090");
         assert!(
@@ -381,6 +425,7 @@ mod tests {
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
             boot_reconcile_enabled: true,
+            instances: InstancesConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");
     }

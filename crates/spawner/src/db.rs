@@ -656,6 +656,8 @@ impl BotRunStore {
             // restart_policy likewise rides in the blob (opt-in supervisor
             // auto-restart); omitted when None so old configs are unchanged.
             "restart_policy": req.restart_policy,
+            // set for a template instance; omitted otherwise
+            "template": req.template,
         });
         let row = sqlx::query(
             "INSERT INTO bot_configs (name, image, mode, config_json) \
@@ -1756,6 +1758,12 @@ pub struct BotConfigRow {
     /// current behaviour): a crashed bot is recorded + alerted but never
     /// respawned. See `crate::supervisor::RestartPolicy`.
     pub restart_policy: Option<crate::supervisor::RestartPolicy>,
+    /// Set when the config is a template instance (`crate::instances`).
+    pub template: Option<crate::models::TemplateRef>,
+    /// The blob names a template but it doesn't parse. Respawn refuses such a
+    /// config rather than run it as a plain one, which for a recorder would
+    /// mean no data folder and recordings lost with the container.
+    pub template_unreadable: bool,
 }
 
 impl BotConfigRow {
@@ -1793,6 +1801,10 @@ impl BotConfigRow {
         let restart_policy = cfg
             .get("restart_policy")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let template_blob = cfg.get("template").filter(|v| !v.is_null());
+        let template: Option<crate::models::TemplateRef> =
+            template_blob.and_then(|v| serde_json::from_value(v.clone()).ok());
+        let template_unreadable = template_blob.is_some() && template.is_none();
         Self {
             id: r.try_get("id").unwrap_or_else(|_| Uuid::nil()),
             name: r.try_get("name").unwrap_or_default(),
@@ -1804,6 +1816,8 @@ impl BotConfigRow {
             secrets,
             bot_id,
             restart_policy,
+            template,
+            template_unreadable,
         }
     }
 }

@@ -47,9 +47,11 @@ use crate::{
     config::Config,
     docker_client::DockerOps,
     error::SpawnerError,
+    instances::{self, InstanceRequest, PlanError},
     metrics,
     models::{ActionResponse, HealthResponse, SpawnRequest, SpawnResponse},
     prometheus_sd,
+    templates::{Template, TemplateSet},
 };
 
 #[cfg(feature = "db")]
@@ -139,7 +141,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/container/{id}", delete(remove_handler))
         .route("/container/{id}/stop", post(stop_handler))
         .route("/container/{id}/restart", post(restart_handler))
-        .route("/container/{id}/logs", get(logs_sse_handler));
+        .route("/container/{id}/logs", get(logs_sse_handler))
+        .route("/templates", get(list_templates_handler))
+        .route("/templates/{id}", get(get_template_handler))
+        .route("/instances/validate", post(validate_instance_handler));
 
     #[cfg(feature = "db")]
     let protected = protected
@@ -170,6 +175,13 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/configs/{name}", delete(delete_config_handler))
         .route("/configs/{name}/respawn", post(respawn_config_handler))
+        .route(
+            "/instances",
+            get(list_instances_handler).post(create_instance_handler),
+        )
+        .route("/instances/{name}", delete(delete_instance_handler))
+        .route("/instances/{name}/start", post(start_instance_handler))
+        .route("/instances/{name}/stop", post(stop_instance_handler))
         .route(
             "/ui/layouts",
             get(list_layouts_handler).post(save_layout_handler),
@@ -661,6 +673,13 @@ async fn stop_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, SpawnerError> {
+    stop_bot(&state, &id).await.map(Json)
+}
+
+/// Stop one container, close its run row, notify, and refresh Prometheus'
+/// targets: `POST /container/{id}/stop` and `POST /instances/{name}/stop`.
+async fn stop_bot(state: &AppState, id: &str) -> Result<ActionResponse, SpawnerError> {
+    let id = id.to_string();
     state.docker.stop(&id).await?;
     metrics::STOPS_TOTAL.inc();
 
@@ -678,7 +697,7 @@ async fn stop_handler(
 
     // Notify configured channels of the stop (best-effort, off-path).
     #[cfg(feature = "db")]
-    spawn_dispatch(&state, NotificationEvent::stopped(&id));
+    spawn_dispatch(state, NotificationEvent::stopped(&id));
 
     let docker = state.docker.clone();
     let config = state.config.clone();
@@ -686,7 +705,7 @@ async fn stop_handler(
         prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
     });
 
-    Ok(Json(ActionResponse::ok(&id, "stop")))
+    Ok(ActionResponse::ok(&id, "stop"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1336,6 +1355,299 @@ async fn delete_config_handler(
     Ok(Json(serde_json::json!({ "ok": removed, "name": name })))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Templates and instances (crate::templates, crate::instances)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// GET  /templates              every valid template, plus why the others aren't
+// GET  /templates/{id}         one template (its form is `params`)
+// POST /instances/validate     what an instance would be, without making it
+// POST /instances              make one: save its config, create its data
+//                              folder, spawn it
+// GET  /instances              every instance, with its container's state
+// POST /instances/{name}/start (re)create its container from the template
+// POST /instances/{name}/stop  stop its container
+// DELETE /instances/{name}     stop and remove it; its data folder is KEPT
+
+fn load_templates(state: &AppState) -> TemplateSet {
+    TemplateSet::load(
+        &state.config.instances.templates_dir,
+        &state.config.allowed_image_prefix,
+    )
+}
+
+/// A plan failure as the response a form can show: 404 for an unknown
+/// template, 400 with one line per problem otherwise.
+fn plan_failure(e: PlanError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        PlanError::NotFound(what) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "errors": [format!("no such {what}")] })),
+        ),
+        PlanError::Invalid(errors) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "errors": errors })),
+        ),
+    }
+}
+
+async fn list_templates_handler(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let set = load_templates(&state);
+    Json(serde_json::json!({
+        "templates": set.templates.values().collect::<Vec<&Template>>(),
+        "errors": set.errors,
+    }))
+}
+
+async fn get_template_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Template>, SpawnerError> {
+    load_templates(&state)
+        .templates
+        .remove(&id)
+        .map(Json)
+        .ok_or_else(|| SpawnerError::NotFound(format!("template '{id}'")))
+}
+
+async fn validate_instance_handler(
+    State(state): State<AppState>,
+    Json(req): Json<InstanceRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match instances::plan(&load_templates(&state), &state.config.instances, &req) {
+        Ok(plan) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "plan": plan })),
+        ),
+        Err(e) => plan_failure(e),
+    }
+}
+
+#[cfg(feature = "db")]
+fn no_db() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "ok": false,
+            "db_enabled": false,
+            "errors": ["instances need the spawner Postgres DB"],
+        })),
+    )
+}
+
+#[cfg(feature = "db")]
+async fn create_instance_handler(
+    State(state): State<AppState>,
+    Json(req): Json<InstanceRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(no_db());
+    };
+    let plan = match instances::plan(&load_templates(&state), &state.config.instances, &req) {
+        Ok(plan) => plan,
+        Err(e) => return Ok(plan_failure(e)),
+    };
+    // A name in use, as a saved config or a container, is refused: start,
+    // stop and delete act on what exists.
+    let conflict = |why: String| {
+        Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "ok": false, "errors": [why] })),
+        ))
+    };
+    if store.get_config(&plan.name).await?.is_some() {
+        return conflict(format!(
+            "'{}' already exists; start, stop or delete it instead",
+            plan.name
+        ));
+    }
+    let container = format!("fks-bot-{}", plan.name);
+    match state.docker.inspect(&container).await {
+        Ok(_) => return conflict(format!("a container named {container} already exists")),
+        Err(SpawnerError::NotFound(_)) => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(dir) = &plan.data_dir
+        && let Err(why) =
+            instances::prepare_data_dir(dir, Some(state.config.instances.lake_min_free_gb))
+    {
+        return Ok((
+            StatusCode::INSUFFICIENT_STORAGE,
+            Json(serde_json::json!({ "ok": false, "errors": [why] })),
+        ));
+    }
+    store.upsert_config(&plan.config_request()).await?;
+    match spawn_bot(&state, plan.spawn_request()).await {
+        Ok(resp) => {
+            info!(
+                instance = %plan.name,
+                template = %plan.template_id,
+                data_dir = ?plan.data_dir,
+                "instance created"
+            );
+            Ok((
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "name": plan.name,
+                    "container_id": resp.container_id,
+                    "image": resp.image,
+                    "data_dir": plan.data_dir,
+                })),
+            ))
+        }
+        Err(e) => {
+            // A create that didn't spawn leaves no instance behind.
+            if let Err(e2) = store.deactivate_config(&plan.name).await {
+                warn!(error = %e2, instance = %plan.name, "couldn't remove the config of a failed create");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The saved config of an instance (a config made from a template), or 404.
+#[cfg(feature = "db")]
+async fn instance_config(store: &BotRunStore, name: &str) -> Result<BotConfigRow, SpawnerError> {
+    match store.get_config(name).await? {
+        Some(cfg) if cfg.template.is_some() || cfg.template_unreadable => Ok(cfg),
+        _ => Err(SpawnerError::NotFound(format!("instance '{name}'"))),
+    }
+}
+
+#[cfg(feature = "db")]
+fn instance_bot_id(cfg: &BotConfigRow) -> String {
+    cfg.bot_id
+        .clone()
+        .filter(|b| !b.trim().is_empty())
+        .unwrap_or_else(|| cfg.name.clone())
+}
+
+#[cfg(feature = "db")]
+async fn list_instances_handler(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(no_db());
+    };
+    let configs = store.list_configs().await?;
+    let containers = state.docker.list_bots().await?;
+    let set = load_templates(&state);
+    let list: Vec<serde_json::Value> = configs
+        .iter()
+        .filter(|c| c.template.is_some() || c.template_unreadable)
+        .map(|c| {
+            let bot_id = instance_bot_id(c);
+            let container = containers.iter().find(|b| b.bot_id == bot_id);
+            let data_dir = c
+                .template
+                .as_ref()
+                .and_then(|t| set.get(&t.id))
+                .and_then(|t| instances::lake_dir(&state.config.instances.lake_root, t, &c.name));
+            serde_json::json!({
+                "name": c.name,
+                "template": c.template.as_ref().map(|t| t.id.clone()),
+                "template_version": c.template.as_ref().map(|t| t.version),
+                "params": c.template.as_ref().map(|t| t.params.clone()),
+                "template_unreadable": c.template_unreadable,
+                "mode": c.mode,
+                "image": c.image,
+                "bot_id": bot_id,
+                "data_dir": data_dir,
+                "container": container.map(|b| serde_json::json!({
+                    "id": b.id,
+                    "state": b.state,
+                    "status": b.status,
+                    "started_at": b.started_at,
+                })),
+            })
+        })
+        .collect();
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "db_enabled": true, "instances": list })),
+    ))
+}
+
+#[cfg(feature = "db")]
+async fn start_instance_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(no_db());
+    };
+    let cfg = instance_config(store, &name).await?;
+    let (old, resp) = respawn_from_config(&state, &cfg, instance_bot_id(&cfg)).await?;
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": name,
+            "container_id": resp.container_id,
+            "replaced_container_id": old,
+            "image": resp.image,
+        })),
+    ))
+}
+
+#[cfg(feature = "db")]
+async fn stop_instance_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ActionResponse>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Err(SpawnerError::InvalidRequest(
+            "instances need the spawner Postgres DB".to_string(),
+        ));
+    };
+    let cfg = instance_config(store, &name).await?;
+    let info = state
+        .docker
+        .inspect(&format!("fks-bot-{}", instance_bot_id(&cfg)))
+        .await?;
+    stop_bot(&state, &info.id).await.map(Json)
+}
+
+#[cfg(feature = "db")]
+async fn delete_instance_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(no_db());
+    };
+    let cfg = instance_config(store, &name).await?;
+    let container = format!("fks-bot-{}", instance_bot_id(&cfg));
+    let removed = remove_existing_bot(state.docker.as_ref(), &container).await?;
+    if let Some(id) = &removed
+        && let Err(e) = store.record_stop(id).await
+    {
+        warn!(error = %e, container_id = %id, "record_stop failed");
+    }
+    store.deactivate_config(&name).await?;
+    let docker = state.docker.clone();
+    let config = state.config.clone();
+    tokio::spawn(async move {
+        prometheus_sd::update_sd_file(docker.as_ref(), &config).await;
+    });
+    let data_dir = cfg
+        .template
+        .as_ref()
+        .and_then(|t| load_templates(&state).get(&t.id).cloned())
+        .and_then(|t| instances::lake_dir(&state.config.instances.lake_root, &t, &name));
+    info!(instance = %name, data_dir = ?data_dir, "instance deleted; its data folder is kept");
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": name,
+            "removed_container_id": removed,
+            "data_dir_kept": data_dir,
+        })),
+    ))
+}
+
 /// Resolve the effective `bot_id` for a respawn. An explicit request-body
 /// override wins over the config's stored `bot_id`; a value that is blank after
 /// trimming counts as absent on either side. When neither yields a non-blank
@@ -1477,17 +1789,56 @@ pub async fn respawn_from_config(
 
     // (c) Rebuild the SpawnRequest from the saved config. Spawned through the
     // shared path — config's :latest image, same mandatory security posture.
-    let mut spawn_req = SpawnRequest {
-        image: cfg.image.clone(),
-        bot_id: Some(bot_id),
-        mode: cfg.mode.clone(),
-        env: cfg.env.clone(),
-        labels: std::collections::HashMap::new(),
-        cpu_limit: cfg.cpu_limit,
-        memory_limit_mb: cfg.memory_mb.map(i64::from),
-        cmd: None,
-        entrypoint: None,
-        secrets: cfg.secrets.clone(),
+    //
+    // A template INSTANCE is rebuilt from its template as it is now (image,
+    // env, resources, data folder) plus its saved form values, here in
+    // pre-flight: a template that's gone, or a saved value the template no
+    // longer accepts, fails with the old container still running. Its data
+    // folder is (re)made without the free-space floor, which is for NEW
+    // recorders only: refusing a respawn would just punch a gap.
+    if cfg.template_unreadable {
+        return Err(SpawnerError::InvalidRequest(format!(
+            "config '{}' names a template but its template data doesn't parse; \
+             delete the instance and create it again",
+            cfg.name
+        )));
+    }
+    let mut spawn_req = if let Some(saved) = &cfg.template {
+        let plan = instances::plan_saved(
+            &load_templates(state),
+            &state.config.instances,
+            &cfg.name,
+            &cfg.mode,
+            saved,
+        )
+        .map_err(|e| match e {
+            PlanError::NotFound(what) => SpawnerError::NotFound(what),
+            PlanError::Invalid(lines) => SpawnerError::InvalidRequest(format!(
+                "instance '{}': {}",
+                cfg.name,
+                lines.join("; ")
+            )),
+        })?;
+        if let Some(dir) = &plan.data_dir {
+            instances::prepare_data_dir(dir, None).map_err(SpawnerError::InvalidRequest)?;
+        }
+        let mut req = plan.spawn_request();
+        req.bot_id = Some(bot_id);
+        req
+    } else {
+        SpawnRequest {
+            data_dir: None,
+            image: cfg.image.clone(),
+            bot_id: Some(bot_id),
+            mode: cfg.mode.clone(),
+            env: cfg.env.clone(),
+            labels: std::collections::HashMap::new(),
+            cpu_limit: cfg.cpu_limit,
+            memory_limit_mb: cfg.memory_mb.map(i64::from),
+            cmd: None,
+            entrypoint: None,
+            secrets: cfg.secrets.clone(),
+        }
     };
 
     // ── PRE-FLIGHT (no side effects) — fail predictably BEFORE teardown ───────

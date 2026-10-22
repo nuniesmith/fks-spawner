@@ -94,6 +94,18 @@ impl MockDockerClient {
 #[derive(Default)]
 struct MockState {
     containers: HashMap<String, ContainerInfo>,
+    /// What the most recent spawn asked for, for assertions on the parts the
+    /// container info doesn't carry (the data folder, the env).
+    last_spawn: Option<RecordedSpawn>,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+struct RecordedSpawn {
+    image: String,
+    env: HashMap<String, String>,
+    labels: HashMap<String, String>,
+    data_dir: Option<std::path::PathBuf>,
 }
 
 impl MockState {
@@ -136,6 +148,12 @@ impl DockerOps for MockDockerClient {
         }
 
         let mut state = self.state.lock().expect("MockState mutex poisoned");
+        state.last_spawn = Some(RecordedSpawn {
+            image: req.image.clone(),
+            env: req.env.clone(),
+            labels: req.labels.clone(),
+            data_dir: req.data_dir.clone(),
+        });
         // Mirror the real client's cap rule: only RUNNING containers occupy
         // slots (exited one-shots awaiting prune must not wedge the cap).
         let running = state
@@ -298,6 +316,7 @@ fn test_config(internal_token: &str) -> Config {
         rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
         edge_decay: spawner::edge_decay::EdgeDecayConfig::default(),
         boot_reconcile_enabled: true,
+        instances: Default::default(),
     }
 }
 
@@ -1581,6 +1600,7 @@ async fn remove_existing_bot_stops_and_removes_when_present() {
     let mock = MockDockerClient::from_config(&config);
 
     mock.spawn(SpawnRequest {
+        data_dir: None,
         image: "fks-bot-example:latest".to_string(),
         bot_id: Some("crypto-spot-live".to_string()),
         mode: "live".to_string(),
@@ -1696,6 +1716,8 @@ async fn respawn_accepts_empty_body() {
 #[cfg(feature = "db")]
 fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::BotConfigRow {
     spawner::db::BotConfigRow {
+        template: None,
+        template_unreadable: false,
         id: uuid::Uuid::nil(),
         name: "spot-live".to_string(),
         image: image.to_string(),
@@ -1713,6 +1735,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
 #[cfg(feature = "db")]
 async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
     mock.spawn(SpawnRequest {
+        data_dir: None,
         image: image.to_string(),
         bot_id: Some(bot_id.to_string()),
         mode: "live".to_string(),
@@ -1984,6 +2007,7 @@ async fn net_worth_sampler_targets_only_running_bots() {
     // Two running bots …
     for bot_id in ["alpha", "beta"] {
         mock.spawn(SpawnRequest {
+            data_dir: None,
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some(bot_id.to_string()),
             mode: "paper".to_string(),
@@ -2891,4 +2915,305 @@ async fn supervisor_prunes_one_shot_but_quarantines_live_and_keeps_running() {
         !bot_ids.contains(&"bt-1".to_string()),
         "a finished one-shot backtest is pruned on the short retention"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Templates and instances: a recorder from a form, its data folder computed by
+// the spawner, never by a caller, and rebuilt from the template on respawn.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RECORDER_TEMPLATE: &str = r#"{
+    "id": "recorder.binance-usdm",
+    "version": 2,
+    "kind": "recorder",
+    "display_name": "Binance USD-M futures recorder",
+    "image": "ghcr.io/nuniesmith/fks-bot-recorder:latest",
+    "modes": ["record"],
+    "resources": {"cpu": 0.25, "memory_mb": 256},
+    "restart_policy": {"enabled": true},
+    "data": {"venue": "binance", "market": "usdm"},
+    "fixed_env": {"RECORDER_VENUE": "binance-usdm"},
+    "env": {"symbols": "RECORDER_SYMBOLS", "streams": "RECORDER_STREAMS"},
+    "params": {
+        "type": "object",
+        "required": ["symbols"],
+        "properties": {
+            "symbols": {"type": "array", "items": {"type": "string", "x-format": "symbol"}, "minItems": 1},
+            "streams": {"type": "array", "items": {"enum": ["forceOrder", "bookTicker", "markPrice@1s"]},
+                        "default": ["forceOrder", "bookTicker", "markPrice@1s"], "uniqueItems": true}
+        }
+    }
+}"#;
+
+/// A temp templates folder with the recorder template (and a broken file),
+/// and a temp lake; removed on drop.
+struct InstanceDirs {
+    root: std::path::PathBuf,
+}
+
+impl InstanceDirs {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("fks-instances-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("templates")).expect("templates dir");
+        std::fs::create_dir_all(root.join("lake")).expect("lake dir");
+        std::fs::write(
+            root.join("templates/recorder.binance-usdm.json"),
+            RECORDER_TEMPLATE,
+        )
+        .expect("template");
+        std::fs::write(root.join("templates/broken.json"), "{ nope").expect("broken");
+        Self { root }
+    }
+    fn lake(&self) -> std::path::PathBuf {
+        self.root.join("lake")
+    }
+    fn config(&self) -> Config {
+        let mut c = test_config("");
+        c.allowed_image_prefix = "ghcr.io/nuniesmith/fks-bot-".to_string();
+        c.instances = spawner::config::InstancesConfig {
+            templates_dir: self.root.join("templates"),
+            lake_root: self.lake(),
+            lake_min_free_gb: 0,
+        };
+        c
+    }
+}
+
+impl Drop for InstanceDirs {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.root).ok();
+    }
+}
+
+async fn post_json(
+    app: Router,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = body_string(resp).await;
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+    )
+}
+
+#[tokio::test]
+async fn templates_lists_the_valid_ones_and_says_what_is_wrong_with_the_rest() {
+    let dirs = InstanceDirs::new();
+    let (app, _) = build_app(dirs.config());
+    let resp = app
+        .oneshot(Request::get("/templates").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(body["templates"][0]["id"], "recorder.binance-usdm");
+    assert_eq!(body["templates"][0]["params"]["required"][0], "symbols");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 1);
+    assert!(
+        body["errors"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("broken.json:")
+    );
+}
+
+#[tokio::test]
+async fn validate_plans_an_instance_without_creating_anything() {
+    let dirs = InstanceDirs::new();
+    let (app, mock) = build_app(dirs.config());
+    let (status, body) = post_json(
+        app,
+        "/instances/validate",
+        serde_json::json!({"template": "recorder.binance-usdm", "name": "btc", "params": {"symbols": ["BTCUSDT"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let plan = &body["plan"];
+    let expected_dir = dirs.lake().join("raw/binance/usdm/btc");
+    assert_eq!(plan["data_dir"], expected_dir.to_string_lossy().as_ref());
+    assert_eq!(plan["env"]["RECORDER_SYMBOLS"], "BTCUSDT");
+    assert_eq!(
+        plan["env"]["RECORDER_STREAMS"],
+        "forceOrder,bookTicker,markPrice@1s"
+    );
+    assert_eq!(plan["mode"], "record");
+    assert!(!expected_dir.exists(), "validating creates no folder");
+    assert!(
+        mock.list_bots().await.unwrap().is_empty(),
+        "and no container"
+    );
+}
+
+#[tokio::test]
+async fn validate_reports_every_problem_and_unknown_templates() {
+    let dirs = InstanceDirs::new();
+    let (app, _) = build_app(dirs.config());
+    let (status, body) = post_json(
+        app.clone(),
+        "/instances/validate",
+        serde_json::json!({"template": "recorder.binance-usdm", "name": "../etc", "params": {"symbols": []}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["errors"][0].as_str().unwrap().contains("name"),
+        "{body}"
+    );
+    let (status, body) = post_json(
+        app.clone(),
+        "/instances/validate",
+        serde_json::json!({"template": "recorder.binance-usdm", "name": "btc", "params": {"symbols": ["btcusdt"], "streams": ["depth"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["errors"].as_array().unwrap().len(), 2, "{body}");
+    let (status, _) = post_json(
+        app,
+        "/instances/validate",
+        serde_json::json!({"template": "nope", "name": "btc"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// SECURITY: a caller can't bind a host path. `data_dir` is never
+/// deserialized, so a spawn naming one gets no data folder at all.
+#[tokio::test]
+async fn a_spawn_request_cannot_bind_a_host_path() {
+    let (app, mock) = build_app(test_config(""));
+    let (status, body) = post_json(
+        app,
+        "/spawn",
+        serde_json::json!({"image": "fks-bot-x:latest", "bot_id": "x", "data_dir": "/etc"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let spawned = mock
+        .state
+        .lock()
+        .unwrap()
+        .last_spawn
+        .clone()
+        .expect("spawned");
+    assert_eq!(
+        spawned.data_dir, None,
+        "a caller-supplied data_dir must be ignored"
+    );
+}
+
+#[cfg(feature = "db")]
+fn instance_row(name: &str, template_id: &str, image: &str) -> spawner::db::BotConfigRow {
+    let mut row = config_row(image, name, vec![]);
+    row.name = name.to_string();
+    row.mode = "record".to_string();
+    row.template = Some(spawner::models::TemplateRef {
+        id: template_id.to_string(),
+        version: 1,
+        params: serde_json::json!({"symbols": ["BTCUSDT"], "streams": ["markPrice@1s"]}),
+    });
+    row
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn respawning_an_instance_rebuilds_it_from_the_template_with_its_data_folder() {
+    use spawner::api::respawn_from_config;
+    let dirs = InstanceDirs::new();
+    let (state, mock) = build_state(dirs.config());
+    seed_running(&mock, "ghcr.io/nuniesmith/fks-bot-recorder:old", "btc").await;
+
+    // The saved config still names the OLD image and holds no env: the
+    // template, as it is now, decides both.
+    let cfg = instance_row(
+        "btc",
+        "recorder.binance-usdm",
+        "ghcr.io/nuniesmith/fks-bot-recorder:old",
+    );
+    let (old, resp) = respawn_from_config(&state, &cfg, "btc".to_string())
+        .await
+        .expect("respawns");
+    assert!(old.is_some(), "the old container was replaced");
+    assert_eq!(resp.image, "ghcr.io/nuniesmith/fks-bot-recorder:latest");
+
+    let spawned = mock
+        .state
+        .lock()
+        .unwrap()
+        .last_spawn
+        .clone()
+        .expect("spawned");
+    let expected_dir = dirs.lake().join("raw/binance/usdm/btc");
+    assert_eq!(
+        spawned.image, "ghcr.io/nuniesmith/fks-bot-recorder:latest",
+        "not the saved config's old image"
+    );
+    assert_eq!(spawned.data_dir.as_deref(), Some(expected_dir.as_path()));
+    assert_eq!(spawned.env["RECORDER_SYMBOLS"], "BTCUSDT");
+    assert_eq!(spawned.env["RECORDER_STREAMS"], "markPrice@1s");
+    assert_eq!(spawned.env["RECORDER_VENUE"], "binance-usdm");
+    assert_eq!(spawned.labels["fks.template"], "recorder.binance-usdm");
+    assert!(
+        expected_dir.is_dir(),
+        "the data folder exists before the container starts"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_respawn_whose_template_is_gone_leaves_the_running_instance_alone() {
+    use spawner::api::respawn_from_config;
+    let dirs = InstanceDirs::new();
+    let (state, mock) = build_state(dirs.config());
+    seed_running(&mock, "ghcr.io/nuniesmith/fks-bot-recorder:latest", "btc").await;
+
+    let cfg = instance_row(
+        "btc",
+        "recorder.gone",
+        "ghcr.io/nuniesmith/fks-bot-recorder:latest",
+    );
+    let err = respawn_from_config(&state, &cfg, "btc".to_string())
+        .await
+        .expect_err("no template");
+    assert!(format!("{err:?}").contains("recorder.gone"), "{err:?}");
+    let bots = mock.list_bots().await.unwrap();
+    assert_eq!(
+        bots.len(),
+        1,
+        "the running recorder must survive a refused respawn"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn an_unreadable_template_blob_is_refused_before_teardown() {
+    use spawner::api::respawn_from_config;
+    let dirs = InstanceDirs::new();
+    let (state, mock) = build_state(dirs.config());
+    seed_running(&mock, "ghcr.io/nuniesmith/fks-bot-recorder:latest", "btc").await;
+
+    // Running it as a plain config would mean no data folder: recordings
+    // written inside the container and lost with it.
+    let mut cfg = instance_row(
+        "btc",
+        "recorder.binance-usdm",
+        "ghcr.io/nuniesmith/fks-bot-recorder:latest",
+    );
+    cfg.template = None;
+    cfg.template_unreadable = true;
+    let err = respawn_from_config(&state, &cfg, "btc".to_string())
+        .await
+        .expect_err("refused");
+    assert!(format!("{err:?}").contains("doesn't parse"), "{err:?}");
+    assert_eq!(mock.list_bots().await.unwrap().len(), 1);
 }

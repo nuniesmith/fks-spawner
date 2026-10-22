@@ -52,6 +52,12 @@ pub struct SpawnRequest {
     /// for keys). Explicit `env` entries win over injected ones.
     #[serde(default)]
     pub secrets: Vec<String>,
+
+    /// The host folder mounted at `/data`: an instance's own data folder
+    /// (`crate::instances`). NEVER deserialized, so no caller can bind a host
+    /// path; only the instance path sets it, from the template and name.
+    #[serde(skip)]
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 fn default_mode() -> String {
@@ -188,6 +194,22 @@ pub struct ConfigRequest {
     /// `crate::supervisor::RestartPolicy`.
     #[serde(default)]
     pub restart_policy: Option<crate::supervisor::RestartPolicy>,
+    /// Set when the config is an INSTANCE of a template (`crate::instances`):
+    /// every respawn re-derives image, env, resources and data folder from
+    /// the template as it is now, plus these saved form values. Stored in the
+    /// `config_json` blob, like `bot_id`.
+    #[serde(default)]
+    pub template: Option<TemplateRef>,
+}
+
+/// Which template a saved config is an instance of, and its form values.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplateRef {
+    pub id: String,
+    /// The template's version when the instance was made or last saved.
+    pub version: u32,
+    /// The checked form values, defaults included.
+    pub params: serde_json::Value,
 }
 
 /// Request body for `POST /configs/{name}/respawn` — an OPTIONAL override of
