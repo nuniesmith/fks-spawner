@@ -1,0 +1,6 @@
+aiohttp>=3.9,<4
+# Pinned: recorder/core.py applies a narrow handshake-validation patch to this
+# exact version's internals (Binance's gateway returns `Connection: close` in
+# its 101 response). Don't bump without re-verifying the patch; the recorder
+# refuses to start if the internals changed.
+websocket-client==1.9.2

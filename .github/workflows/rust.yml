@@ -21,6 +21,9 @@ on:
             - "LICENSE"
             - "**/LICENSE"
             - ".gitignore"
+            # Python; its own workflow is recorder.yml.
+            - "bots/recorder/**"
+            - ".github/workflows/recorder.yml"
     push:
         branches: [main]
         paths-ignore:
@@ -28,6 +31,9 @@ on:
             - "LICENSE"
             - "**/LICENSE"
             - ".gitignore"
+            # Python; its own workflow is recorder.yml.
+            - "bots/recorder/**"
+            - ".github/workflows/recorder.yml"
 
 concurrency:
     group: rust-${{ github.workflow }}-${{ github.ref }}
