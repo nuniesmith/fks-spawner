@@ -63,6 +63,10 @@ pub struct Fill {
 /// `exchange-apiws` client is wrapped in an adapter implementing this trait, so
 /// the portfolio engine can treat every venue uniformly.
 #[async_trait]
+// `#[async_trait]` marks each async method `#[must_use]`, and since Rust 1.99
+// clippy's double_must_use reports that, because the boxed future it returns
+// is already must_use. The duplicate is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 pub trait SpotExchange: Send + Sync {
     /// Display name, e.g. `"Kraken"`.
     fn name(&self) -> &str;
