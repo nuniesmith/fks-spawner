@@ -206,6 +206,10 @@ async fn hydrate(
 /// production implementation is [`HydratePoller`]; both the WS trigger and the
 /// safety poll invoke the exact same action.
 #[async_trait]
+// `#[async_trait]` marks each async method `#[must_use]`, and since Rust 1.99
+// clippy's double_must_use reports that, because the boxed future it returns
+// is already must_use. The duplicate is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 trait Poller: Send {
     async fn poll(&mut self);
 }

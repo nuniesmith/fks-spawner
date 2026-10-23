@@ -58,6 +58,10 @@ pub type LogStream = Pin<Box<dyn Stream<Item = String> + Send + 'static>>;
 /// daemon. Implemented by [`DockerClient`] for production and by a mock
 /// in `tests/integration.rs` for handler-level tests.
 #[async_trait]
+// `#[async_trait]` marks each async method `#[must_use]`, and since Rust 1.99
+// clippy's double_must_use reports that, because the boxed future it returns
+// is already must_use. The duplicate is the macro's, not ours.
+#[allow(clippy::double_must_use)]
 pub trait DockerOps: Send + Sync + 'static {
     /// Create + start a new bot container.
     async fn spawn(&self, req: SpawnRequest) -> SpawnerResult<SpawnResponse>;
