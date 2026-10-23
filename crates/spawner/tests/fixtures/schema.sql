@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS bot_configs (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT bot_configs_name_unique UNIQUE (name),
     CONSTRAINT bot_configs_mode_valid  CHECK (
-        mode IN ('paper', 'live', 'backtest', 'optimise', 'train')
+        -- 'record' (recorder instances) is fks src/sql/spawner/021_record_mode.sql
+        mode IN ('paper', 'live', 'backtest', 'optimise', 'train', 'record')
     )
 );
 

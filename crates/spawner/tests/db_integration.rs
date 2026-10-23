@@ -363,6 +363,7 @@ async fn sql_path_roundtrips_against_ephemeral_postgres() {
     );
 
     exercise_bot_configs(&store).await;
+    exercise_template_instance_configs(&store, &pg).await;
     exercise_exchange_secrets(&store, &pg).await;
     exercise_bot_runs(&store).await;
     exercise_accounts(&store).await;
@@ -380,6 +381,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
     env.insert("SYMBOL".to_string(), "BTCUSD".to_string());
 
     let insert = ConfigRequest {
+        template: None,
         name: "alpha".to_string(),
         image: "fks-bot-generic:latest".to_string(),
         mode: "paper".to_string(),
@@ -397,6 +399,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
     // Re-upsert under the same name (the UPSERT key) with changed fields (now
     // WITH a bot_id) → same row id, updated values.
     let update = ConfigRequest {
+        template: None,
         name: "alpha".to_string(),
         image: "fks-bot-crypto:latest".to_string(),
         mode: "live".to_string(),
@@ -478,6 +481,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
     // A config saved without a bot_id loads it back as None (backward compat).
     store
         .upsert_config(&ConfigRequest {
+            template: None,
             name: "legacy".to_string(),
             image: "fks-bot-legacy:latest".to_string(),
             mode: "paper".to_string(),
@@ -537,6 +541,90 @@ async fn exercise_bot_configs(store: &BotRunStore) {
 // ─────────────────────────────────────────────────────────────────────────────
 // exchange_secrets — encrypted store / status / decrypt / delete
 // ─────────────────────────────────────────────────────────────────────────────
+/// A template instance's config round-trips its template reference through
+/// the config_json blob, and a blob that names a template but doesn't parse
+/// is flagged, so respawn refuses it instead of running a recorder without
+/// its data folder.
+async fn exercise_template_instance_configs(store: &BotRunStore, pg: &DockerPostgres) {
+    let template = spawner::models::TemplateRef {
+        id: "recorder.binance-usdm".to_string(),
+        version: 2,
+        params: serde_json::json!({"symbols": ["BTCUSDT"], "streams": ["markPrice@1s"]}),
+    };
+    let req = ConfigRequest {
+        template: Some(template.clone()),
+        name: "rec-btc".to_string(),
+        image: "ghcr.io/nuniesmith/fks-bot-recorder:latest".to_string(),
+        mode: "record".to_string(),
+        cpu_limit: Some(0.25),
+        memory_mb: Some(256),
+        env: HashMap::new(),
+        secrets: vec![],
+        bot_id: Some("rec-btc".to_string()),
+        restart_policy: None,
+    };
+    store
+        .upsert_config(&req)
+        .await
+        .expect("upsert instance config");
+    let row = store
+        .get_config("rec-btc")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(row.template, Some(template), "template ref round-trips");
+    assert!(!row.template_unreadable);
+
+    // A plain config carries no template and isn't flagged.
+    let plain_req = ConfigRequest {
+        template: None,
+        name: "plain-cfg".to_string(),
+        image: "fks-bot-generic:latest".to_string(),
+        mode: "paper".to_string(),
+        cpu_limit: None,
+        memory_mb: None,
+        env: HashMap::new(),
+        secrets: vec![],
+        bot_id: None,
+        restart_policy: None,
+    };
+    store
+        .upsert_config(&plain_req)
+        .await
+        .expect("upsert plain config");
+    let plain = store
+        .get_config("plain-cfg")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(plain.template, None);
+    assert!(!plain.template_unreadable);
+    store
+        .deactivate_config("plain-cfg")
+        .await
+        .expect("deactivate");
+
+    // Damage the blob by hand: it still names a template, but not one that parses.
+    let _ = pg.psql_scalar(
+        "UPDATE bot_configs SET config_json = jsonb_set(config_json, '{template}', '\"oops\"') WHERE name = 'rec-btc'",
+    );
+    let row = store
+        .get_config("rec-btc")
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(row.template, None);
+    assert!(
+        row.template_unreadable,
+        "a template blob that doesn't parse must be flagged"
+    );
+
+    store
+        .deactivate_config("rec-btc")
+        .await
+        .expect("deactivate");
+}
+
 async fn exercise_exchange_secrets(store: &BotRunStore, pg: &DockerPostgres) {
     store
         .upsert_secret("kraken", "pub-key", "priv-secret", None)

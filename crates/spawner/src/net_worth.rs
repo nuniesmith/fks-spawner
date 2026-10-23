@@ -1506,6 +1506,7 @@ mod sampler {
                 rithmic_sampler: crate::rithmic_sampler::RithmicSamplerConfig::default(),
                 edge_decay: crate::edge_decay::EdgeDecayConfig::default(),
                 boot_reconcile_enabled: true,
+                instances: Default::default(),
             }
         }
 

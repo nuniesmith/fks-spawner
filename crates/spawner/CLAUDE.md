@@ -65,6 +65,13 @@ cargo test -p spawner            # unit (incl. stats math) + HTTP integration te
 | `GET` `POST` | `/configs` | yes (db only) | List / save (UPSERT) reusable spawn configs (optional self-contained `bot_id`, stored in the `config_json` blob) |
 | `DELETE` | `/configs/{name}` | yes (db only) | Soft-delete a saved config |
 | `POST` | `/configs/{name}/respawn` | yes (db only) | Atomically redeploy a saved config's bot: stop→force-remove the existing `fks-bot-{bot_id}` container (idempotent — skips cleanly if it isn't running) THEN spawn a fresh one through the SAME `/spawn` path, so CURRENT stored secrets are re-injected (rotated keys picked up) and the config's `:latest` image runs (freshly-built code). Body `{ bot_id? }` overrides the config's stored id; bot_id resolves override > config > 400. The remove is awaited BEFORE the spawn (never two live containers for one bot_id); a residual 409 name-conflict is a clear error, not a half-state. Returns `{ bot_id, old_container_id, new_container_id, status, image }`. NOTE: recreates from the current image — it does NOT rebuild the image from source (see follow-up) |
+| `GET` | `/templates` | yes | Every valid template in `TEMPLATES_DIR` (JSON files; the form is `params`) plus `errors` naming each file that didn't validate. Read fresh on every request |
+| `GET` | `/templates/{id}` | yes | One template |
+| `POST` | `/instances/validate` | yes | `{template, name, params, mode?}` → `{ok, plan}`: the image, env, resources and data folder the instance WOULD get. No side effects. 400 `{errors:[…]}` (one line per form field), 404 unknown template |
+| `GET` `POST` | `/instances` | yes (db only) | List instances (configs made from a template) with their container's state and data folder / make one: save its config, create its data folder (refused under `LAKE_MIN_FREE_GB`, 507), spawn it. 409 if the name is taken; a failed spawn removes the config again |
+| `POST` | `/instances/{name}/start` | yes (db only) | (Re)create its container through `respawn_from_config`, i.e. from the template as it is NOW |
+| `POST` | `/instances/{name}/stop` | yes (db only) | Stop its container (closes the run row, like `/container/{id}/stop`) |
+| `DELETE` | `/instances/{name}` | yes (db only) | Stop and remove the container, soft-delete the config. The data folder is KEPT |
 | `GET` `POST` | `/ui/layouts` | yes (db only) | List (names + updated_at) / save (UPSERT) named WebUI dock layouts |
 | `GET` `DELETE` | `/ui/layouts/{name}` | yes (db only) | Fetch one full layout envelope / hard-delete it |
 | `GET` `POST` | `/transfers` | yes (db only) | Treasury cash-flow ledger: list (`?account_id=` filter, `?limit=` default 500 / cap 5000; oldest→newest like /net-worth) / append one signed row (positive = deposit in, negative = withdrawal out; kind: deposit / withdrawal / payout / sweep; source: manual / bot_detected; optional backfill `ts`) |
@@ -118,6 +125,11 @@ the fks repo).
 - Every spawned container is forced onto `ALLOWED_NETWORK` (default `fks_network`).
 - `cap_drop: ALL` + `security_opt: no-new-privileges:true` are unconditional.
 - Every container gets `fks.bot=true`, `fks.bot_id=<uuid>`, `fks.mode=...` labels.
+- **No caller can bind a host path.** `SpawnRequest::data_dir` is
+  `#[serde(skip)]`; only the instance path sets it, to
+  `LAKE_ROOT/raw/<venue>/<market>/<instance>` from the template's `data` and
+  the instance name (both checked against `[a-z0-9-]`), mounted at `/data`.
+  Pinned by `a_spawn_request_cannot_bind_a_host_path`.
 - **Request input is validated** before any Docker call: `bot_id`/`mode` must
   match the Docker name charset (`[A-Za-z0-9._-]`, ≤64/32 chars); `cpu_limit`
   and `memory_limit_mb` are bounded by `MAX_CPU_LIMIT` (default 8 cores) and
@@ -400,5 +412,25 @@ Hardened (auth + HTTP integration tests) and DB-backed in `fks_db`:
   paper-journal-loss issue (container-local, no volume — separate, already
   known) since a reconciled respawn still starts the bot fresh; it just does
   so automatically instead of requiring a human to notice.
+- **Templates and instances** (`src/templates.rs`, `src/instances.rs`;
+  EDGE_FACTORY_PLAN §4): a template is a JSON file in `TEMPLATES_DIR` (default
+  `/templates`, the fks repo's `templates/` mounted read-only) naming an image
+  under `ALLOWED_IMAGE_PREFIX`, its modes, resources, restart policy and a
+  form (`params`, a small JSON-Schema subset; any other keyword refuses the
+  template rather than being ignored). An instance is a saved config holding a
+  `TemplateRef` (id, version, checked form values) in `config_json`; EVERY
+  (re)spawn — `/instances/{name}/start`, `/configs/{name}/respawn`, boot
+  reconcile, crash restarts — re-derives image, env, resources and data folder
+  from the template as it is now, in respawn's pre-flight, so a missing
+  template or a saved value it no longer accepts fails with the old container
+  still up. A blob naming a template that doesn't parse is refused, never run
+  as a plain config (that would lose a recorder's data folder). Only
+  recorders can be instances until account leases exist; a recorder template
+  can't list `live`/`dry-run` modes or secrets. The data folder lives under
+  `LAKE_ROOT` (default `/srv/fks-lake`), mounted into the spawner at the SAME
+  path because Docker resolves bind sources on the host; the spawner runs as
+  uid 1000, the uid the recorder image runs as, so the folders it creates are
+  the recorder's. Saving a recorder needs mode `record` in `bot_configs`'
+  CHECK constraint: fks `src/sql/spawner/021_record_mode.sql`.
 - Wired into the WebUI `/bots` route; `fks-bot-example` / `crypto-demo` demo the
   spawn contract end-to-end.

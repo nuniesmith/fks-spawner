@@ -21,9 +21,9 @@ use bollard::{
     container::LogOutput,
     models::{ContainerCreateBody, EndpointSettings, HostConfig, NetworkingConfig},
     query_parameters::{
-        CreateContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
-        RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder, StatsOptionsBuilder,
-        StopContainerOptionsBuilder,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, RestartContainerOptionsBuilder,
+        StatsOptionsBuilder, StopContainerOptionsBuilder,
     },
 };
 use chrono::{DateTime, Datelike, Utc};
@@ -83,6 +83,13 @@ pub trait DockerOps: Send + Sync + 'static {
 
     /// One-shot live resource stats (CPU% + memory) for a single container.
     async fn stats(&self, id: &str) -> SpawnerResult<ContainerStats>;
+
+    /// Pull an image from its registry, anonymously. A template names the
+    /// image of every instance made from it, and nothing else pulls those.
+    async fn pull_image(&self, image: &str) -> SpawnerResult<()>;
+
+    /// Whether the image is on this host.
+    async fn image_present(&self, image: &str) -> SpawnerResult<bool>;
 
     /// Returns a stream of log lines for `id`, optionally tailing the
     /// last `tail` lines first.
@@ -284,6 +291,11 @@ impl DockerClient {
             .map(|(k, v)| format!("{}={}", k, v))
             .chain(std::iter::once(format!("FKS_BOT_ID={}", bot_id)))
             .chain(std::iter::once(format!("FKS_BOT_MODE={}", req.mode)))
+            .chain(
+                req.data_dir
+                    .as_ref()
+                    .map(|_| format!("DATA_DIR={}", crate::instances::DATA_MOUNT)),
+            )
             .collect();
 
         // ── Resource limits ───────────────────────────────────────────────────
@@ -309,6 +321,7 @@ impl DockerClient {
             cpu_quota_us,
             self.config.default_cpu_shares,
             &bot_id,
+            req.data_dir.as_deref(),
         );
 
         let networking_config = NetworkingConfig {
@@ -601,6 +614,26 @@ impl DockerOps for DockerClient {
         DockerClient::stats(self, id).await
     }
 
+    async fn pull_image(&self, image: &str) -> SpawnerResult<()> {
+        let opts = CreateImageOptionsBuilder::new().from_image(image).build();
+        let mut progress = self.docker.create_image(Some(opts), None, None);
+        while let Some(step) = progress.next().await {
+            step?;
+        }
+        info!(image = %image, "pulled image");
+        Ok(())
+    }
+
+    async fn image_present(&self, image: &str) -> SpawnerResult<bool> {
+        match self.docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     fn stream_logs(&self, id: &str, tail: Option<String>) -> LogStream {
         Box::pin(DockerClient::stream_logs(self, id, tail))
     }
@@ -790,16 +823,28 @@ fn build_bot_host_config(
     cpu_quota_us: i64,
     cpu_shares: i64,
     bot_id: &str,
+    data_dir: Option<&std::path::Path>,
 ) -> HostConfig {
-    HostConfig {
-        // Per-bot state volume (see BOT_STATE_MOUNT). Named volume, not a host
-        // bind: no host path is exposed to the bot and Docker manages the
-        // lifecycle. `:rw` is explicit — the bot writes its journal here.
-        binds: Some(vec![format!(
+    // Per-bot state volume (see BOT_STATE_MOUNT). Named volume, not a host
+    // bind: no host path is exposed to the bot and Docker manages the
+    // lifecycle. `:rw` is explicit — the bot writes its journal here.
+    let mut binds = vec![format!(
+        "{}:{}:rw",
+        bot_state_volume(bot_id),
+        BOT_STATE_MOUNT
+    )];
+    // An instance's data folder (`crate::instances`): the one host bind a bot
+    // gets, computed by the spawner from the template and the instance name,
+    // never supplied by a caller (`SpawnRequest::data_dir` isn't deserialized).
+    if let Some(dir) = data_dir {
+        binds.push(format!(
             "{}:{}:rw",
-            bot_state_volume(bot_id),
-            BOT_STATE_MOUNT
-        )]),
+            dir.display(),
+            crate::instances::DATA_MOUNT
+        ));
+    }
+    HostConfig {
+        binds: Some(binds),
         memory: Some(memory_bytes),
         memory_swap: Some(memory_bytes), // disable swap
         cpu_period: Some(100_000),
@@ -968,7 +1013,7 @@ mod tests {
 
     #[test]
     fn bot_host_config_enforces_security_contract() {
-        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "crypto-spot");
+        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "crypto-spot", None);
         // The hardening that was missing: drop every Linux capability.
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
         // Per-bot state volume: present, bot-specific (NOT shared — a shared
@@ -1014,8 +1059,26 @@ mod tests {
         assert_eq!(hc.cpu_shares, Some(1024));
     }
 
+    #[test]
+    fn an_instance_data_folder_is_the_one_extra_bind_and_lands_at_data() {
+        let plain = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", None);
+        assert_eq!(
+            plain.binds.as_ref().map(Vec::len),
+            Some(1),
+            "only the state volume"
+        );
+        let dir = std::path::Path::new("/srv/fks-lake/raw/binance/usdm/btc");
+        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", Some(dir));
+        let binds = hc.binds.expect("binds");
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[1], "/srv/fks-lake/raw/binance/usdm/btc:/data:rw");
+        // the hardened posture is unchanged by the extra bind
+        assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
+    }
+
     fn valid_spawn_req() -> SpawnRequest {
         SpawnRequest {
+            data_dir: None,
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some("bot-1".to_string()),
             mode: "paper".to_string(),
