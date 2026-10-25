@@ -182,6 +182,21 @@ pub struct Config {
     /// BOOT_RECONCILE_ENABLED.
     pub boot_reconcile_enabled: bool,
 
+    /// Account leases (`crate::leases`): how long (seconds) a bot's lease on
+    /// its declared exchange account stays live without a heartbeat. The
+    /// heartbeat loop refreshes the leases of bots Docker reports RUNNING;
+    /// a crashed/exited bot stops being refreshed and its lease lapses after
+    /// this TTL, so the account can be taken over without manual cleanup —
+    /// and a spawner that was down longer than the TTL can re-acquire its
+    /// own bots' leases when it returns. Env: ACCOUNT_LEASE_TTL_SECS.
+    pub account_lease_ttl_secs: i64,
+
+    /// How often (seconds) the account-lease heartbeat loop runs. Must stay
+    /// WELL under `account_lease_ttl_secs` (default 20 vs 90): several
+    /// missed beats are tolerated before a live bot's lease can lapse.
+    /// Env: ACCOUNT_LEASE_HEARTBEAT_SECS.
+    pub account_lease_heartbeat_secs: u64,
+
     /// Templates and the instances made from them (`crate::instances`).
     pub instances: InstancesConfig,
 }
@@ -269,6 +284,8 @@ impl Config {
             rithmic_sampler: RithmicSamplerConfig::from_env(),
             edge_decay: EdgeDecayConfig::from_env(),
             boot_reconcile_enabled: env_parse_bool("BOOT_RECONCILE_ENABLED", true),
+            account_lease_ttl_secs: env_parse("ACCOUNT_LEASE_TTL_SECS", 90),
+            account_lease_heartbeat_secs: env_parse("ACCOUNT_LEASE_HEARTBEAT_SECS", 20),
             instances: InstancesConfig::from_env(),
         }
     }
@@ -383,6 +400,8 @@ mod tests {
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
             boot_reconcile_enabled: true,
+            account_lease_ttl_secs: 90,
+            account_lease_heartbeat_secs: 20,
             instances: InstancesConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "0.0.0.0:8090");
@@ -425,6 +444,8 @@ mod tests {
             rithmic_sampler: RithmicSamplerConfig::default(),
             edge_decay: EdgeDecayConfig::default(),
             boot_reconcile_enabled: true,
+            account_lease_ttl_secs: 90,
+            account_lease_heartbeat_secs: 20,
             instances: InstancesConfig::default(),
         };
         assert_eq!(cfg.bind_addr(), "127.0.0.1:12345");

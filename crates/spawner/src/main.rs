@@ -46,6 +46,11 @@
 //                             currently running in Docker — recovers live-money bots that a
 //                             host reboot removed outright (they run with no restart policy).
 //                             See crate::boot_reconcile
+//   ACCOUNT_LEASE_TTL_SECS    seconds an account lease stays live without a heartbeat
+//                             (default: 90; DB only). A crashed/exited bot's lease lapses
+//                             after this, freeing its exchange account. See crate::leases
+//   ACCOUNT_LEASE_HEARTBEAT_SECS  seconds between account-lease heartbeats (default: 20;
+//                             DB only). Keep well under the TTL
 //   RUST_LOG                  log level (default: info,spawner=debug)
 // =============================================================================
 
@@ -284,6 +289,36 @@ async fn main() -> anyhow::Result<()> {
             prune_after_secs = %config.prune_after_secs,
             prune_live_after_secs = %config.prune_live_after_secs,
             "crash-supervisor + prune task started"
+        );
+    }
+
+    // ── Background: account-lease heartbeat ──────────────────────────────────────
+    // Extends the account leases (crate::leases) of bots Docker reports
+    // RUNNING, so a live bot's lease never lapses underneath it while a
+    // crashed/exited bot's lease expires on its TTL and frees the account.
+    // DB-only (leases live in Postgres). Supervised like the crash
+    // supervisor: a dead heartbeat silently un-guards every leased account
+    // within one TTL, so it respawns on panic rather than ending quietly.
+    #[cfg(feature = "db")]
+    if state.store.is_some() {
+        let lease_state = state.clone();
+        tokio::spawn(async move {
+            spawner::task_supervisor::supervise(
+                "account-lease-heartbeat",
+                || false,
+                move || {
+                    let state = lease_state.clone();
+                    async move {
+                        spawner::leases::run(state).await;
+                    }
+                },
+            )
+            .await;
+        });
+        info!(
+            ttl_secs = %config.account_lease_ttl_secs,
+            heartbeat_secs = %config.account_lease_heartbeat_secs,
+            "account-lease heartbeat started"
         );
     }
 

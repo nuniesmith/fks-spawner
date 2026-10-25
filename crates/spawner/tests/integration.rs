@@ -343,6 +343,8 @@ fn test_config(internal_token: &str) -> Config {
         rithmic_sampler: spawner::rithmic_sampler::RithmicSamplerConfig::default(),
         edge_decay: spawner::edge_decay::EdgeDecayConfig::default(),
         boot_reconcile_enabled: true,
+        account_lease_ttl_secs: 90,
+        account_lease_heartbeat_secs: 20,
         instances: Default::default(),
     }
 }
@@ -421,6 +423,44 @@ async fn spawn_rejects_image_outside_allowed_prefix() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let payload = body_string(resp).await;
     assert!(payload.contains("not allowed"), "body was: {payload}");
+}
+
+#[tokio::test]
+async fn spawn_declaring_an_account_without_a_db_is_refused() {
+    // Account leases live in Postgres (crate::leases). These test states
+    // run store-less, so a spawn that DECLARES an account must fail closed
+    // (400) rather than run unleased — and must not create a container.
+    let (app, mock) = build_app(test_config(""));
+    let body = serde_json::json!({
+        "image": "fks-bot-example:latest",
+        "bot_id": "would-be-tenant",
+        "mode": "live",
+        "account": "kraken:spot:default"
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/spawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let payload = body_string(resp).await;
+    assert!(
+        payload.contains("account leases require"),
+        "body was: {payload}"
+    );
+    let state = mock.state.lock().unwrap();
+    assert_eq!(
+        state.containers.len(),
+        0,
+        "a refused spawn must not create a container"
+    );
 }
 
 #[tokio::test]
@@ -1630,6 +1670,7 @@ async fn remove_existing_bot_stops_and_removes_when_present() {
         data_dir: None,
         image: "fks-bot-example:latest".to_string(),
         bot_id: Some("crypto-spot-live".to_string()),
+        account: None,
         mode: "live".to_string(),
         env: HashMap::new(),
         labels: HashMap::new(),
@@ -1754,6 +1795,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
         env: HashMap::new(),
         secrets,
         bot_id: Some(bot_id.to_string()),
+        account: None,
         restart_policy: None,
     }
 }
@@ -1765,6 +1807,7 @@ async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
         data_dir: None,
         image: image.to_string(),
         bot_id: Some(bot_id.to_string()),
+        account: None,
         mode: "live".to_string(),
         env: HashMap::new(),
         labels: HashMap::new(),
@@ -2037,6 +2080,7 @@ async fn net_worth_sampler_targets_only_running_bots() {
             data_dir: None,
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some(bot_id.to_string()),
+            account: None,
             mode: "paper".to_string(),
             env: HashMap::new(),
             labels: HashMap::new(),

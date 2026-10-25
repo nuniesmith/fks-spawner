@@ -1506,6 +1506,8 @@ mod sampler {
                 rithmic_sampler: crate::rithmic_sampler::RithmicSamplerConfig::default(),
                 edge_decay: crate::edge_decay::EdgeDecayConfig::default(),
                 boot_reconcile_enabled: true,
+                account_lease_ttl_secs: 90,
+                account_lease_heartbeat_secs: 20,
                 instances: Default::default(),
             }
         }

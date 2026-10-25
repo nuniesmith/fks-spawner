@@ -15,6 +15,17 @@ pub enum SpawnerError {
     #[error("concurrent bot limit reached ({0} running)")]
     TooManyBots(usize),
 
+    #[error(
+        "account '{account}' is already leased by bot '{holder_bot_id}' (lease expires {expires_at}) \
+         — refusing to spawn a second bot on the same account"
+    )]
+    AccountLeaseHeld {
+        account: String,
+        holder_bot_id: String,
+        /// RFC3339 expiry of the lease standing in the way.
+        expires_at: String,
+    },
+
     #[error("container '{0}' not found")]
     NotFound(String),
 
@@ -52,6 +63,7 @@ impl SpawnerError {
             SpawnerError::InvalidImage(_) => StatusCode::BAD_REQUEST,
             SpawnerError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             SpawnerError::TooManyBots(_) => StatusCode::TOO_MANY_REQUESTS,
+            SpawnerError::AccountLeaseHeld { .. } => StatusCode::CONFLICT,
             SpawnerError::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }

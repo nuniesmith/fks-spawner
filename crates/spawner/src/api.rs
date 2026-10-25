@@ -371,6 +371,75 @@ async fn inject_secrets(
     Ok(())
 }
 
+/// Take the account lease a spawn declares, if it declares one
+/// (`crate::leases`). Returns the (possibly bot_id-completed) request plus
+/// the held lease, which the caller binds to the new container on success
+/// and rolls back if the Docker create fails.
+///
+/// Fail-closed throughout, mirroring secrets injection: a declared account
+/// with no spawner DB is an error (never a silently unleased live bot), a
+/// malformed account string is an error, and a live lease held by another
+/// bot is a 409 with the refusal counter incremented. No declared account
+/// returns the request untouched — every pre-lease spawn path behaves
+/// exactly as before.
+#[cfg(feature = "db")]
+async fn acquire_account_lease(
+    state: &AppState,
+    mut req: SpawnRequest,
+) -> Result<(SpawnRequest, Option<crate::leases::AccountLease>), SpawnerError> {
+    let Some(account) = crate::leases::declared_account(req.account.as_deref())? else {
+        return Ok((req, None));
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Err(SpawnerError::InvalidRequest(
+            "account leases require the spawner Postgres DB (not configured)".to_string(),
+        ));
+    };
+
+    // Resolve the bot_id exactly as `DockerClient::spawn` will, so the
+    // lease names the identity the container actually gets. An anonymous
+    // spawn (no bot_id) gets its generated id HERE and the request is
+    // completed with it — spawn then uses the same id instead of minting
+    // a second one.
+    let bot_id = match req.bot_id.clone().filter(|s| !s.is_empty()) {
+        Some(id) => id,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            req.bot_id = Some(id.clone());
+            id
+        }
+    };
+
+    match store
+        .acquire_account_lease(&account, &bot_id, state.config.account_lease_ttl_secs)
+        .await?
+    {
+        crate::leases::AcquireOutcome::Granted => {
+            info!(account = %account, bot_id = %bot_id, "account lease acquired");
+            Ok((req, Some(crate::leases::AccountLease { account, bot_id })))
+        }
+        crate::leases::AcquireOutcome::HeldByOther {
+            holder_bot_id,
+            expires_at,
+        } => {
+            metrics::ACCOUNT_LEASE_REFUSALS_TOTAL
+                .with_label_values(&[account.as_str()])
+                .inc();
+            warn!(
+                account = %account,
+                bot_id = %bot_id,
+                holder_bot_id = %holder_bot_id,
+                "spawn refused: account already leased by another bot"
+            );
+            Err(SpawnerError::AccountLeaseHeld {
+                account,
+                holder_bot_id,
+                expires_at: expires_at.to_rfc3339(),
+            })
+        }
+    }
+}
+
 /// Inject the scoped events-ingest env (`SPAWNER_EVENTS_URL` +
 /// `SPAWNER_EVENTS_TOKEN`) into a spawn's env so the bot can POST `risk_halt` to
 /// the spawner's own `/events` mailbox (plan-03 D2).
@@ -450,6 +519,12 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
             "secrets injection requires the db feature (stateless build)".to_string(),
         ));
     }
+    #[cfg(not(feature = "db"))]
+    if req.account.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+        return Err(SpawnerError::InvalidRequest(
+            "account leases require the db feature (stateless build)".to_string(),
+        ));
+    }
     #[cfg(feature = "db")]
     let req = {
         let mut req = req;
@@ -468,6 +543,14 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
         req
     };
 
+    // ── Account lease (crate::leases) ───────────────────────────────────────
+    // After every cheaper validation (mode, secrets) so a spawn refused for
+    // those reasons never takes a lease it would only have to roll back;
+    // before the Docker create, which is the point of no return. No declared
+    // account = no lease and no behaviour change.
+    #[cfg(feature = "db")]
+    let (req, account_lease) = acquire_account_lease(state, req).await?;
+
     // ── Events-ingest env injection (plan-03 D2) ─────────────────────────────
     // When EVENTS_TOKEN is configured, hand every spawned bot the scoped ingest
     // URL + token so it can raise `risk_halt` through POST /events. Empty token
@@ -483,6 +566,23 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
         Ok(resp) => resp,
         Err(e) => {
             metrics::SPAWN_ERRORS_TOTAL.inc();
+            // Roll back a lease taken moments ago: the bot never started,
+            // so it must not hold the account against the operator's retry
+            // for a whole TTL. Best-effort — if the delete fails, expiry
+            // is the backstop.
+            #[cfg(feature = "db")]
+            if let (Some(store), Some(lease)) = (state.store.as_ref(), account_lease.as_ref())
+                && let Err(re) = store
+                    .release_account_lease(&lease.account, &lease.bot_id)
+                    .await
+            {
+                warn!(
+                    error = %re,
+                    account = %lease.account,
+                    bot_id = %lease.bot_id,
+                    "failed to roll back account lease after a failed spawn — it will expire on its TTL"
+                );
+            }
             warn!(error = %e, "spawn failed");
             // A failed spawn is a bot_error event (best-effort, off-path).
             #[cfg(feature = "db")]
@@ -493,6 +593,26 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
             return Err(e);
         }
     };
+
+    // Bind the new container onto the lease, so the remove path can later
+    // release exactly this run's lease (and the heartbeat can match the
+    // lease to the running container). Best-effort bookkeeping: a failed
+    // bind never fails a spawn that already succeeded — it only weakens
+    // release precision, and the lease still expires on its TTL.
+    #[cfg(feature = "db")]
+    if let (Some(store), Some(lease)) = (state.store.as_ref(), account_lease.as_ref())
+        && let Err(e) = store
+            .bind_account_lease_container(&lease.account, &lease.bot_id, &resp.container_id)
+            .await
+    {
+        warn!(
+            error = %e,
+            account = %lease.account,
+            bot_id = %lease.bot_id,
+            container_id = %resp.container_id,
+            "failed to bind container onto account lease — release will fall back to TTL expiry"
+        );
+    }
 
     metrics::SPAWNS_TOTAL.inc();
     metrics::SPAWN_DURATION
@@ -639,6 +759,19 @@ async fn remove_handler(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ActionResponse>, SpawnerError> {
+    // Resolve the container's identity BEFORE it is removed, for the
+    // account-lease release below (the lease row names bot_id + full
+    // container id). Best-effort: an inspect failure must not block the
+    // removal — the lease then simply lapses on its TTL.
+    #[cfg(feature = "db")]
+    let removed_identity = state
+        .docker
+        .inspect(&id)
+        .await
+        .ok()
+        .filter(|info| !info.bot_id.is_empty())
+        .map(|info| (info.bot_id, info.id_full));
+
     state.docker.remove(&id).await?;
     metrics::REMOVES_TOTAL.inc();
 
@@ -648,6 +781,22 @@ async fn remove_handler(
         tokio::spawn(async move {
             if let Err(e) = store.record_remove(&id_owned).await {
                 warn!(error = %e, container_id = %id_owned, "record_remove failed");
+            }
+            // Removal is the point of no return: release this container's
+            // account lease immediately, so the account is free for the
+            // next spawn instead of after the TTL. Matched on
+            // (bot_id, container_id), so a respawned successor's fresh
+            // lease is never touched. (A plain stop does NOT release —
+            // see crate::leases.)
+            if let Some((bot_id, full_id)) = removed_identity
+                && let Err(e) = store.release_container_leases(&bot_id, &full_id).await
+            {
+                warn!(
+                    error = %e,
+                    bot_id = %bot_id,
+                    container_id = %full_id,
+                    "account-lease release after remove failed — it will expire on its TTL"
+                );
             }
         });
     }
@@ -1848,12 +1997,16 @@ pub async fn respawn_from_config(
         }
         let mut req = plan.spawn_request();
         req.bot_id = Some(bot_id);
+        // An instance's account comes from its saved config (templates do
+        // not declare one yet), never from the plan.
+        req.account = cfg.account.clone();
         req
     } else {
         SpawnRequest {
             data_dir: None,
             image: cfg.image.clone(),
             bot_id: Some(bot_id),
+            account: cfg.account.clone(),
             mode: cfg.mode.clone(),
             env: cfg.env.clone(),
             labels: std::collections::HashMap::new(),
@@ -1920,6 +2073,34 @@ pub async fn respawn_from_config(
         .count();
     if running >= state.config.max_concurrent_bots {
         return Err(SpawnerError::TooManyBots(running));
+    }
+
+    // 6. Account lease (crate::leases) — the config's declared account must
+    //    be free, expired, or held by THIS bot. Read-only here: the
+    //    authoritative acquire happens in `spawn_bot`, but refusing BEFORE
+    //    teardown keeps a lease conflict from destroying a running bot
+    //    whose replacement could never start — the same ordering rule as
+    //    the mode check in step 4. A bot re-acquiring its OWN lease is the
+    //    normal respawn and passes.
+    if let Some(account) = crate::leases::declared_account(cfg.account.as_deref())? {
+        let Some(store) = state.store.as_ref() else {
+            return Err(SpawnerError::InvalidRequest(
+                "account leases require the spawner Postgres DB (not configured)".to_string(),
+            ));
+        };
+        let req_bot_id = spawn_req.bot_id.as_deref().unwrap_or_default();
+        if let Some(holder) = store.account_lease_holder(&account).await?
+            && holder.bot_id != req_bot_id
+        {
+            metrics::ACCOUNT_LEASE_REFUSALS_TOTAL
+                .with_label_values(&[account.as_str()])
+                .inc();
+            return Err(SpawnerError::AccountLeaseHeld {
+                account,
+                holder_bot_id: holder.bot_id,
+                expires_at: holder.expires_at.to_rfc3339(),
+            });
+        }
     }
 
     // ── (b)+(d) Teardown then spawn ───────────────────────────────────────────

@@ -121,6 +121,20 @@ pub static NET_WORTH_UNVERIFIABLE_TOTAL: Lazy<Counter> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// Spawns refused because the bot's declared account lease is held by
+/// ANOTHER bot (`crate::leases`). Labelled by account so the alert names the
+/// contested account, not just that something clashed. This is the Oct-2026
+/// two-bots-one-Kraken-account incident turned into a number: any increment
+/// means a second live trader on an account was attempted and stopped.
+pub static ACCOUNT_LEASE_REFUSALS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "fks_spawner_account_lease_refusals_total",
+        "Spawns refused because the declared account's lease is held by another bot",
+        &["account"]
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Gauges
 // ─────────────────────────────────────────────────────────────────────────────
