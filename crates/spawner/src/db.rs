@@ -892,17 +892,24 @@ impl BotRunStore {
     /// Matched on (bot_id, container_id): after a respawn the bot's lease
     /// names the NEW container, so releasing the old container can never
     /// tear down the live bot's lease.
+    ///
+    /// The match is `starts_with(incoming, stored)`, not equality: bind
+    /// stores the SHORT id the spawn path returns, while this path (like
+    /// the heartbeat) carries Docker's FULL id. Equality here silently
+    /// released nothing until the 2026-10-25 rehearsal caught it.
     pub async fn release_container_leases(
         &self,
         bot_id: &str,
         container_id: &str,
     ) -> Result<u64, SpawnerError> {
-        let r = sqlx::query("DELETE FROM account_leases WHERE bot_id = $1 AND container_id = $2")
-            .bind(bot_id)
-            .bind(container_id)
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let r = sqlx::query(
+            "DELETE FROM account_leases WHERE bot_id = $1 AND starts_with($2, container_id)",
+        )
+        .bind(bot_id)
+        .bind(container_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         Ok(r.rows_affected())
     }
 
@@ -924,6 +931,12 @@ impl BotRunStore {
     /// `running_bot_ids` / `running_container_ids` are parallel arrays
     /// (bot_id, full container id) of the currently running bot containers.
     /// Returns how many leases were refreshed.
+    ///
+    /// The container match is `starts_with(running, stored)`, not
+    /// equality: bind stores the SHORT id the spawn path returns, this
+    /// loop carries the FULL id — with equality the heartbeat refreshed
+    /// zero rows and every lease lapsed 90s after spawn while its bot
+    /// kept running (2026-10-25 rehearsal).
     pub async fn heartbeat_account_leases(
         &self,
         running_bot_ids: &[String],
@@ -939,7 +952,7 @@ impl BotRunStore {
                  expires_at = NOW() + make_interval(secs => $3) \
              FROM (SELECT * FROM UNNEST($1::text[], $2::text[])) AS r(bot_id, container_id) \
              WHERE l.bot_id = r.bot_id \
-               AND (l.container_id IS NULL OR l.container_id = r.container_id)",
+               AND (l.container_id IS NULL OR starts_with(r.container_id, l.container_id))",
         )
         .bind(running_bot_ids)
         .bind(running_container_ids)
