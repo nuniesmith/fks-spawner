@@ -653,6 +653,9 @@ impl BotRunStore {
             // bot_id lives in the JSONB blob so a self-contained respawn
             // template needs NO schema migration (the column set is unchanged).
             "bot_id": req.bot_id,
+            // account (the exchange account the lease guards, crate::leases)
+            // rides in the blob the same way; omitted when None.
+            "account": req.account,
             // restart_policy likewise rides in the blob (opt-in supervisor
             // auto-restart); omitted when None so old configs are unchanged.
             "restart_policy": req.restart_policy,
@@ -752,6 +755,199 @@ impl BotRunStore {
         .await
         .map_err(map_sqlx)?;
         Ok(r.rows_affected() > 0)
+    }
+
+    // ── account_leases (see src/sql/spawner/022_account_leases.sql) ────────
+    // One row per leased exchange account (account is the PRIMARY KEY): the
+    // structural guarantee that two spawner-managed bots never trade the
+    // same account at once. Design + the incident behind it: crate::leases.
+
+    /// Try to take (or refresh) the lease on `account` for `bot_id`.
+    ///
+    /// ONE atomic upsert: the row is inserted when unleased, and updated in
+    /// place — new expiry, `container_id` cleared until the fresh container
+    /// is bound — only when it is already OURS or EXPIRED. That `WHERE` is
+    /// `crate::leases::decide_acquire` clause for clause; doing it in the
+    /// statement (not read-then-write) is what makes two simultaneous
+    /// spawns race-safe: Postgres serialises them on the conflicting row
+    /// and the loser simply updates zero rows.
+    ///
+    /// A missing `account_leases` table (022 not yet applied) errors here —
+    /// deliberately fail-CLOSED: a bot that declared an account must never
+    /// spawn unleased because the guard's table isn't there.
+    pub async fn acquire_account_lease(
+        &self,
+        account: &str,
+        bot_id: &str,
+        ttl_secs: i64,
+    ) -> Result<crate::leases::AcquireOutcome, SpawnerError> {
+        let row = sqlx::query(
+            "INSERT INTO account_leases \
+                 (account, bot_id, container_id, acquired_at, heartbeat_at, expires_at) \
+             VALUES ($1, $2, NULL, NOW(), NOW(), NOW() + make_interval(secs => $3)) \
+             ON CONFLICT (account) DO UPDATE \
+             SET bot_id = EXCLUDED.bot_id, \
+                 container_id = NULL, \
+                 acquired_at = NOW(), \
+                 heartbeat_at = NOW(), \
+                 expires_at = EXCLUDED.expires_at \
+             WHERE account_leases.bot_id = EXCLUDED.bot_id \
+                OR account_leases.expires_at <= NOW() \
+             RETURNING bot_id",
+        )
+        .bind(account)
+        .bind(bot_id)
+        .bind(ttl_secs as f64)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        if row.is_some() {
+            return Ok(crate::leases::AcquireOutcome::Granted);
+        }
+
+        // Zero rows updated: a live lease held by another bot stands in the
+        // way. Re-read it so the refusal can name the holder; the row could
+        // have expired in the microseconds since (then the caller's retry
+        // would succeed), so a vanished holder degrades to a placeholder
+        // rather than masking the refusal.
+        match self.account_lease_holder(account).await? {
+            Some(holder) => Ok(crate::leases::AcquireOutcome::HeldByOther {
+                holder_bot_id: holder.bot_id,
+                expires_at: holder.expires_at,
+            }),
+            None => Ok(crate::leases::AcquireOutcome::HeldByOther {
+                holder_bot_id: "<expired>".to_string(),
+                expires_at: Utc::now(),
+            }),
+        }
+    }
+
+    /// The live (unexpired) holder of `account`, if any. Read-only — the
+    /// respawn pre-flight uses it to refuse BEFORE tearing the old container
+    /// down; the acquire above stays the authority at spawn time.
+    pub async fn account_lease_holder(
+        &self,
+        account: &str,
+    ) -> Result<Option<crate::leases::LeaseState>, SpawnerError> {
+        let row = sqlx::query(
+            "SELECT bot_id, expires_at FROM account_leases \
+             WHERE account = $1 AND expires_at > NOW()",
+        )
+        .bind(account)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        row.map(|r| {
+            Ok(crate::leases::LeaseState {
+                bot_id: r.try_get("bot_id").map_err(map_sqlx)?,
+                expires_at: r.try_get("expires_at").map_err(map_sqlx)?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Stamp the freshly created container's id onto a held lease, so the
+    /// stop/remove paths can release exactly this run's lease (a delayed
+    /// release for an old container must never delete a respawned bot's
+    /// fresh lease — the container ids differ).
+    pub async fn bind_account_lease_container(
+        &self,
+        account: &str,
+        bot_id: &str,
+        container_id: &str,
+    ) -> Result<(), SpawnerError> {
+        sqlx::query(
+            "UPDATE account_leases SET container_id = $3 \
+             WHERE account = $1 AND bot_id = $2",
+        )
+        .bind(account)
+        .bind(bot_id)
+        .bind(container_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
+    }
+
+    /// Release the lease on `account` held by `bot_id` (spawn-failure
+    /// rollback: we just took it and the container never started). Matched
+    /// on bot_id so it can only ever remove our own bot's row.
+    pub async fn release_account_lease(
+        &self,
+        account: &str,
+        bot_id: &str,
+    ) -> Result<bool, SpawnerError> {
+        let r = sqlx::query("DELETE FROM account_leases WHERE account = $1 AND bot_id = $2")
+            .bind(account)
+            .bind(bot_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Release every lease held for one container (stop / remove paths).
+    /// Matched on (bot_id, container_id): after a respawn the bot's lease
+    /// names the NEW container, so releasing the old container can never
+    /// tear down the live bot's lease.
+    pub async fn release_container_leases(
+        &self,
+        bot_id: &str,
+        container_id: &str,
+    ) -> Result<u64, SpawnerError> {
+        let r = sqlx::query("DELETE FROM account_leases WHERE bot_id = $1 AND container_id = $2")
+            .bind(bot_id)
+            .bind(container_id)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        Ok(r.rows_affected())
+    }
+
+    /// Extend the leases of the bots Docker reports RUNNING (its ground
+    /// truth of what is actually up) to a fresh `expires_at`.
+    ///
+    /// A lease row is refreshed only when it still belongs to a running
+    /// container of the same bot: matched on `bot_id` AND on the bound
+    /// `container_id` (a NULL binding — the bind write failed at spawn —
+    /// still refreshes on bot_id alone, since that lease has no other
+    /// identity to check). The container match is what stops two stale-row
+    /// failure modes. A lease taken over by another bot after expiry names
+    /// the OTHER bot/container, so the old holder's heartbeat can't revive
+    /// it. And a bot whose declared account CHANGED at respawn leaves its
+    /// old account's row bound to the removed container — unmatched, it
+    /// lapses on its TTL instead of being refreshed for as long as the bot
+    /// lives.
+    ///
+    /// `running_bot_ids` / `running_container_ids` are parallel arrays
+    /// (bot_id, full container id) of the currently running bot containers.
+    /// Returns how many leases were refreshed.
+    pub async fn heartbeat_account_leases(
+        &self,
+        running_bot_ids: &[String],
+        running_container_ids: &[String],
+        ttl_secs: i64,
+    ) -> Result<u64, SpawnerError> {
+        if running_bot_ids.is_empty() {
+            return Ok(0);
+        }
+        let r = sqlx::query(
+            "UPDATE account_leases AS l \
+             SET heartbeat_at = NOW(), \
+                 expires_at = NOW() + make_interval(secs => $3) \
+             FROM (SELECT * FROM UNNEST($1::text[], $2::text[])) AS r(bot_id, container_id) \
+             WHERE l.bot_id = r.bot_id \
+               AND (l.container_id IS NULL OR l.container_id = r.container_id)",
+        )
+        .bind(running_bot_ids)
+        .bind(running_container_ids)
+        .bind(ttl_secs as f64)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(r.rows_affected())
     }
 
     // ── ui_layouts (see src/sql/spawner/005_ui_layouts.sql) ──────────────────
@@ -1754,6 +1950,11 @@ pub struct BotConfigRow {
     /// configs saved before the field existed — surfaced on GET /configs so the
     /// WebUI can show which templates are respawn-ready.
     pub bot_id: Option<String>,
+    /// The exchange account this config's bot trades (in the config_json
+    /// blob), e.g. "kraken:spot:default". `None` for configs saved before
+    /// the field existed — respawn then takes no account lease (the
+    /// pre-lease behaviour). See `crate::leases`.
+    pub account: Option<String>,
     /// Opt-in auto-restart policy (in the config_json blob). `None` = OFF (the
     /// current behaviour): a crashed bot is recorded + alerted but never
     /// respawned. See `crate::supervisor::RestartPolicy`.
@@ -1796,6 +1997,10 @@ impl BotConfigRow {
             .get("bot_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let account = cfg
+            .get("account")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         // Tolerant parse: a malformed restart_policy blob loads as None (OFF)
         // rather than poisoning the whole config row.
         let restart_policy = cfg
@@ -1815,6 +2020,7 @@ impl BotConfigRow {
             env,
             secrets,
             bot_id,
+            account,
             restart_policy,
             template,
             template_unreadable,

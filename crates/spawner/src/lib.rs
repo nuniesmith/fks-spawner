@@ -23,6 +23,8 @@ pub mod edge_decay;
 pub mod edges;
 pub mod error;
 pub mod instances;
+#[cfg(feature = "db")]
+pub mod leases;
 pub mod metrics;
 pub mod models;
 pub mod net_worth;

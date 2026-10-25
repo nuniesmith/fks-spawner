@@ -1081,6 +1081,7 @@ mod tests {
             data_dir: None,
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some("bot-1".to_string()),
+            account: None,
             mode: "paper".to_string(),
             env: std::collections::HashMap::new(),
             labels: std::collections::HashMap::new(),

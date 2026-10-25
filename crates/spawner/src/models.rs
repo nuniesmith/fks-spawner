@@ -53,6 +53,16 @@ pub struct SpawnRequest {
     #[serde(default)]
     pub secrets: Vec<String>,
 
+    /// The exchange account this bot trades, e.g. `"kraken:spot:default"`.
+    /// When set, the spawner must hold the account's lease before it will
+    /// create the container — a second bot declaring the same account is
+    /// refused while the holder's lease is live, so two bots can never trade
+    /// one account at once (see `crate::leases`). Requires the spawner DB;
+    /// a spawn declaring an account without one fails rather than running
+    /// unleased. Absent/blank = no lease, behaviour unchanged.
+    #[serde(default)]
+    pub account: Option<String>,
+
     /// The host folder mounted at `/data`: an instance's own data folder
     /// (`crate::instances`). NEVER deserialized, so no caller can bind a host
     /// path; only the instance path sets it, from the template and name.
@@ -188,6 +198,15 @@ pub struct ConfigRequest {
     /// redeploy is then one call with no hand-reconstruction.
     #[serde(default)]
     pub bot_id: Option<String>,
+    /// The exchange account this config's bot trades, e.g.
+    /// `"kraken:spot:default"` — persisted inside the row's JSONB
+    /// `config_json` blob like `bot_id` (no schema migration). At respawn
+    /// the spawner must hold the account's lease before creating the
+    /// container, and refuses when another bot holds it live (see
+    /// `crate::leases`). Backward compatible: configs saved before this
+    /// field existed carry no `account` and load as `None` (no lease).
+    #[serde(default)]
+    pub account: Option<String>,
     /// Opt-in auto-restart policy for the supervisor. Absent = OFF (a crashed
     /// bot is recorded + alerted but never respawned — the current behaviour).
     /// Stored inside the row's `config_json` blob (no schema migration). See
@@ -700,6 +719,31 @@ mod tests {
         assert!(req.bot_id.is_none(), "absent bot_id defaults to None");
         assert_eq!(req.mode, "paper", "mode still defaults");
         assert!(req.secrets.is_empty());
+    }
+
+    #[test]
+    fn account_fields_deserialize_present_and_absent() {
+        // SpawnRequest: declared account lands; absent stays None (no lease).
+        let with = serde_json::from_str::<SpawnRequest>(
+            r#"{"image":"fks-bot-x:latest","account":"kraken:spot:default"}"#,
+        )
+        .expect("valid JSON");
+        assert_eq!(with.account.as_deref(), Some("kraken:spot:default"));
+        let without = serde_json::from_str::<SpawnRequest>(r#"{"image":"fks-bot-x:latest"}"#)
+            .expect("valid JSON");
+        assert!(without.account.is_none(), "absent account defaults to None");
+
+        // ConfigRequest: same pair, so a config saved before the field
+        // existed keeps loading (respawn then runs unleased, as before).
+        let cfg_with = serde_json::from_str::<ConfigRequest>(
+            r#"{"name":"c","image":"fks-bot-x:latest","account":"kraken:spot:default"}"#,
+        )
+        .expect("valid JSON");
+        assert_eq!(cfg_with.account.as_deref(), Some("kraken:spot:default"));
+        let cfg_without =
+            serde_json::from_str::<ConfigRequest>(r#"{"name":"c","image":"fks-bot-x:latest"}"#)
+                .expect("valid JSON");
+        assert!(cfg_without.account.is_none());
     }
 
     #[test]

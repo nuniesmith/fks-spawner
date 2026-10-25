@@ -363,6 +363,7 @@ async fn sql_path_roundtrips_against_ephemeral_postgres() {
     );
 
     exercise_bot_configs(&store).await;
+    exercise_account_leases(&store).await;
     exercise_template_instance_configs(&store, &pg).await;
     exercise_exchange_secrets(&store, &pg).await;
     exercise_bot_runs(&store).await;
@@ -392,6 +393,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         // Backward-compat: this template carries NO bot_id (like configs saved
         // before the field existed) — it must round-trip as None.
         bot_id: None,
+        account: None,
         restart_policy: None,
     };
     let id1 = store.upsert_config(&insert).await.expect("insert config");
@@ -408,6 +410,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         env,
         secrets: vec!["kraken".to_string(), "kucoin".to_string()],
         bot_id: Some("crypto-spot-live".to_string()),
+        account: None,
         restart_policy: Some(RestartPolicy {
             enabled: true,
             max_restarts: 5,
@@ -490,6 +493,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
             env: HashMap::new(),
             secrets: vec![],
             bot_id: None,
+            account: None,
             restart_policy: None,
         })
         .await
@@ -561,6 +565,7 @@ async fn exercise_template_instance_configs(store: &BotRunStore, pg: &DockerPost
         env: HashMap::new(),
         secrets: vec![],
         bot_id: Some("rec-btc".to_string()),
+        account: None,
         restart_policy: None,
     };
     store
@@ -586,6 +591,7 @@ async fn exercise_template_instance_configs(store: &BotRunStore, pg: &DockerPost
         env: HashMap::new(),
         secrets: vec![],
         bot_id: None,
+        account: None,
         restart_policy: None,
     };
     store
@@ -1155,5 +1161,172 @@ async fn exercise_dispatcher_ledger(store: &BotRunStore) {
         !r.detail.contains("127.0.0.1") && !r.detail.contains("hook"),
         "ledger detail must never contain the URL: {}",
         r.detail
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// account_leases — one live bot per exchange account (crate::leases).
+// The guard itself, driven through the store's real SQL: two saved configs
+// declaring the SAME account (the Oct-2026 two-traders-one-Kraken shape) —
+// the first acquires, the second is refused while the lease is live.
+// ─────────────────────────────────────────────────────────────────────────────
+async fn exercise_account_leases(store: &BotRunStore) {
+    use spawner::leases::AcquireOutcome;
+
+    const ACCOUNT: &str = "kraken:spot:default";
+
+    // Two configs, two different bot_ids, ONE declared account.
+    for (name, bot_id) in [("lease-a", "lease-bot-a"), ("lease-b", "lease-bot-b")] {
+        store
+            .upsert_config(&ConfigRequest {
+                template: None,
+                name: name.to_string(),
+                image: "fks-bot-crypto:latest".to_string(),
+                mode: "live".to_string(),
+                cpu_limit: None,
+                memory_mb: None,
+                env: HashMap::new(),
+                secrets: vec!["kraken".to_string()],
+                bot_id: Some(bot_id.to_string()),
+                account: Some(ACCOUNT.to_string()),
+                restart_policy: None,
+            })
+            .await
+            .expect("insert lease config");
+    }
+    // The declaration round-trips through the config_json blob.
+    let cfg_a = store
+        .get_config("lease-a")
+        .await
+        .expect("get lease-a")
+        .expect("lease-a present");
+    assert_eq!(
+        cfg_a.account.as_deref(),
+        Some(ACCOUNT),
+        "account round-trips via the config_json blob (no schema migration)"
+    );
+
+    // First bot takes the lease.
+    assert_eq!(
+        store
+            .acquire_account_lease(ACCOUNT, "lease-bot-a", 90)
+            .await
+            .expect("acquire for a"),
+        AcquireOutcome::Granted
+    );
+
+    // THE GUARD: the second bot is refused while the first lease is live,
+    // and the refusal names the holder.
+    match store
+        .acquire_account_lease(ACCOUNT, "lease-bot-b", 90)
+        .await
+        .expect("acquire for b")
+    {
+        AcquireOutcome::HeldByOther { holder_bot_id, .. } => {
+            assert_eq!(holder_bot_id, "lease-bot-a");
+        }
+        AcquireOutcome::Granted => {
+            panic!("a second bot on the same account must be refused while the lease is live")
+        }
+    }
+
+    // The holder re-acquiring (a respawn/restart) is idempotent.
+    assert_eq!(
+        store
+            .acquire_account_lease(ACCOUNT, "lease-bot-a", 90)
+            .await
+            .expect("re-acquire for a"),
+        AcquireOutcome::Granted
+    );
+    let holder = store
+        .account_lease_holder(ACCOUNT)
+        .await
+        .expect("holder query")
+        .expect("lease held");
+    assert_eq!(holder.bot_id, "lease-bot-a");
+
+    // Bind the container, then heartbeat: only the matching (bot,
+    // container) pair refreshes the lease.
+    store
+        .bind_account_lease_container(ACCOUNT, "lease-bot-a", "ctr-a")
+        .await
+        .expect("bind container");
+    assert_eq!(
+        store
+            .heartbeat_account_leases(&["lease-bot-a".to_string()], &["ctr-a".to_string()], 90)
+            .await
+            .expect("heartbeat"),
+        1,
+        "the running holder's lease is refreshed"
+    );
+    assert_eq!(
+        store
+            .heartbeat_account_leases(
+                &["lease-bot-a".to_string()],
+                &["ctr-someone-else".to_string()],
+                90
+            )
+            .await
+            .expect("heartbeat with the wrong container"),
+        0,
+        "a heartbeat naming a different container must not refresh the lease"
+    );
+
+    // Release by (bot, container) — the remove path — frees the account.
+    assert_eq!(
+        store
+            .release_container_leases("lease-bot-a", "ctr-a")
+            .await
+            .expect("release by container"),
+        1
+    );
+    assert_eq!(
+        store
+            .acquire_account_lease(ACCOUNT, "lease-bot-b", 90)
+            .await
+            .expect("acquire for b after release"),
+        AcquireOutcome::Granted,
+        "once the holder is removed, the second bot may take the account"
+    );
+
+    // Expiry: a 1-second lease lapses and is taken over — a crashed holder
+    // can never lock the account forever.
+    assert!(
+        store
+            .release_account_lease(ACCOUNT, "lease-bot-b")
+            .await
+            .expect("release b")
+    );
+    assert_eq!(
+        store
+            .acquire_account_lease(ACCOUNT, "lease-bot-b", 1)
+            .await
+            .expect("short acquire for b"),
+        AcquireOutcome::Granted
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(
+        store
+            .acquire_account_lease(ACCOUNT, "lease-bot-a", 90)
+            .await
+            .expect("takeover after expiry"),
+        AcquireOutcome::Granted,
+        "an expired lease must be taken over, not lock the account forever"
+    );
+
+    // Cleanup: no lease left behind for other exercises.
+    assert!(
+        store
+            .release_account_lease(ACCOUNT, "lease-bot-a")
+            .await
+            .expect("cleanup release")
+    );
+    assert!(
+        store
+            .account_lease_holder(ACCOUNT)
+            .await
+            .expect("final holder query")
+            .is_none(),
+        "no live lease remains"
     );
 }

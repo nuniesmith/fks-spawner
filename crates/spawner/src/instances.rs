@@ -193,6 +193,7 @@ impl InstancePlan {
             env: self.env.clone().into_iter().collect(),
             secrets: Vec::new(),
             bot_id: Some(self.name.clone()),
+            account: None,
             restart_policy: self.restart_policy.clone(),
             template: Some(TemplateRef {
                 id: self.template_id.clone(),
@@ -213,6 +214,7 @@ impl InstancePlan {
         SpawnRequest {
             image: self.image.clone(),
             bot_id: Some(self.name.clone()),
+            account: None,
             mode: self.mode.clone(),
             env: self.env.clone().into_iter().collect(),
             labels,

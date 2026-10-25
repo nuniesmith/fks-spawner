@@ -239,6 +239,7 @@ pub fn build_backtest_spawn_request(
         data_dir: None,
         image: image.to_string(),
         bot_id: Some(backtest_bot_id(edge_id, run_id)),
+        account: None,
         mode: "backtest".to_string(),
         env,
         labels: HashMap::from([("fks.edge_id".to_string(), edge_id.to_string())]),

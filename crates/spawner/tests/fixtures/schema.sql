@@ -9,7 +9,7 @@
 -- the table/constraint/trigger/index definitions verbatim but drops the psql
 -- meta-commands, the database/role bootstrap, and the GRANT ... TO :fks_user
 -- lines (the test connects as the image superuser, which already owns
--- everything). Keep it in sync with src/sql/spawner/002..008.
+-- everything). Keep it in sync with src/sql/spawner/002..008 + 022 (account_leases).
 --
 -- Applied by piping this file into `psql` inside the throwaway container, so
 -- the plpgsql $$...$$ function bodies and multiple statements execute cleanly.
@@ -253,3 +253,15 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_edge_started
     ON backtest_runs (edge_id, started_at DESC);
+
+-- ── account_leases (fks src/sql/spawner/022_account_leases.sql) ─────────────
+-- One row per leased exchange account: the spawner may run at most one bot
+-- per account (crate::leases). account is the PRIMARY KEY by design.
+CREATE TABLE IF NOT EXISTS account_leases (
+    account      TEXT        PRIMARY KEY,
+    bot_id       TEXT        NOT NULL,
+    container_id TEXT,
+    acquired_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMPTZ NOT NULL
+);
