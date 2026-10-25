@@ -1246,24 +1246,31 @@ async fn exercise_account_leases(store: &BotRunStore) {
     assert_eq!(holder.bot_id, "lease-bot-a");
 
     // Bind the container, then heartbeat: only the matching (bot,
-    // container) pair refreshes the lease.
+    // container) pair refreshes the lease. ID FORMS mirror production:
+    // bind stores the id the spawn path returns (Docker's SHORT id),
+    // while the heartbeat loop and the remove path carry Docker's FULL
+    // id. A test that used one form for all three passed while the live
+    // heartbeat refreshed nothing (2026-10-25 rehearsal) — the forms
+    // here are production's on purpose.
+    const SHORT_ID: &str = "ab6f6acf0b1f";
+    const FULL_ID: &str = "ab6f6acf0b1f744bef32c0ffee1234567890abcdef1234567890abcdef1234";
     store
-        .bind_account_lease_container(ACCOUNT, "lease-bot-a", "ctr-a")
+        .bind_account_lease_container(ACCOUNT, "lease-bot-a", SHORT_ID)
         .await
         .expect("bind container");
     assert_eq!(
         store
-            .heartbeat_account_leases(&["lease-bot-a".to_string()], &["ctr-a".to_string()], 90)
+            .heartbeat_account_leases(&["lease-bot-a".to_string()], &[FULL_ID.to_string()], 90)
             .await
             .expect("heartbeat"),
         1,
-        "the running holder's lease is refreshed"
+        "the running holder's lease is refreshed (full id vs stored short id)"
     );
     assert_eq!(
         store
             .heartbeat_account_leases(
                 &["lease-bot-a".to_string()],
-                &["ctr-someone-else".to_string()],
+                &["deadbeef0000aaaa1111bbbb2222cccc3333dddd4444eeee5555ffff6666".to_string()],
                 90
             )
             .await
@@ -1272,10 +1279,11 @@ async fn exercise_account_leases(store: &BotRunStore) {
         "a heartbeat naming a different container must not refresh the lease"
     );
 
-    // Release by (bot, container) — the remove path — frees the account.
+    // Release by (bot, container) — the remove path, full id — frees the
+    // account.
     assert_eq!(
         store
-            .release_container_leases("lease-bot-a", "ctr-a")
+            .release_container_leases("lease-bot-a", FULL_ID)
             .await
             .expect("release by container"),
         1
