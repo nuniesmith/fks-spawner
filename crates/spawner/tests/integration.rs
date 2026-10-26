@@ -518,19 +518,30 @@ async fn read_views_degrade_without_db_and_name_what_is_missing() {
     // GET /instances/{name}/files: instances live in Postgres.
     let resp = app
         .clone()
-        .oneshot(Request::get("/instances/btc/files").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/instances/btc/files")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     // GET /bots/{id}/status: a bot that is not running is a 404 naming it.
     let resp = app
-        .oneshot(Request::get("/bots/ghost/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/bots/ghost/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let payload = body_string(resp).await;
-    assert!(payload.contains("no running bot 'ghost'"), "body: {payload}");
+    assert!(
+        payload.contains("no running bot 'ghost'"),
+        "body: {payload}"
+    );
 }
 
 #[cfg(feature = "db")]
@@ -540,10 +551,17 @@ async fn bot_status_of_an_unreachable_bot_is_a_bad_gateway() {
     // response says so (502) rather than hanging or passing an error off as
     // a status.
     let (app, _) = build_app(test_config(""));
-    assert_eq!(post_spawn(&app, "status-probe").await.status(), StatusCode::CREATED);
+    assert_eq!(
+        post_spawn(&app, "status-probe").await.status(),
+        StatusCode::CREATED
+    );
 
     let resp = app
-        .oneshot(Request::get("/bots/status-probe/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/bots/status-probe/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
