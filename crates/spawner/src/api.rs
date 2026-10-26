@@ -50,7 +50,7 @@ use crate::{
     instances::{self, InstanceRequest, PlanError},
     metrics,
     models::{ActionResponse, HealthResponse, SpawnRequest, SpawnResponse},
-    prometheus_sd,
+    prometheus_sd, redact,
     templates::{Template, TemplateSet},
 };
 
@@ -182,6 +182,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/instances/{name}", delete(delete_instance_handler))
         .route("/instances/{name}/start", post(start_instance_handler))
         .route("/instances/{name}/stop", post(stop_instance_handler))
+        .route("/instances/{name}/files", get(instance_files_handler))
+        .route("/leases", get(list_leases_handler))
+        .route("/bots/{bot_id}/status", get(bot_status_handler))
         .route(
             "/ui/layouts",
             get(list_layouts_handler).post(save_layout_handler),
@@ -488,6 +491,20 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     // hand.
     if let Err(why) = reject_contradictory_execution_mode(&req.mode, &req.env) {
         return Err(SpawnerError::InvalidRequest(why));
+    }
+
+    // A read of a saved config shows credentials as the redaction marker
+    // (crate::redact). Spawning with the marker would hand the bot the literal
+    // string, so it is refused here, the one path every spawn passes. Saved
+    // configs never hold the marker (save restores it), so a respawn passes.
+    let markers = redact::marker_keys(&req.env);
+    if !markers.is_empty() {
+        return Err(SpawnerError::InvalidRequest(format!(
+            "env {} still holds the redaction placeholder {:?}; respawn the saved config, \
+             or type the real values",
+            markers.join(", "),
+            redact::REDACTED,
+        )));
     }
 
     let image_prefix = req
@@ -1438,7 +1455,7 @@ const INGEST_DETAIL_MAX: usize = 512;
 #[cfg(feature = "db")]
 async fn save_config_handler(
     State(state): State<AppState>,
-    Json(req): Json<ConfigRequest>,
+    Json(mut req): Json<ConfigRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
     if req.name.trim().is_empty() || req.image.trim().is_empty() {
         return Ok((
@@ -1461,6 +1478,23 @@ async fn save_config_handler(
         ));
     };
 
+    // GET /configs shows credentials as the redaction marker; an edited
+    // config posted back carries it. Put the stored values back, so saving a
+    // config can never overwrite a secret with the placeholder.
+    let stored = store.get_config(&req.name).await?;
+    if let Err(missing) = redact::restore_redacted(&mut req.env, stored.as_ref().map(|c| &c.env)) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "env {} is the redaction placeholder with no saved value behind it; type the real value",
+                    missing.join(", ")
+                ),
+            })),
+        ));
+    }
+
     let id = store.upsert_config(&req).await?;
     info!(name = %req.name, "saved bot config");
     Ok((
@@ -1482,9 +1516,19 @@ async fn list_configs_handler(
     };
 
     let rows = store.list_configs().await?;
+    let configs = rows
+        .iter()
+        .map(|row| {
+            let (env, redacted) = redact::redact_env(&row.env);
+            let mut value = serde_json::to_value(row)?;
+            value["env"] = serde_json::json!(env);
+            value["env_redacted"] = serde_json::json!(redacted);
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
     Ok(Json(serde_json::json!({
-        "configs": rows,
-        "total": rows.len(),
+        "configs": configs,
+        "total": configs.len(),
         "db_enabled": true,
     })))
 }
@@ -1695,6 +1739,153 @@ fn instance_bot_id(cfg: &BotConfigRow) -> String {
         .unwrap_or_else(|| cfg.name.clone())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Read views for the web UI and agents: account leases, a running bot's own
+// /status, and what a recorder instance has written
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// GET /leases                   every account lease, live or lapsed
+// GET /bots/{bot_id}/status     the running bot's /status document
+// GET /instances/{name}/files   days, files, sizes and gaps in its data folder
+
+/// Upper bound on a bot's /status document, so a misbehaving bot cannot make
+/// the spawner buffer an unbounded body.
+#[cfg(feature = "db")]
+const BOT_STATUS_MAX_BYTES: usize = 1 << 20;
+
+#[cfg(feature = "db")]
+async fn list_leases_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(
+            serde_json::json!({ "leases": [], "total": 0, "db_enabled": false }),
+        ));
+    };
+    let leases = store.list_account_leases().await?;
+    Ok(Json(serde_json::json!({
+        "leases": leases,
+        "total": leases.len(),
+        "db_enabled": true,
+    })))
+}
+
+/// The bot's own `/status`, from the same URL the net-worth sampler polls.
+///
+/// Only a bot Docker reports RUNNING with this bot_id is fetched, and its
+/// address is the container name Docker reports, never one built from the
+/// request, so this cannot be pointed at anything but our own bots. Needs the
+/// `db` feature only because that is what brings in the HTTP client.
+#[cfg(feature = "db")]
+async fn bot_status_handler(
+    State(state): State<AppState>,
+    Path(bot_id): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let bots = state.docker.list_bots().await?;
+    let Some(bot) = bots
+        .iter()
+        .find(|b| b.bot_id == bot_id && b.state == "running" && !b.name.is_empty())
+    else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": format!("no running bot '{bot_id}'") })),
+        ));
+    };
+    let url = crate::net_worth::status_url(&bot.name, state.config.bot_metrics_port);
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .user_agent(concat!("fks-spawner/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_default()
+    });
+    let unreachable = |why: String| {
+        Ok((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "ok": false, "bot_id": bot_id, "error": why })),
+        ))
+    };
+    let resp = match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => return unreachable(format!("the bot answered {}", resp.status())),
+        Err(e) => return unreachable(format!("the bot did not answer: {e}")),
+    };
+    let body = match resp.bytes().await {
+        Ok(body) if body.len() <= BOT_STATUS_MAX_BYTES => body,
+        Ok(body) => return unreachable(format!("status is {} bytes, over the limit", body.len())),
+        Err(e) => return unreachable(format!("reading the status failed: {e}")),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(status) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "bot_id": bot_id, "status": status })),
+        )),
+        Err(e) => unreachable(format!("status is not JSON: {e}")),
+    }
+}
+
+#[cfg(feature = "db")]
+#[derive(Debug, serde::Deserialize)]
+struct FilesQuery {
+    days: Option<usize>,
+}
+
+/// What a recorder instance has written: days newest first, per symbol and
+/// stream, with sizes and the gap ledger summed per day and connection.
+/// Deleting an instance never deletes its data, so the folder is read even
+/// when the container is gone.
+#[cfg(feature = "db")]
+async fn instance_files_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<FilesQuery>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(no_db());
+    };
+    let cfg = instance_config(store, &name).await?;
+    let set = load_templates(&state);
+    let Some(dir) = cfg
+        .template
+        .as_ref()
+        .and_then(|t| set.get(&t.id))
+        .and_then(|t| instances::lake_dir(&state.config.instances.lake_root, t, &cfg.name))
+    else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("'{name}' keeps no data folder (its template has no data section, or is unreadable)"),
+            })),
+        ));
+    };
+    let days = q.days.unwrap_or(31);
+    let scan_dir = dir.clone();
+    let scanned = tokio::task::spawn_blocking(move || crate::coverage::scan(&scan_dir, days))
+        .await
+        .map_err(|e| SpawnerError::Other(format!("coverage scan panicked: {e}")))?;
+    let coverage = match scanned {
+        Ok(coverage) => coverage,
+        // Created but nothing written yet (or the lake is not mounted here).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::coverage::Coverage::default(),
+        Err(e) => return Err(e.into()),
+    };
+    let disk = instances::disk_space(&state.config.instances.lake_root)
+        .ok()
+        .map(|(free, total)| serde_json::json!({ "free_bytes": free, "total_bytes": total }));
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "name": name,
+            "data_dir": dir,
+            "coverage": coverage,
+            "disk": disk,
+        })),
+    ))
+}
+
 #[cfg(feature = "db")]
 async fn list_instances_handler(
     State(state): State<AppState>,
@@ -1716,8 +1907,14 @@ async fn list_instances_handler(
                 .as_ref()
                 .and_then(|t| set.get(&t.id))
                 .and_then(|t| instances::lake_dir(&state.config.instances.lake_root, t, &c.name));
+            let kind = c
+                .template
+                .as_ref()
+                .and_then(|t| set.get(&t.id))
+                .map(|t| t.kind);
             serde_json::json!({
                 "name": c.name,
+                "kind": kind,
                 "template": c.template.as_ref().map(|t| t.id.clone()),
                 "template_version": c.template.as_ref().map(|t| t.version),
                 "params": c.template.as_ref().map(|t| t.params.clone()),

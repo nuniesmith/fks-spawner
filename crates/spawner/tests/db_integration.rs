@@ -1245,6 +1245,16 @@ async fn exercise_account_leases(store: &BotRunStore) {
         .expect("lease held");
     assert_eq!(holder.bot_id, "lease-bot-a");
 
+    // The read API (GET /leases) lists the same holder, live.
+    let leases = store.list_account_leases().await.expect("list leases");
+    let row = leases
+        .iter()
+        .find(|l| l.account == ACCOUNT)
+        .expect("the lease is listed");
+    assert_eq!(row.bot_id, "lease-bot-a");
+    assert!(row.live, "a freshly acquired lease is live");
+    assert!(row.expires_at > row.acquired_at);
+
     // Bind the container, then heartbeat: only the matching (bot,
     // container) pair refreshes the lease. ID FORMS mirror production:
     // bind stores the id the spawn path returns (Docker's SHORT id),

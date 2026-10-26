@@ -229,8 +229,13 @@ impl InstancePlan {
 }
 
 /// Free bytes for unprivileged use on the filesystem holding `path`.
-#[allow(clippy::unnecessary_cast)] // the statvfs field types differ by platform
 pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
+    disk_space(path).map(|(free, _)| free)
+}
+
+/// (free for unprivileged use, total) bytes on the filesystem holding `path`.
+#[allow(clippy::unnecessary_cast)] // the statvfs field types differ by platform
+pub fn disk_space(path: &Path) -> std::io::Result<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has a NUL byte")
@@ -245,7 +250,11 @@ pub fn free_bytes(path: &Path) -> std::io::Result<u64> {
     }
     // SAFETY: rc == 0, so statvfs initialised `st`.
     let st = unsafe { st.assume_init() };
-    Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    let frsize = st.f_frsize as u64;
+    Ok((
+        (st.f_bavail as u64).saturating_mul(frsize),
+        (st.f_blocks as u64).saturating_mul(frsize),
+    ))
 }
 
 /// Make the instance's data folder. For a NEW instance (`min_free_gb` set)

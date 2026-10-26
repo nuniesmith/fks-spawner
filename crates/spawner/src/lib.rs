@@ -16,6 +16,7 @@ pub mod auth;
 pub mod boot_reconcile;
 pub mod btc_watch;
 pub mod config;
+pub mod coverage;
 #[cfg(feature = "db")]
 pub mod db;
 pub mod docker_client;
@@ -30,6 +31,7 @@ pub mod models;
 pub mod net_worth;
 pub mod notifications;
 pub mod prometheus_sd;
+pub mod redact;
 pub mod rithmic_sampler;
 #[cfg(feature = "db")]
 pub mod secrets_crypto;
