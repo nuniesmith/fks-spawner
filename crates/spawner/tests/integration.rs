@@ -464,6 +464,94 @@ async fn spawn_declaring_an_account_without_a_db_is_refused() {
 }
 
 #[tokio::test]
+async fn spawn_carrying_the_redaction_placeholder_is_refused() {
+    // GET /configs shows credentials as the placeholder (spawner::redact). A
+    // spawn built from that read must not hand the bot the literal string.
+    let (app, mock) = build_app(test_config(""));
+    let body = serde_json::json!({
+        "image": "fks-bot-example:latest",
+        "bot_id": "copied-from-a-read",
+        "mode": "paper",
+        "env": { "DISCORD_WEBHOOK_URL": spawner::redact::REDACTED, "TZ": "UTC" }
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/spawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let payload = body_string(resp).await;
+    assert!(
+        payload.contains("DISCORD_WEBHOOK_URL") && payload.contains("redaction placeholder"),
+        "body was: {payload}"
+    );
+    assert_eq!(
+        mock.state.lock().unwrap().containers.len(),
+        0,
+        "a refused spawn must not create a container"
+    );
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn read_views_degrade_without_db_and_name_what_is_missing() {
+    let (app, _) = build_app(test_config(""));
+
+    // GET /leases: an honest empty list, never a 500.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/leases").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"db_enabled\":false"), "body: {payload}");
+    assert!(payload.contains("\"total\":0"), "body: {payload}");
+
+    // GET /instances/{name}/files: instances live in Postgres.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/instances/btc/files").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // GET /bots/{id}/status: a bot that is not running is a 404 naming it.
+    let resp = app
+        .oneshot(Request::get("/bots/ghost/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("no running bot 'ghost'"), "body: {payload}");
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn bot_status_of_an_unreachable_bot_is_a_bad_gateway() {
+    // The mock "runs" the bot, but nothing answers on its address: the
+    // response says so (502) rather than hanging or passing an error off as
+    // a status.
+    let (app, _) = build_app(test_config(""));
+    assert_eq!(post_spawn(&app, "status-probe").await.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(Request::get("/bots/status-probe/status").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("\"ok\":false"), "body: {payload}");
+}
+
+#[tokio::test]
 async fn spawn_then_list_then_remove_round_trips() {
     let (app, mock) = build_app(test_config(""));
 

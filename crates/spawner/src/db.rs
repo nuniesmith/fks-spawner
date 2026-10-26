@@ -823,6 +823,34 @@ impl BotRunStore {
         }
     }
 
+    /// Every account lease, live or lapsed, for the read API (`GET /leases`):
+    /// which bot holds which account. `live` is computed by Postgres against
+    /// its own clock, the same clock the acquire's expiry test uses.
+    pub async fn list_account_leases(&self) -> Result<Vec<AccountLeaseRow>, SpawnerError> {
+        let rows = sqlx::query(
+            "SELECT account, bot_id, container_id, acquired_at, heartbeat_at, expires_at, \
+                    expires_at > NOW() AS live \
+             FROM account_leases ORDER BY account",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        rows.iter()
+            .map(|r| {
+                Ok(AccountLeaseRow {
+                    account: r.try_get("account").map_err(map_sqlx)?,
+                    bot_id: r.try_get("bot_id").map_err(map_sqlx)?,
+                    container_id: r.try_get("container_id").map_err(map_sqlx)?,
+                    acquired_at: r.try_get("acquired_at").map_err(map_sqlx)?,
+                    heartbeat_at: r.try_get("heartbeat_at").map_err(map_sqlx)?,
+                    expires_at: r.try_get("expires_at").map_err(map_sqlx)?,
+                    live: r.try_get("live").map_err(map_sqlx)?,
+                })
+            })
+            .collect()
+    }
+
     /// The live (unexpired) holder of `account`, if any. Read-only — the
     /// respawn pre-flight uses it to refuse BEFORE tearing the old container
     /// down; the acquire above stays the authority at spawn time.
@@ -1944,6 +1972,19 @@ impl NotificationLogRow {
 pub struct UiLayoutSummaryRow {
     pub name: String,
     pub updated_at: String,
+}
+
+/// One `account_leases` row, as `GET /leases` returns it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountLeaseRow {
+    pub account: String,
+    pub bot_id: String,
+    pub container_id: Option<String>,
+    pub acquired_at: DateTime<Utc>,
+    pub heartbeat_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// The lease has not expired (Postgres's clock).
+    pub live: bool,
 }
 
 /// A row from `bot_configs` exposed via GET /configs. Resource limits + env are
