@@ -206,7 +206,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/edges", get(list_edges_handler).post(save_edge_handler))
         .route("/edges/{id}", delete(delete_edge_handler))
         .route("/edges/{id}/backtests", get(list_edge_backtests_handler))
-        .route("/edges/{id}/backtest", post(run_edge_backtest_handler));
+        .route("/edges/{id}/backtest", post(run_edge_backtest_handler))
+        .route("/edges/{id}/hypotheses", post(register_hypothesis_handler))
+        .route("/ladder", get(ladder_handler))
+        .route(
+            "/hypotheses/{id}/withdraw",
+            post(withdraw_hypothesis_handler),
+        )
+        .route("/deployments", post(create_deployment_handler))
+        .route(
+            "/deployments/{id}/promote",
+            post(promote_deployment_handler),
+        )
+        .route("/deployments/{id}/retire", post(retire_deployment_handler));
 
     let protected = protected
         .layer(middleware::from_fn_with_state(
@@ -3176,6 +3188,189 @@ async fn logs_sse_handler(
 // ───────────────────────────────────────────────────────────────────────────
 // Tests — pure handler-adjacent logic (no HTTP, no DB, no Docker)
 // ───────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The edge ladder (ladder.rs): hypotheses, experiments, deployments
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+/// 400 with one line per problem, the instances' shape.
+fn ladder_invalid(errors: Vec<String>) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "ok": false, "errors": errors })),
+    )
+}
+
+#[cfg(feature = "db")]
+fn ladder_no_db() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "ok": false,
+            "db_enabled": false,
+            "errors": ["the edge ladder needs the spawner Postgres DB"],
+        })),
+    )
+}
+
+#[cfg(feature = "db")]
+fn ladder_not_found(what: String) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "ok": false, "errors": [what] })),
+    )
+}
+
+/// GET /ladder — the whole board: edges, hypotheses, experiments,
+/// deployments and search effort, each newest first. Without a database it
+/// degrades to empty lists and `db_enabled: false`, like /edges.
+#[cfg(feature = "db")]
+async fn ladder_handler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, SpawnerError> {
+    let Some(store) = state.store.as_ref() else {
+        return Ok(Json(serde_json::json!({
+            "db_enabled": false,
+            "edges": [], "hypotheses": [], "experiments": [], "deployments": [], "effort": [],
+        })));
+    };
+    let mut board = store.ladder_board().await?;
+    board["db_enabled"] = serde_json::Value::Bool(true);
+    Ok(Json(board))
+}
+
+/// POST /edges/{id}/hypotheses — register a hypothesis (stage 2) for an
+/// ACTIVE edge. Frozen from this moment (fks 024).
+#[cfg(feature = "db")]
+async fn register_hypothesis_handler(
+    State(state): State<AppState>,
+    Path(edge_id): Path<String>,
+    Json(req): Json<crate::ladder::HypothesisRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let h = match crate::ladder::validate_hypothesis(&req) {
+        Ok(h) => h,
+        Err(errors) => return Ok(ladder_invalid(errors)),
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Ok(ladder_no_db());
+    };
+    let edge_id = edge_id.trim().to_string();
+    if store.get_edge(&edge_id).await?.is_none() {
+        return Ok(ladder_not_found(format!(
+            "no active edge {edge_id:?}: register the edge first (POST /edges)"
+        )));
+    }
+    let row = store.register_hypothesis(&edge_id, &h).await?;
+    info!(edge_id = %edge_id, id = %row["id"], by = ?h.registered_by, "hypothesis registered");
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true, "hypothesis": row })),
+    ))
+}
+
+/// POST /hypotheses/{id}/withdraw — `{reason}`. Terminal.
+#[cfg(feature = "db")]
+async fn withdraw_hypothesis_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<crate::ladder::ReasonRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let reason = match crate::ladder::validate_reason(&req) {
+        Ok(r) => r,
+        Err(errors) => return Ok(ladder_invalid(errors)),
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Ok(ladder_no_db());
+    };
+    match store.withdraw_hypothesis(id, &reason).await? {
+        Some(row) => {
+            info!(id, reason = %reason, "hypothesis withdrawn");
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "hypothesis": row })),
+            ))
+        }
+        None => Ok(ladder_not_found(format!("no hypothesis {id}"))),
+    }
+}
+
+/// POST /deployments — a deployment row at `backtest` for an experiment.
+#[cfg(feature = "db")]
+async fn create_deployment_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::ladder::DeploymentRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let d = match crate::ladder::validate_deployment(&req) {
+        Ok(d) => d,
+        Err(errors) => return Ok(ladder_invalid(errors)),
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Ok(ladder_no_db());
+    };
+    let row = store.create_deployment(&d).await?;
+    info!(id = %row["id"], experiment_id = d.experiment_id, account = %d.account_id, "deployment created at backtest");
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true, "deployment": row })),
+    ))
+}
+
+/// POST /deployments/{id}/promote — `{to: "forward", forward_sessions_required}`
+/// or `{to: "live"}`. The promotion guard decides; a refusal is a 409 in its
+/// own words. Live is admin-only in the web UI (R2b); here, as everywhere,
+/// the internal token is the gate.
+#[cfg(feature = "db")]
+async fn promote_deployment_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<crate::ladder::PromoteRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let to = match crate::ladder::validate_promotion(&req) {
+        Ok(to) => to,
+        Err(errors) => return Ok(ladder_invalid(errors)),
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Ok(ladder_no_db());
+    };
+    match store.promote_deployment(id, to).await? {
+        Some(row) => {
+            warn!(id, to = ?to, "deployment promoted");
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "deployment": row })),
+            ))
+        }
+        None => Ok(ladder_not_found(format!("no deployment {id}"))),
+    }
+}
+
+/// POST /deployments/{id}/retire — `{reason}`. From any stage; terminal.
+/// Demotion is always allowed and cheaper than promotion, on purpose.
+#[cfg(feature = "db")]
+async fn retire_deployment_handler(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(req): Json<crate::ladder::ReasonRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), SpawnerError> {
+    let reason = match crate::ladder::validate_reason(&req) {
+        Ok(r) => r,
+        Err(errors) => return Ok(ladder_invalid(errors)),
+    };
+    let Some(store) = state.store.as_ref() else {
+        return Ok(ladder_no_db());
+    };
+    match store.retire_deployment(id, &reason).await? {
+        Some(row) => {
+            info!(id, reason = %reason, "deployment retired");
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "ok": true, "deployment": row })),
+            ))
+        }
+        None => Ok(ladder_not_found(format!("no deployment {id}"))),
+    }
+}
 
 #[cfg(test)]
 mod tests {
