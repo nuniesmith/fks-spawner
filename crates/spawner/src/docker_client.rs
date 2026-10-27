@@ -1079,6 +1079,7 @@ mod tests {
     fn valid_spawn_req() -> SpawnRequest {
         SpawnRequest {
             data_dir: None,
+            webhooks: Default::default(),
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some("bot-1".to_string()),
             account: None,

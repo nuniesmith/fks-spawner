@@ -28,6 +28,11 @@ pub struct SpawnRequest {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
+    /// Env var -> notification channel: each channel's webhook URL is
+    /// decrypted from Settings and set at spawn (`crate::webhooks`).
+    #[serde(default)]
+    pub webhooks: std::collections::BTreeMap<String, String>,
+
     /// Extra labels applied to the container (merged with mandatory fks.* labels).
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -131,6 +136,16 @@ pub struct NotificationChannelRequest {
     /// "pnl_digest") subscribe to just those events.
     #[serde(default)]
     pub events: Vec<String>,
+
+    /// Whether the dispatcher sends the platform's events here. Off for a
+    /// bot's own channel (its webhook set at spawn, `crate::webhooks`), so it
+    /// doesn't also get every bot's lifecycle events. Default on.
+    #[serde(default = "default_platform_events")]
+    pub platform_events: bool,
+}
+
+fn default_platform_events() -> bool {
+    true
 }
 
 fn default_channel_kind() -> String {
@@ -188,6 +203,11 @@ pub struct ConfigRequest {
     /// self-contained: image + env + which keys the bot needs.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// Env var -> notification channel (Settings): each channel's webhook URL
+    /// is set at every spawn and never saved here (`crate::webhooks`).
+    /// Stored in the `config_json` blob like `secrets`.
+    #[serde(default)]
+    pub webhooks: std::collections::BTreeMap<String, String>,
     /// Optional bot identity this template respawns as — the container-name
     /// suffix (`fks-bot-{bot_id}`) `POST /configs/{name}/respawn` targets.
     /// Persisted inside the row's JSONB `config_json` blob (no schema

@@ -471,24 +471,27 @@ impl BotRunStore {
         kind: &str,
         url: &str,
         events: &[String],
+        platform_events: bool,
     ) -> Result<(), SpawnerError> {
         let map_crypto = |e: String| SpawnerError::Other(format!("webhook encryption failed: {e}"));
         let target = self.cipher.encrypt(url).map_err(map_crypto)?;
         let events_json = serde_json::json!(events);
 
         sqlx::query(
-            "INSERT INTO notification_channels (name, kind, target, events) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO notification_channels (name, kind, target, events, platform_events) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (name) DO UPDATE \
              SET kind = EXCLUDED.kind, \
                  target = EXCLUDED.target, \
                  events = EXCLUDED.events, \
+                 platform_events = EXCLUDED.platform_events, \
                  updated_at = NOW()",
         )
         .bind(name)
         .bind(kind)
         .bind(&target)
         .bind(events_json)
+        .bind(platform_events)
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)?;
@@ -507,8 +510,11 @@ impl BotRunStore {
     /// deliberately never selected.
     pub async fn list_channels(&self) -> Result<Vec<NotificationChannelRow>, SpawnerError> {
         let rows = sqlx::query(
-            "SELECT name, kind, events, updated_at \
-             FROM notification_channels \
+            // platform_events via to_jsonb so a database without fks 026's
+            // column still lists (and dispatches to) every channel.
+            "SELECT name, kind, events, updated_at, \
+                    COALESCE((to_jsonb(c) ->> 'platform_events')::boolean, TRUE) AS platform_events \
+             FROM notification_channels c \
              ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -650,6 +656,9 @@ impl BotRunStore {
             "memory_mb": req.memory_mb,
             "env": req.env,
             "secrets": req.secrets,
+            // env var -> Settings channel; resolved at every spawn, the URL
+            // itself never stored here (crate::webhooks)
+            "webhooks": req.webhooks,
             // bot_id lives in the JSONB blob so a self-contained respawn
             // template needs NO schema migration (the column set is unchanged).
             "bot_id": req.bot_id,
@@ -2093,6 +2102,8 @@ pub struct NotificationChannelRow {
     pub kind: String,
     pub events: Vec<String>,
     pub updated_at: DateTime<Utc>,
+    /// Off: a bot's own channel, which the dispatcher never sends to.
+    pub platform_events: bool,
 }
 
 impl NotificationChannelRow {
@@ -2112,6 +2123,7 @@ impl NotificationChannelRow {
             kind: r.try_get("kind").unwrap_or_default(),
             events,
             updated_at: r.try_get("updated_at").unwrap_or_else(|_| Utc::now()),
+            platform_events: r.try_get("platform_events").unwrap_or(true),
         }
     }
 }
@@ -2191,6 +2203,8 @@ pub struct BotConfigRow {
     pub env: HashMap<String, String>,
     /// Exchanges whose stored credentials the template injects at spawn time.
     pub secrets: Vec<String>,
+    /// Env var -> Settings channel, resolved at every spawn (`crate::webhooks`).
+    pub webhooks: std::collections::BTreeMap<String, String>,
     /// Bot identity the template respawns as (`fks-bot-{bot_id}`). `None` for
     /// configs saved before the field existed — surfaced on GET /configs so the
     /// WebUI can show which templates are respawn-ready.
@@ -2238,6 +2252,15 @@ impl BotConfigRow {
                     .collect()
             })
             .unwrap_or_default();
+        let webhooks = cfg
+            .get("webhooks")
+            .and_then(serde_json::Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
         let bot_id = cfg
             .get("bot_id")
             .and_then(serde_json::Value::as_str)
@@ -2264,6 +2287,7 @@ impl BotConfigRow {
             memory_mb,
             env,
             secrets,
+            webhooks,
             bot_id,
             account,
             restart_policy,

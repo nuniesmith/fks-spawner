@@ -40,3 +40,4 @@ pub mod supervisor;
 pub mod task_supervisor;
 pub mod templates;
 pub mod treasury;
+pub mod webhooks;

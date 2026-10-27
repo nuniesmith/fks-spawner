@@ -1774,6 +1774,7 @@ async fn remove_existing_bot_stops_and_removes_when_present() {
 
     mock.spawn(SpawnRequest {
         data_dir: None,
+        webhooks: Default::default(),
         image: "fks-bot-example:latest".to_string(),
         bot_id: Some("crypto-spot-live".to_string()),
         account: None,
@@ -1900,6 +1901,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
         memory_mb: None,
         env: HashMap::new(),
         secrets,
+        webhooks: Default::default(),
         bot_id: Some(bot_id.to_string()),
         account: None,
         restart_policy: None,
@@ -1911,6 +1913,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
 async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
     mock.spawn(SpawnRequest {
         data_dir: None,
+        webhooks: Default::default(),
         image: image.to_string(),
         bot_id: Some(bot_id.to_string()),
         account: None,
@@ -2184,6 +2187,7 @@ async fn net_worth_sampler_targets_only_running_bots() {
     for bot_id in ["alpha", "beta"] {
         mock.spawn(SpawnRequest {
             data_dir: None,
+            webhooks: Default::default(),
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some(bot_id.to_string()),
             account: None,
@@ -2632,6 +2636,69 @@ async fn ladder_routes_are_token_gated() {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route: {uri}");
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A bot's webhooks from Settings (crate::webhooks)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_webhook_comes_from_settings_or_env_never_both() {
+    let (app, _) = build_app(test_config(""));
+    for body in [
+        serde_json::json!({
+            "name": "crypto-regime", "image": "fks-bot-crypto:latest",
+            "env": {"CRYPTO_DISCORD_WEBHOOK_URL": "https://example.invalid/old"},
+            "webhooks": {"CRYPTO_DISCORD_WEBHOOK_URL": "crypto"}
+        }),
+        serde_json::json!({
+            "name": "crypto-regime", "image": "fks-bot-crypto:latest",
+            "webhooks": {"lower": "crypto"}
+        }),
+        serde_json::json!({
+            "name": "crypto-regime", "image": "fks-bot-crypto:latest",
+            "webhooks": {"FKS_BOT_ID": "crypto"}
+        }),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/configs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body: {body}");
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn a_missing_webhook_channel_never_stops_a_spawn() {
+    // No database here, so no channel can resolve: the bot still starts,
+    // without the variable (a live trader must not stay down over Discord).
+    let (app, mock) = build_app(test_config(""));
+    let body = serde_json::json!({
+        "image": "fks-bot-crypto:latest",
+        "bot_id": "hooked",
+        "mode": "paper",
+        "webhooks": {"CRYPTO_DISCORD_WEBHOOK_URL": "crypto"}
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/spawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bots = mock.list_bots().await.unwrap();
+    assert!(bots.iter().any(|b| b.bot_id == "hooked"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

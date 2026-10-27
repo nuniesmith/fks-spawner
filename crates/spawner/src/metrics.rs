@@ -135,6 +135,18 @@ pub static ACCOUNT_LEASE_REFUSALS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     .expect("metric registration failed")
 });
 
+/// A bot's webhook (`webhooks:` on its config, `crate::webhooks`) that
+/// couldn't be set at spawn: the channel is missing from Settings or couldn't
+/// be read. The bot started anyway, without that variable.
+pub static WEBHOOK_UNRESOLVED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    register_counter_vec!(
+        "fks_spawner_webhook_unresolved_total",
+        "Bot webhooks that couldn't be set from Settings at spawn (the bot started without them)",
+        &["channel"]
+    )
+    .expect("metric registration failed")
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Gauges
 // ─────────────────────────────────────────────────────────────────────────────
