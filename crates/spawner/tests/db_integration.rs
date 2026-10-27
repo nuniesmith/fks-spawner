@@ -46,6 +46,12 @@
 //!                        deactivate_edge, plus insert_backtest_run →
 //!                        record_backtest_container → list_backtest_runs and
 //!                        mark_backtest_failed on the backtest_runs ledger.
+//!   • the edge ladder  — register_hypothesis / withdraw_hypothesis,
+//!                        create / promote / retire_deployment and
+//!                        ladder_board against the REAL guard triggers (fks
+//!                        017/018/020/024, transcribed whole): every rung the
+//!                        database refuses comes back as SpawnerError::Refused
+//!                        in Postgres's own words.
 //!
 //! ── Gating ───────────────────────────────────────────────────────────────────
 //! The test is `#[ignore]`d because it needs a Docker daemon, so a plain
@@ -370,6 +376,7 @@ async fn sql_path_roundtrips_against_ephemeral_postgres() {
     exercise_accounts(&store).await;
     exercise_net_worth_transfers_profit(&store).await;
     exercise_edges_and_backtests(&store).await;
+    exercise_edge_ladder(&store, &pg).await;
     exercise_notification_log(&store).await;
     exercise_dispatcher_ledger(&store).await;
 }
@@ -1032,6 +1039,286 @@ async fn exercise_edges_and_backtests(store: &BotRunStore) {
     assert!(
         edges.iter().any(|e| e.edge_id == "orb" && !e.active),
         "list_edges still shows the soft-deleted edge"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The edge ladder — the store against the real guard triggers
+// ─────────────────────────────────────────────────────────────────────────────
+async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
+    use spawner::error::SpawnerError;
+    use spawner::ladder::{
+        DeploymentRequest, HypothesisRequest, Promotion, validate_deployment, validate_hypothesis,
+    };
+
+    fn refused<T: std::fmt::Debug>(r: Result<T, SpawnerError>, needle: &str) {
+        match r {
+            Err(SpawnerError::Refused(m)) => {
+                assert!(
+                    m.contains(needle),
+                    "refusal {m:?} should mention {needle:?}"
+                )
+            }
+            other => panic!("expected a refusal mentioning {needle:?}, got {other:?}"),
+        }
+    }
+
+    store
+        .upsert_edge(&EdgeRequest {
+            edge_id: "liq-fade".to_string(),
+            display_name: Some("Liquidation fade".to_string()),
+            edge_type: "rule".to_string(),
+            asset_scope: Some(serde_json::json!(["BTCUSDT"])),
+            status: "research".to_string(),
+            backtest_image: None,
+            validation_record: None,
+            notes: None,
+            active: true,
+        })
+        .await
+        .expect("edge");
+    for (id, class) in [
+        ("ladder-personal", "personal-crypto"),
+        ("ladder-prop", "prop"),
+    ] {
+        store
+            .upsert_account(&AccountRequest {
+                account_id: id.to_string(),
+                display_name: None,
+                tier: 1,
+                account_class: class.to_string(),
+                venue: Some("binance".to_string()),
+                role: "bot-trade".to_string(),
+                firm: None,
+                compliance_flag: "manual-mirror".to_string(),
+                risk_caps: None,
+                sizing: None,
+                active: true,
+            })
+            .await
+            .expect("account");
+    }
+
+    // ── Stage 2: register, then try to change it ──────────────────────────
+    let req: HypothesisRequest = serde_json::from_value(serde_json::json!({
+        "idea": "Liquidation clusters overshoot; fading the 5-minute move earns the snap-back.",
+        "symbols": ["btcusdt"],
+        "dataset": "lake raw/binance/usdm/btc, 2026-10-27..2027-01-27",
+        "holdout_share": 0.25,
+        "params": [{"name": "threshold_usd", "min": 1000000, "max": 20000000, "step": 1000000}],
+        "baseline": "buy-and-hold",
+        "metric": "net return after fees",
+        "costs": {"maker_bps": 40, "taker_bps": 80, "slippage_bps": 5},
+        "registered_by": "jordan"
+    }))
+    .expect("hypothesis json");
+    let h = validate_hypothesis(&req).expect("valid hypothesis");
+    let row = store
+        .register_hypothesis("liq-fade", &h)
+        .await
+        .expect("register");
+    let first = row["id"].as_i64().expect("id");
+    assert_eq!(row["status"], "registered");
+    assert_eq!(row["symbols"], serde_json::json!(["BTCUSDT"]));
+    assert_eq!(row["registered_by"], "jordan");
+    assert!(row["registered_at"].is_string(), "{row}");
+
+    // No API edits a hypothesis, and no SQL can: the trigger refuses it.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&pg.url())
+        .await
+        .expect("raw pool");
+    let edit = sqlx::query("UPDATE edge_hypotheses SET baseline = 'zero' WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect_err("editing a registered hypothesis must be refused");
+    assert!(edit.to_string().contains("frozen"), "{edit}");
+
+    let withdrawn = store
+        .withdraw_hypothesis(first, "superseded by a tighter idea")
+        .await
+        .expect("withdraw")
+        .expect("exists");
+    assert_eq!(withdrawn["status"], "withdrawn");
+    refused(store.withdraw_hypothesis(first, "again").await, "terminal");
+    assert!(
+        store
+            .withdraw_hypothesis(999_999, "no such row")
+            .await
+            .expect("query")
+            .is_none()
+    );
+
+    // ── Stages 3–4 stand-in: the search job's rows ────────────────────────
+    let second = store
+        .register_hypothesis("liq-fade", &h)
+        .await
+        .expect("register again")["id"]
+        .as_i64()
+        .expect("id");
+    let experiment = |name: &str, verdict: &str| {
+        // A CTE, so psql prints the id and not the INSERT's command tag.
+        pg.psql_scalar(&format!(
+            "WITH ins AS (INSERT INTO edge_experiments (study_name, config_fingerprint, symbol, \
+             bar_minutes, n_trials, verdict, finished_at, hypothesis_id) \
+             VALUES ('{name}', 'fp-liq', 'BTCUSDT', 5, 40, '{verdict}', now(), {second}) \
+             RETURNING id) SELECT id FROM ins"
+        ))
+        .parse::<i64>()
+        .expect("experiment id")
+    };
+    let usable = experiment("liq-fade-1", "USABLE");
+    let rejected = experiment("liq-fade-2", "DO NOT PASTE");
+    // A search that finished before its hypothesis was registered (U2).
+    let early = sqlx::query(
+        "INSERT INTO edge_experiments (study_name, config_fingerprint, symbol, bar_minutes, \
+         n_trials, verdict, finished_at, hypothesis_id) \
+         VALUES ('liq-fade-early', 'fp-liq', 'BTCUSDT', 5, 40, 'USABLE', \
+                 now() - interval '1 day', $1)",
+    )
+    .bind(second)
+    .execute(&pool)
+    .await
+    .expect_err("a result older than its hypothesis must be refused");
+    assert!(
+        early.to_string().contains("description, not a test"),
+        "{early}"
+    );
+
+    // ── Stage 5: deployments climb one rung at a time ─────────────────────
+    let deployment = |experiment_id: i64, account: &str, execution: Option<&str>| {
+        validate_deployment(&DeploymentRequest {
+            experiment_id,
+            account_id: account.to_string(),
+            symbol: "BTCUSDT".to_string(),
+            params_snapshot: serde_json::json!({"threshold_usd": 5_000_000}),
+            execution: execution.map(str::to_string),
+        })
+        .expect("valid deployment")
+    };
+    let good = store
+        .create_deployment(&deployment(usable, "ladder-personal", None))
+        .await
+        .expect("deployment");
+    let good_id = good["id"].as_i64().expect("id");
+    assert_eq!(good["stage"], "backtest");
+    assert_eq!(good["execution"], "manual");
+    let bad_id = store
+        .create_deployment(&deployment(rejected, "ladder-personal", None))
+        .await
+        .expect("deployment of a rejected experiment")["id"]
+        .as_i64()
+        .expect("id");
+
+    refused(
+        store
+            .create_deployment(&deployment(usable, "ladder-prop", Some("auto")))
+            .await,
+        "prop account",
+    );
+    refused(
+        store
+            .create_deployment(&deployment(424_242, "ladder-personal", None))
+            .await,
+        "is not present",
+    );
+
+    refused(
+        store
+            .promote_deployment(
+                bad_id,
+                Promotion::Forward {
+                    sessions_required: 20,
+                },
+            )
+            .await,
+        "USABLE",
+    );
+    refused(
+        store.promote_deployment(good_id, Promotion::Live).await,
+        "illegal stage transition backtest -> live",
+    );
+    let fwd = store
+        .promote_deployment(
+            good_id,
+            Promotion::Forward {
+                sessions_required: 20,
+            },
+        )
+        .await
+        .expect("forward")
+        .expect("exists");
+    assert_eq!(fwd["stage"], "forward");
+    assert_eq!(fwd["forward_sessions_required"], 20);
+    refused(
+        store.promote_deployment(good_id, Promotion::Live).await,
+        "requires 20 forward session(s), only 0 observed",
+    );
+    // The forward harness (not built yet) counts sessions; stand in for it.
+    pg.psql_scalar(&format!(
+        "WITH up AS (UPDATE edge_deployments SET forward_sessions_observed = 20 \
+         WHERE id = {good_id} RETURNING id) SELECT id FROM up"
+    ));
+    let live = store
+        .promote_deployment(good_id, Promotion::Live)
+        .await
+        .expect("live")
+        .expect("exists");
+    assert_eq!(live["stage"], "live");
+    assert!(
+        store
+            .promote_deployment(999_999, Promotion::Live)
+            .await
+            .expect("query")
+            .is_none()
+    );
+
+    let retired = store
+        .retire_deployment(good_id, "drift on 2 consecutive days")
+        .await
+        .expect("retire")
+        .expect("exists");
+    assert_eq!(retired["stage"], "retired");
+    assert_eq!(retired["retired_reason"], "drift on 2 consecutive days");
+    refused(
+        store.retire_deployment(good_id, "again").await,
+        "already retired (drift on 2 consecutive days)",
+    );
+    assert!(
+        store
+            .retire_deployment(999_999, "no such row")
+            .await
+            .expect("query")
+            .is_none()
+    );
+
+    // ── The board ─────────────────────────────────────────────────────────
+    let board = store.ladder_board().await.expect("board");
+    let ids = |key: &str| -> Vec<i64> {
+        board[key]
+            .as_array()
+            .expect("list")
+            .iter()
+            .filter_map(|r| r["id"].as_i64())
+            .collect()
+    };
+    assert_eq!(ids("hypotheses"), vec![second, first], "newest first");
+    assert!(ids("experiments").contains(&usable) && ids("experiments").contains(&rejected));
+    assert_eq!(ids("deployments")[0], good_id, "the last one touched first");
+    let effort = board["effort"].as_array().expect("effort");
+    let liq = effort
+        .iter()
+        .find(|e| e["config_fingerprint"] == "fp-liq")
+        .expect("the family's effort");
+    assert_eq!(liq["trials_total"], 80, "both searches count toward N");
+    assert!(
+        board["edges"]
+            .as_array()
+            .expect("edges")
+            .iter()
+            .any(|e| e["edge_id"] == "liq-fade")
     );
 }
 

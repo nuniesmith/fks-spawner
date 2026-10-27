@@ -1403,6 +1403,197 @@ impl BotRunStore {
         Ok(rows.into_iter().map(EdgeRow::from_row).collect())
     }
 
+    // ── The edge ladder (ladder.rs; fks 017, 018, 020, 024) ──────────────────
+
+    /// The whole ladder in one read: edges, hypotheses, experiments,
+    /// deployments and the search effort per family (the N for a
+    /// multiple-testing correction). Postgres builds each list as JSON,
+    /// newest first, at most 500 rows: the board shows the tables as they
+    /// are, so the columns are the tables' own.
+    pub async fn ladder_board(&self) -> Result<serde_json::Value, SpawnerError> {
+        const LISTS: [(&str, &str, &str); 4] = [
+            (
+                "hypotheses",
+                "SELECT id, edge_id, idea, symbols, dataset, holdout_share, params, baseline, \
+                        metric, costs, registered_at, registered_by, status, withdrawn_reason, \
+                        withdrawn_at \
+                 FROM edge_hypotheses ORDER BY registered_at DESC LIMIT 500",
+                "registered_at DESC",
+            ),
+            (
+                "experiments",
+                "SELECT id, study_name, config_fingerprint, symbol, bar_minutes, hypothesis, \
+                        hypothesis_id, registered_at, tuned_params, n_trials, train_days, \
+                        test_days, folds, holdout_folds, selection_score, holdout_score, \
+                        baseline_holdout_score, overfit_gap, selection_trades, holdout_trades, \
+                        verdict, verdict_reasons, outcome, finished_at, created_at \
+                 FROM edge_experiments \
+                 ORDER BY COALESCE(finished_at, created_at) DESC LIMIT 500",
+                "COALESCE(finished_at, created_at) DESC",
+            ),
+            (
+                "deployments",
+                "SELECT id, experiment_id, account_id, symbol, stage, execution, params_snapshot, \
+                        forward_sessions_required, forward_sessions_observed, live_trades, \
+                        live_r_sum, divergence_vs_backtest, since, retired_reason, created_at, \
+                        updated_at \
+                 FROM edge_deployments ORDER BY updated_at DESC LIMIT 500",
+                "updated_at DESC",
+            ),
+            (
+                "effort",
+                "SELECT symbol, config_fingerprint, experiments, trials_total, best_holdout, \
+                        usable, adopted, first_run, last_run \
+                 FROM edge_search_effort ORDER BY trials_total DESC LIMIT 500",
+                "trials_total DESC",
+            ),
+        ];
+        let mut board = serde_json::Map::new();
+        board.insert(
+            "edges".into(),
+            serde_json::to_value(self.list_edges().await?).map_err(SpawnerError::Json)?,
+        );
+        for (key, sql, order) in LISTS {
+            let list: serde_json::Value = sqlx::query_scalar(&format!(
+                "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY {order}), '[]'::jsonb) FROM ({sql}) t"
+            ))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+            board.insert(key.into(), list);
+        }
+        Ok(serde_json::Value::Object(board))
+    }
+
+    /// Register a hypothesis (stage 2). `registered_at` is the database's
+    /// clock, never the caller's.
+    pub async fn register_hypothesis(
+        &self,
+        edge_id: &str,
+        h: &crate::ladder::ValidHypothesis,
+    ) -> Result<serde_json::Value, SpawnerError> {
+        sqlx::query_scalar(
+            "INSERT INTO edge_hypotheses (edge_id, idea, symbols, dataset, holdout_share, params, \
+                                          baseline, metric, costs, registered_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             RETURNING to_jsonb(edge_hypotheses.*)",
+        )
+        .bind(edge_id)
+        .bind(&h.idea)
+        .bind(&h.symbols)
+        .bind(&h.dataset)
+        .bind(h.holdout_share)
+        .bind(&h.params)
+        .bind(&h.baseline)
+        .bind(&h.metric)
+        .bind(&h.costs)
+        .bind(h.registered_by.as_deref())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_ladder)
+    }
+
+    /// Withdraw a registered hypothesis, with its reason. `None` = no such
+    /// hypothesis. Withdrawn is terminal: the trigger refuses a second one.
+    pub async fn withdraw_hypothesis(
+        &self,
+        id: i64,
+        reason: &str,
+    ) -> Result<Option<serde_json::Value>, SpawnerError> {
+        sqlx::query_scalar(
+            "UPDATE edge_hypotheses \
+             SET status = 'withdrawn', withdrawn_reason = $2, withdrawn_at = now() \
+             WHERE id = $1 RETURNING to_jsonb(edge_hypotheses.*)",
+        )
+        .bind(id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_ladder)
+    }
+
+    /// A deployment row at `backtest` for an experiment (stage 5 starts
+    /// here). The promotion guard refuses any other starting stage, and
+    /// `auto` on a prop account.
+    pub async fn create_deployment(
+        &self,
+        d: &crate::ladder::ValidDeployment,
+    ) -> Result<serde_json::Value, SpawnerError> {
+        sqlx::query_scalar(
+            "INSERT INTO edge_deployments (experiment_id, account_id, symbol, execution, \
+                                           params_snapshot) \
+             VALUES ($1, $2, $3, $4, $5) RETURNING to_jsonb(edge_deployments.*)",
+        )
+        .bind(d.experiment_id)
+        .bind(&d.account_id)
+        .bind(&d.symbol)
+        .bind(&d.execution)
+        .bind(&d.params_snapshot)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_ladder)
+    }
+
+    /// One rung up. The promotion guard (018/020) decides; its refusal comes
+    /// back as `SpawnerError::Refused`. `None` = no such deployment.
+    pub async fn promote_deployment(
+        &self,
+        id: i64,
+        to: crate::ladder::Promotion,
+    ) -> Result<Option<serde_json::Value>, SpawnerError> {
+        use crate::ladder::Promotion;
+        let query = match to {
+            Promotion::Forward { sessions_required } => sqlx::query_scalar(
+                "UPDATE edge_deployments \
+                 SET stage = 'forward', forward_sessions_required = $2, since = now() \
+                 WHERE id = $1 RETURNING to_jsonb(edge_deployments.*)",
+            )
+            .bind(id)
+            .bind(sessions_required),
+            Promotion::Live => sqlx::query_scalar(
+                "UPDATE edge_deployments SET stage = 'live', since = now() \
+                 WHERE id = $1 RETURNING to_jsonb(edge_deployments.*)",
+            )
+            .bind(id),
+        };
+        query.fetch_optional(&self.pool).await.map_err(map_ladder)
+    }
+
+    /// Retire a deployment, from any stage, with its reason. Retired is
+    /// terminal; retiring it again is refused here (the guard would allow a
+    /// same-stage edit, which would overwrite the first reason).
+    pub async fn retire_deployment(
+        &self,
+        id: i64,
+        reason: &str,
+    ) -> Result<Option<serde_json::Value>, SpawnerError> {
+        let row: Option<serde_json::Value> = sqlx::query_scalar(
+            "UPDATE edge_deployments SET stage = 'retired', retired_reason = $2, since = now() \
+             WHERE id = $1 AND stage <> 'retired' RETURNING to_jsonb(edge_deployments.*)",
+        )
+        .bind(id)
+        .bind(reason)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_ladder)?;
+        if row.is_some() {
+            return Ok(row);
+        }
+        let existing: Option<Option<String>> =
+            sqlx::query_scalar("SELECT retired_reason FROM edge_deployments WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        match existing {
+            None => Ok(None),
+            Some(reason) => Err(SpawnerError::Refused(format!(
+                "deployment {id} is already retired ({}); retired is terminal",
+                reason.unwrap_or_default()
+            ))),
+        }
+    }
+
     /// One ACTIVE edge by id — the backtest path's lookup. A soft-deleted
     /// edge reads as absent here (you can't backtest a retired-and-removed
     /// edge), while `list_edges` still shows it.
@@ -2088,6 +2279,16 @@ impl BotConfigRow {
 
 fn map_sqlx(e: sqlx::Error) -> SpawnerError {
     SpawnerError::Other(format!("postgres: {e}"))
+}
+
+/// The ladder's writes: a refusal by the database (guard trigger, CHECK,
+/// foreign key, unique index) is the operator's answer, a 409 in Postgres's
+/// own words; anything else is a fault.
+fn map_ladder(e: sqlx::Error) -> SpawnerError {
+    match crate::ladder::refusal(&e) {
+        Some(message) => SpawnerError::Refused(message),
+        None => map_sqlx(e),
+    }
 }
 
 /// Decode one `(ts, net_worth::float8)` snapshot row for `profit_inputs`.

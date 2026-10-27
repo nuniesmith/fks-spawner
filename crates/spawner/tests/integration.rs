@@ -2498,6 +2498,143 @@ async fn edge_routes_are_token_gated() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The edge ladder (ladder.rs) — without a DB: degrade, validate first, gate
+// (the real-SQL path, guards included, is in tests/db_integration.rs)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn ladder_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::post(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn good_hypothesis() -> serde_json::Value {
+    serde_json::json!({
+        "idea": "Liquidation clusters overshoot; fading the 5-minute move earns the snap-back.",
+        "symbols": ["BTCUSDT"],
+        "dataset": "lake raw/binance/usdm/btc, 2026-10-27..2027-01-27",
+        "holdout_share": 0.25,
+        "params": [{"name": "threshold_usd", "min": 1000000, "max": 20000000, "step": 1000000}],
+        "baseline": "buy-and-hold",
+        "metric": "net return after fees",
+        "costs": {"maker_bps": 40, "taker_bps": 80, "slippage_bps": 5}
+    })
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn ladder_degrades_to_an_empty_board_without_db() {
+    let (app, _) = build_app(test_config(""));
+    let resp = app
+        .oneshot(Request::get("/ladder").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert_eq!(v["db_enabled"], false);
+    for key in [
+        "edges",
+        "hypotheses",
+        "experiments",
+        "deployments",
+        "effort",
+    ] {
+        assert_eq!(v[key], serde_json::json!([]), "{key}");
+    }
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn ladder_writes_are_validated_before_the_store() {
+    // Every one of these is a 400 with one line per problem, DB or not.
+    let (app, _) = build_app(test_config(""));
+    let mut bad = good_hypothesis();
+    bad["idea"] = serde_json::json!("up only");
+    bad["params"] = serde_json::json!([]);
+    let cases = [
+        ladder_post("/edges/liq-fade/hypotheses", bad),
+        ladder_post(
+            "/hypotheses/1/withdraw",
+            serde_json::json!({ "reason": "" }),
+        ),
+        ladder_post(
+            "/deployments",
+            serde_json::json!({
+                "experiment_id": 1, "account_id": "a", "symbol": "BTC-USDT", "params_snapshot": []
+            }),
+        ),
+        ladder_post(
+            "/deployments/1/promote",
+            serde_json::json!({ "to": "forward" }),
+        ),
+        ladder_post(
+            "/deployments/1/promote",
+            serde_json::json!({ "to": "retired" }),
+        ),
+        ladder_post(
+            "/deployments/1/retire",
+            serde_json::json!({ "reason": "x" }),
+        ),
+    ];
+    for req in cases {
+        let uri = req.uri().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "route: {uri}");
+        let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert!(
+            v["errors"].as_array().is_some_and(|e| !e.is_empty()),
+            "route {uri} body: {v}"
+        );
+    }
+
+    // A hypothesis can't carry its own registration time: unknown fields are
+    // refused, so a backdated registered_at is a 4xx, not silently dropped.
+    let mut backdated = good_hypothesis();
+    backdated["registered_at"] = serde_json::json!("2020-01-01T00:00:00Z");
+    let resp = app
+        .clone()
+        .oneshot(ladder_post("/edges/liq-fade/hypotheses", backdated))
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+
+    // Valid, but no DB: an honest 503, not a fake success.
+    let resp = app
+        .oneshot(ladder_post("/edges/liq-fade/hypotheses", good_hypothesis()))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[cfg(feature = "db")]
+#[tokio::test]
+async fn ladder_routes_are_token_gated() {
+    let (app, _) = build_app(test_config("s3cr3t"));
+    for req in [
+        Request::get("/ladder").body(Body::empty()).unwrap(),
+        ladder_post("/edges/x/hypotheses", good_hypothesis()),
+        ladder_post(
+            "/hypotheses/1/withdraw",
+            serde_json::json!({ "reason": "because" }),
+        ),
+        ladder_post("/deployments", serde_json::json!({})),
+        ladder_post(
+            "/deployments/1/promote",
+            serde_json::json!({ "to": "live" }),
+        ),
+        ladder_post(
+            "/deployments/1/retire",
+            serde_json::json!({ "reason": "because" }),
+        ),
+    ] {
+        let uri = req.uri().clone();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route: {uri}");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Auth middleware
 // ─────────────────────────────────────────────────────────────────────────────
 

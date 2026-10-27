@@ -24,6 +24,7 @@ pub mod edge_decay;
 pub mod edges;
 pub mod error;
 pub mod instances;
+pub mod ladder;
 #[cfg(feature = "db")]
 pub mod leases;
 pub mod metrics;

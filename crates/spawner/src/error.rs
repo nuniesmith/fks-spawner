@@ -29,6 +29,12 @@ pub enum SpawnerError {
     #[error("container '{0}' not found")]
     NotFound(String),
 
+    /// The database refused a change: a guard trigger, CHECK, foreign key or
+    /// unique index (the edge ladder, ladder.rs). The message is Postgres's
+    /// own, passed on verbatim because it is the explanation.
+    #[error("{0}")]
+    Refused(String),
+
     #[error("Docker API error: {0}")]
     Docker(#[from] bollard::errors::Error),
 
@@ -64,6 +70,7 @@ impl SpawnerError {
             SpawnerError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             SpawnerError::TooManyBots(_) => StatusCode::TOO_MANY_REQUESTS,
             SpawnerError::AccountLeaseHeld { .. } => StatusCode::CONFLICT,
+            SpawnerError::Refused(_) => StatusCode::CONFLICT,
             SpawnerError::NotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
