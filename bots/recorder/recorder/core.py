@@ -71,6 +71,21 @@ HEARTBEAT_SECONDS = 10
 # How long a drain waits for a message before checking its connection's
 # health; also how soon it notices it should stop.
 POLL_SECONDS = 1.0
+def is_sporadic(stream_name: str) -> bool:
+    """Liquidations: a quiet market can go many minutes without one, on a
+    single symbol and even across the whole exchange."""
+    return stream_name.endswith("@forceOrder") or stream_name.startswith("!forceOrder@")
+
+
+def silence_means_stall(stream_names) -> bool:
+    """Whether a connection going quiet can be read as a stall. Only if at
+    least one of its streams ticks continuously (best bid/ask, mark price):
+    a connection carrying only liquidations would otherwise be recycled in
+    every quiet spell and file a quiet market as missing data. A dead
+    connection is still caught by the websocket ping/pong."""
+    return any(not is_sporadic(name) for name in stream_names)
+
+
 # Reconnect pacing. Every second offline is data nobody can fetch later, so a
 # connection that was healthy retries almost at once; only a venue that keeps
 # refusing earns a longer wait. (Binance allows 300 connection attempts per 5
@@ -412,7 +427,9 @@ async def drain_task(
 ) -> None:
     """Consumes one connection's queue on the event loop: writes each message
     to its stream's file, keeps that connection's status, records its gaps,
-    and recycles it when every one of its streams has gone silent."""
+    and recycles it when every one of its streams has gone silent (unless all
+    of them are sporadic, see silence_means_stall)."""
+    watch_silence = silence_means_stall(bridge.streams)
     last_msg_at = {s: time.monotonic() for s in bridge.streams}
     last_any_msg_at = time.monotonic()
     last_any_msg_ms = now_ms()
@@ -481,7 +498,7 @@ async def drain_task(
         if stop.is_set() or not group_state.connected:
             continue
         now = time.monotonic()
-        if now - last_any_msg_at > CONNECTION_SILENCE:
+        if watch_silence and now - last_any_msg_at > CONNECTION_SILENCE:
             log.warning(
                 "no data on any %s stream for >%ss; recycling the connection",
                 bridge.group,
