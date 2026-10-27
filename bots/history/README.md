@@ -16,7 +16,7 @@ instance, configured from a template's form.
 | `HISTORY_SYMBOLS` | required | comma-separated, e.g. `BTCUSDT,ETHUSDT` |
 | `HISTORY_DATASETS` | `klines` | `klines`; `usdm` also has `fundingRate` and `metrics` |
 | `HISTORY_INTERVALS` | `1h,1d` | kline intervals, `1m` to `1d` |
-| `HISTORY_START` | `2020-01` | the first month, `YYYY-MM`, 2017 or later |
+| `HISTORY_START` | `2020-01` | the first month, `YYYY-MM`, or a year `YYYY` for its January; 2017 or later, not in the future |
 | `HISTORY_POLL_HOURS` | `6` | hours between checks for new files, 0.25 to 48 |
 | `HISTORY_CONCURRENCY` | `4` | parallel downloads, at most 8 |
 | `HISTORY_BASE_URL` | `https://data.binance.vision` | the archive |

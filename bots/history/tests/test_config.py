@@ -20,6 +20,10 @@ def test_futures_offer_funding_and_metrics(make_cfg):
     assert cfg.datasets == ("klines", "fundingRate", "metrics")
 
 
+def test_a_year_alone_is_its_january(make_cfg):
+    assert make_cfg(HISTORY_START="2021").start == date(2021, 1, 1)
+
+
 def test_no_klines_means_no_intervals(make_cfg):
     assert make_cfg(HISTORY_MARKET="usdm", HISTORY_DATASETS="fundingRate").intervals == ()
 
@@ -32,8 +36,10 @@ def test_no_klines_means_no_intervals(make_cfg):
         ({"HISTORY_SYMBOLS": "BTC-USDT"}, "aren't a venue symbol"),
         ({"HISTORY_DATASETS": "fundingRate"}, "which spot doesn't publish"),
         ({"HISTORY_INTERVALS": "7m"}, "HISTORY_INTERVALS has ['7m']"),
-        ({"HISTORY_START": "2016-12"}, "2017-01 or later"),
+        ({"HISTORY_START": "2016-12"}, "2017 or later"),
         ({"HISTORY_START": "2026-13"}, "must be a month"),
+        ({"HISTORY_START": "2026-1"}, "must be a month"),
+        ({"HISTORY_START": "2099"}, "is in the future"),
         ({"HISTORY_CONCURRENCY": "20"}, "between 1 and 8"),
         ({"HISTORY_POLL_HOURS": "0"}, "between 0.25 and 48"),
     ],

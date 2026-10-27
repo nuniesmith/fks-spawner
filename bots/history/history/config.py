@@ -8,7 +8,8 @@ work by hand with `docker run -e ...`.
   HISTORY_SYMBOLS     comma-separated, e.g. BTCUSDT,ETHUSDT; required
   HISTORY_DATASETS    klines (default); usdm also offers fundingRate, metrics
   HISTORY_INTERVALS   kline intervals (default 1h,1d)
-  HISTORY_START       first month, YYYY-MM (default 2020-01)
+  HISTORY_START       first month, YYYY-MM, or a year YYYY for its January
+                      (default 2020-01)
   HISTORY_POLL_HOURS  hours between checks for new files (default 6)
   HISTORY_CONCURRENCY parallel downloads (default 4, at most 8)
   HISTORY_BASE_URL    the archive (default https://data.binance.vision)
@@ -22,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
@@ -56,7 +57,7 @@ MARKETS = {
 
 INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
-MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+START_RE = re.compile(r"^(\d{4})(?:-(\d{2}))?$")
 
 
 @dataclass(frozen=True)
@@ -87,8 +88,9 @@ def _list(raw: str | None) -> list[str]:
     return out
 
 
-def load(env: Mapping[str, str] | None = None) -> Config:
+def load(env: Mapping[str, str] | None = None, today: date | None = None) -> Config:
     env = os.environ if env is None else env
+    today = today or datetime.now(timezone.utc).date()
 
     market = env.get("HISTORY_MARKET", "").strip()
     if market not in MARKETS:
@@ -114,10 +116,14 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     if "klines" not in datasets:
         intervals = []
 
-    m = MONTH_RE.match(env.get("HISTORY_START", "2020-01").strip())
-    if not m or not 1 <= int(m.group(2)) <= 12 or int(m.group(1)) < 2017:
-        raise ConfigError("HISTORY_START must be a month YYYY-MM, 2017-01 or later")
-    start = date(int(m.group(1)), int(m.group(2)), 1)
+    # A year alone is its January: the template's form asks for a year.
+    m = START_RE.match(env.get("HISTORY_START", "2020-01").strip())
+    month = int(m.group(2) or 1) if m else 0
+    if not m or not 1 <= month <= 12 or int(m.group(1)) < 2017:
+        raise ConfigError("HISTORY_START must be a month YYYY-MM or a year YYYY, 2017 or later")
+    start = date(int(m.group(1)), month, 1)
+    if start > today:
+        raise ConfigError(f"HISTORY_START {start:%Y-%m} is in the future")
 
     try:
         poll_hours = float(env.get("HISTORY_POLL_HOURS", "6"))
