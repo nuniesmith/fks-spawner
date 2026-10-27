@@ -45,6 +45,9 @@ def test_duplicates_and_blanks_are_dropped(make_cfg):
         ({"RECORDER_REST_SECONDS": "30"}, "at least 60"),
         ({"RECORDER_REST_SECONDS": "5m"}, "whole number"),
         ({"RECORDER_PORT": "x"}, "port number"),
+        ({"RECORDER_MARKET_STREAMS": "depth@arr"}, "doesn't offer: ['depth@arr']"),
+        ({"RECORDER_SYMBOLS": "ALL"}, "aren't a venue symbol"),
+        ({"RECORDER_SYMBOLS": "", "RECORDER_MARKET_STREAMS": ""}, "RECORDER_SYMBOLS is required"),
     ],
 )
 def test_bad_settings_say_what_is_wrong(make_cfg, env, message):
@@ -61,3 +64,24 @@ def test_an_empty_stream_list_means_rest_only(make_cfg):
 def test_stream_dir_drops_the_rate_suffix():
     assert config.stream_dir("markPrice@1s") == "markPrice"
     assert config.stream_dir("forceOrder") == "forceOrder"
+
+
+def test_market_wide_streams_need_no_symbols(make_cfg):
+    cfg = make_cfg(RECORDER_SYMBOLS="", RECORDER_MARKET_STREAMS="forceOrder@arr")
+    assert cfg.symbols == ()
+    # the per-symbol defaults stay empty without symbols to apply them to
+    assert (cfg.streams, cfg.rest) == ((), ())
+    assert cfg.market_streams == ("forceOrder@arr",)
+    # verified live 2026-10-27: /market delivers it, /public delivers nothing
+    assert cfg.subscriptions() == {"market": ["!forceOrder@arr"]}
+
+
+def test_market_wide_streams_join_their_group_beside_the_symbols(make_cfg):
+    cfg = make_cfg(RECORDER_MARKET_STREAMS="forceOrder@arr, markPrice@arr", RECORDER_STREAMS="forceOrder")
+    assert cfg.subscriptions() == {"market": ["btcusdt@forceOrder", "!forceOrder@arr", "!markPrice@arr"]}
+
+
+def test_stream_identity_files_market_wide_streams_under_ALL():
+    assert config.stream_identity("btcusdt@markPrice@1s") == ("BTCUSDT", "markPrice@1s")
+    assert config.stream_identity("!forceOrder@arr") == ("ALL", "forceOrder@arr")
+    assert config.stream_dir("forceOrder@arr") == "forceOrder"

@@ -20,6 +20,8 @@ Files, under DATA_DIR:
                                        message: the raw frame plus our receive
                                        time; gzipped once the UTC day closes
   <SYMBOL>/snapshots/YYYY-MM-DD.jsonl  REST snapshots, same envelope
+  ALL/<stream>/YYYY-MM-DD.jsonl        market-wide streams (every symbol in
+                                       one feed, e.g. all liquidations)
   _gaps/YYYY-MM-DD.jsonl               {"group", "start_ms", "end_ms",
                                        "reason"} for every stretch a
                                        connection recorded nothing: missing
@@ -50,7 +52,7 @@ import aiohttp
 import websocket
 import websocket._handshake as _ws_handshake
 
-from .config import Config, stream_dir
+from .config import Config, stream_dir, stream_identity
 
 log = logging.getLogger("recorder")
 
@@ -69,6 +71,21 @@ HEARTBEAT_SECONDS = 10
 # How long a drain waits for a message before checking its connection's
 # health; also how soon it notices it should stop.
 POLL_SECONDS = 1.0
+def is_sporadic(stream_name: str) -> bool:
+    """Liquidations: a quiet market can go many minutes without one, on a
+    single symbol and even across the whole exchange."""
+    return stream_name.endswith("@forceOrder") or stream_name.startswith("!forceOrder@")
+
+
+def silence_means_stall(stream_names) -> bool:
+    """Whether a connection going quiet can be read as a stall. Only if at
+    least one of its streams ticks continuously (best bid/ask, mark price):
+    a connection carrying only liquidations would otherwise be recycled in
+    every quiet spell and file a quiet market as missing data. A dead
+    connection is still caught by the websocket ping/pong."""
+    return any(not is_sporadic(name) for name in stream_names)
+
+
 # Reconnect pacing. Every second offline is data nobody can fetch later, so a
 # connection that was healthy retries almost at once; only a venue that keeps
 # refusing earns a longer wait. (Binance allows 300 connection attempts per 5
@@ -194,9 +211,9 @@ class Status:
         self.streams: dict[str, dict] = {}
         for group, names in subs.items():
             for name in names:
-                symbol, stream = name.split("@", 1)
+                symbol, stream = stream_identity(name)
                 self.streams[name] = {
-                    "symbol": symbol.upper(),
+                    "symbol": symbol,
                     "stream": stream,
                     "group": group,
                     "count": 0,
@@ -410,7 +427,9 @@ async def drain_task(
 ) -> None:
     """Consumes one connection's queue on the event loop: writes each message
     to its stream's file, keeps that connection's status, records its gaps,
-    and recycles it when every one of its streams has gone silent."""
+    and recycles it when every one of its streams has gone silent (unless all
+    of them are sporadic, see silence_means_stall)."""
+    watch_silence = silence_means_stall(bridge.streams)
     last_msg_at = {s: time.monotonic() for s in bridge.streams}
     last_any_msg_at = time.monotonic()
     last_any_msg_ms = now_ms()
@@ -479,7 +498,7 @@ async def drain_task(
         if stop.is_set() or not group_state.connected:
             continue
         now = time.monotonic()
-        if now - last_any_msg_at > CONNECTION_SILENCE:
+        if watch_silence and now - last_any_msg_at > CONNECTION_SILENCE:
             log.warning(
                 "no data on any %s stream for >%ss; recycling the connection",
                 bridge.group,
@@ -680,9 +699,10 @@ async def run(cfg: Config, serve=None) -> None:
         except (NotImplementedError, RuntimeError):
             pass
     log.info(
-        "recorder %s starting: %s %s, streams %s, REST %s every %ss, data %s, proxy %s",
-        cfg.bot_id, cfg.venue.name, ",".join(cfg.symbols), ",".join(cfg.streams) or "-",
-        ",".join(cfg.rest) or "-", cfg.rest_seconds, cfg.data_dir, "set" if cfg.proxy else "none",
+        "recorder %s starting: %s %s, streams %s, market-wide %s, REST %s every %ss, data %s, proxy %s",
+        cfg.bot_id, cfg.venue.name, ",".join(cfg.symbols) or "-", ",".join(cfg.streams) or "-",
+        ",".join(cfg.market_streams) or "-", ",".join(cfg.rest) or "-", cfg.rest_seconds,
+        cfg.data_dir, "set" if cfg.proxy else "none",
     )
     bridges = []
     for group, names in cfg.subscriptions().items():
@@ -698,9 +718,11 @@ async def run(cfg: Config, serve=None) -> None:
             )
             for b in bridges
         ]
-        if cfg.rest:
+        # REST snapshots and the OI backfill are per symbol: nothing to do for
+        # a market-wide-only recorder.
+        if cfg.rest and cfg.symbols:
             tasks.append(asyncio.create_task(rest_task(cfg, session, rec.snapshot_writers, rec.status, stop), name="rest"))
-        if cfg.backfill_oi:
+        if cfg.backfill_oi and cfg.symbols:
             tasks.append(asyncio.create_task(backfill_task(cfg, session, rec.snapshot_writers, rec.status, stop), name="oi-backfill"))
         tasks.append(asyncio.create_task(flush_loop(rec.all_writers(), stop), name="flush"))
         tasks.append(asyncio.create_task(rec.status.flusher(stop), name="status"))

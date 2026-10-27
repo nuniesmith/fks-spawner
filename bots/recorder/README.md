@@ -15,10 +15,11 @@ two Binance traps below.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RECORDER_SYMBOLS` | required | comma-separated, e.g. `BTCUSDT,ETHUSDT` |
+| `RECORDER_SYMBOLS` | required unless market-wide streams are set | comma-separated, e.g. `BTCUSDT,ETHUSDT` |
 | `RECORDER_VENUE` | `binance-usdm` | the only venue so far |
-| `RECORDER_STREAMS` | all three | `forceOrder` (liquidations), `bookTicker` (best bid/ask), `markPrice@1s` (mark, index, funding) |
-| `RECORDER_REST` | both | `openInterest`, `premiumIndex` |
+| `RECORDER_STREAMS` | all three (none without symbols) | `forceOrder` (liquidations), `bookTicker` (best bid/ask), `markPrice@1s` (mark, index, funding) |
+| `RECORDER_MARKET_STREAMS` | none | one feed for every symbol: `forceOrder@arr` (every liquidation on the exchange, ~0.7 msg/s, a few MB a day) or `markPrice@arr` (every symbol's mark price and funding, ~229 symbols a message) |
+| `RECORDER_REST` | both (none without symbols) | `openInterest`, `premiumIndex` |
 | `RECORDER_REST_SECONDS` | `300` | between REST snapshots, at least 60 |
 | `RECORDER_BACKFILL_OI` | `0` | `1` also backfills open interest from Binance Vision daily metrics, as the btc recorder did while its REST access was geo-blocked |
 | `DATA_DIR` | `/data` | where the files go |
@@ -35,6 +36,7 @@ which one, before it opens a connection.
 |---|---|
 | `<SYMBOL>/<stream>/YYYY-MM-DD.jsonl` | `{"recv_ts_ms", "stream", "data"}` per message: the raw frame plus our receive time. Gzipped once the UTC day closes, never edited after. `markPrice@1s` goes in `markPrice/`. |
 | `<SYMBOL>/snapshots/YYYY-MM-DD.jsonl` | REST snapshots, same envelope, `"stream": "rest:snapshots"` |
+| `ALL/<stream>/YYYY-MM-DD.jsonl` | market-wide streams, same envelope (`"stream": "!forceOrder@arr"`) |
 | `_gaps/YYYY-MM-DD.jsonl` | `{"group", "start_ms", "end_ms", "reason"}`, one line per stretch a connection recorded nothing |
 | `_state/status.json` | the heartbeat `/status` serves |
 

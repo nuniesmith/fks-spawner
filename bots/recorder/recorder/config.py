@@ -4,8 +4,14 @@ The spawner sets these from a recorder template's form (EDGE_FACTORY_PLAN
 §5.2); the same names work by hand with `docker run -e ...`.
 
   RECORDER_VENUE         venue id; only `binance-usdm` so far
-  RECORDER_SYMBOLS       required, comma-separated, e.g. BTCUSDT,ETHUSDT
-  RECORDER_STREAMS       websocket streams (default: all the venue offers)
+  RECORDER_SYMBOLS       comma-separated, e.g. BTCUSDT,ETHUSDT; required
+                         unless RECORDER_MARKET_STREAMS is set
+  RECORDER_STREAMS       per-symbol websocket streams (default: all the
+                         venue offers)
+  RECORDER_MARKET_STREAMS  market-wide streams, one feed for every symbol,
+                         e.g. forceOrder@arr (every liquidation on the
+                         exchange); filed under the symbol folder ALL
+                         (default: none)
   RECORDER_REST          REST snapshot kinds (default: all the venue offers)
   RECORDER_REST_SECONDS  seconds between REST snapshots (default 300, min 60)
   RECORDER_BACKFILL_OI   1 = also backfill open interest from Binance Vision
@@ -21,7 +27,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 
@@ -42,6 +48,9 @@ class Venue:
     rest: dict[str, tuple[str, str]]
     # daily metrics zip, formatted with {symbol} and {day}
     vision_metrics: str | None = None
+    # market-wide stream, as named in RECORDER_MARKET_STREAMS -> (connection
+    # group, the venue's spelling)
+    market_streams: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 # Binance split its futures websocket streams across /public, /market and
@@ -68,11 +77,22 @@ BINANCE_USDM = Venue(
         "https://data.binance.vision/data/futures/um/daily/metrics/"
         "{symbol}/{symbol}-metrics-{day}.zip"
     ),
+    # Verified on oryx 2026-10-27: both deliver on /market and NOTHING on
+    # /public (the same trap as the per-symbol streams). forceOrder@arr is
+    # every liquidation on the exchange (~0.7 msg/s); markPrice@arr carries
+    # every symbol's mark price and funding (~229 symbols a message).
+    market_streams={
+        "forceOrder@arr": ("market", "!forceOrder@arr"),
+        "markPrice@arr": ("market", "!markPrice@arr"),
+    },
 )
 
 VENUES = {v.name: v for v in (BINANCE_USDM,)}
 
 SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
+
+# The symbol folder market-wide streams are filed under.
+MARKET_SYMBOL = "ALL"
 
 
 @dataclass(frozen=True)
@@ -80,6 +100,7 @@ class Config:
     venue: Venue
     symbols: tuple[str, ...]
     streams: tuple[str, ...]
+    market_streams: tuple[str, ...]
     rest: tuple[str, ...]
     rest_seconds: int
     backfill_oi: bool
@@ -90,17 +111,31 @@ class Config:
 
     def subscriptions(self) -> dict[str, list[str]]:
         """Connection group -> the stream names to subscribe on it, as the
-        venue spells them (e.g. `btcusdt@forceOrder`)."""
+        venue spells them (e.g. `btcusdt@forceOrder`, `!forceOrder@arr`)."""
         groups: dict[str, list[str]] = {}
         for stream in self.streams:
             group = self.venue.streams[stream]
             for symbol in self.symbols:
                 groups.setdefault(group, []).append(f"{symbol.lower()}@{stream}")
+        for name in self.market_streams:
+            group, spelling = self.venue.market_streams[name]
+            groups.setdefault(group, []).append(spelling)
         return groups
 
 
+def stream_identity(name: str) -> tuple[str, str]:
+    """(symbol folder, stream) for a subscribed stream name:
+    `btcusdt@forceOrder` -> (BTCUSDT, forceOrder);
+    `!forceOrder@arr` -> (ALL, forceOrder@arr)."""
+    if name.startswith("!"):
+        return MARKET_SYMBOL, name[1:]
+    symbol, stream = name.split("@", 1)
+    return symbol.upper(), stream
+
+
 def stream_dir(stream: str) -> str:
-    """The folder a stream's files go in: `markPrice@1s` -> `markPrice`."""
+    """The folder a stream's files go in: `markPrice@1s` -> `markPrice`,
+    `forceOrder@arr` -> `forceOrder` (under ALL/)."""
     return stream.split("@", 1)[0]
 
 
@@ -123,18 +158,29 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     if venue is None:
         raise ConfigError(f"RECORDER_VENUE {venue_name!r} is not one of {sorted(VENUES)}")
 
+    market_streams = _list(env.get("RECORDER_MARKET_STREAMS"))
+    unknown = [s for s in market_streams if s not in venue.market_streams]
+    if unknown:
+        raise ConfigError(
+            f"RECORDER_MARKET_STREAMS has streams {venue.name} doesn't offer: {unknown} "
+            f"(offered: {list(venue.market_streams)})"
+        )
+
     symbols = [s.upper() for s in _list(env.get("RECORDER_SYMBOLS"))]
-    if not symbols:
-        raise ConfigError("RECORDER_SYMBOLS is required, e.g. BTCUSDT")
-    bad = [s for s in symbols if not SYMBOL_RE.match(s)]
+    if not symbols and not market_streams:
+        raise ConfigError(
+            "RECORDER_SYMBOLS is required (e.g. BTCUSDT) unless RECORDER_MARKET_STREAMS is set"
+        )
+    bad = [s for s in symbols if not SYMBOL_RE.match(s) or s == MARKET_SYMBOL]
     if bad:
         raise ConfigError(f"RECORDER_SYMBOLS has symbols that aren't a venue symbol: {bad}")
     symbols = list(dict.fromkeys(symbols))
 
+    # Per-symbol defaults only apply when there are symbols to apply them to.
     if "RECORDER_STREAMS" in env:
         streams = _list(env["RECORDER_STREAMS"])
     else:
-        streams = list(venue.streams)
+        streams = list(venue.streams) if symbols else []
     unknown = [s for s in streams if s not in venue.streams]
     if unknown:
         raise ConfigError(
@@ -145,7 +191,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     if "RECORDER_REST" in env:
         rest = _list(env["RECORDER_REST"])
     else:
-        rest = list(venue.rest)
+        rest = list(venue.rest) if symbols else []
     unknown = [r for r in rest if r not in venue.rest]
     if unknown:
         raise ConfigError(
@@ -153,8 +199,10 @@ def load(env: Mapping[str, str] | None = None) -> Config:
             f"(offered: {list(venue.rest)})"
         )
 
-    if not streams and not rest:
-        raise ConfigError("nothing to record: RECORDER_STREAMS and RECORDER_REST are both empty")
+    if not market_streams and not (symbols and (streams or rest)):
+        raise ConfigError(
+            "nothing to record: no market-wide streams, and no per-symbol streams or REST snapshots"
+        )
 
     try:
         rest_seconds = int(env.get("RECORDER_REST_SECONDS", "300"))
@@ -178,6 +226,7 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         venue=venue,
         symbols=tuple(symbols),
         streams=tuple(streams),
+        market_streams=tuple(market_streams),
         rest=tuple(rest),
         rest_seconds=rest_seconds,
         backfill_oi=backfill,

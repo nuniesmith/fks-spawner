@@ -67,6 +67,22 @@ def test_messages_land_in_their_stream_files_in_the_envelope(make_cfg):
     assert rec.status.groups["market"]["connected"] is True
 
 
+def test_a_market_wide_stream_is_filed_under_ALL(make_cfg):
+    rec = core.Recorder(make_cfg(RECORDER_SYMBOLS="", RECORDER_MARKET_STREAMS="forceOrder@arr", RECORDER_REST=""))
+    t = wall_ms()
+    liquidation = {"e": "forceOrder", "o": {"s": "ETHUSDT", "S": "SELL", "q": "1.5"}}
+    drive(rec, "market", [("event", "connected", t), msg("!forceOrder@arr", liquidation, t + 1)])
+    day = core.utc_day(t)
+    lines = (rec.cfg.data_dir / "ALL" / "forceOrder" / f"{day}.jsonl").read_text().splitlines()
+    assert [json.loads(x) for x in lines] == [
+        {"recv_ts_ms": t + 1, "stream": "!forceOrder@arr", "data": liquidation}
+    ]
+    s = rec.status.streams["!forceOrder@arr"]
+    assert (s["symbol"], s["stream"], s["count"]) == ("ALL", "forceOrder@arr", 1)
+    # no symbols: no REST snapshots to write
+    assert rec.snapshot_writers == {}
+
+
 def test_unknown_and_undecodable_messages_are_dropped(make_cfg):
     rec = core.Recorder(make_cfg())
     drive(rec, "market", [
@@ -126,6 +142,28 @@ def test_a_stalled_connection_is_recycled_and_its_gap_starts_at_the_last_message
     assert closes, "the stalled connection should have been recycled"
     stall = [g for g in gaps(rec) if g["reason"] == "stall"]
     assert stall == [{"group": "market", "start_ms": t + 100, "end_ms": t + 1200, "reason": "stall"}]
+
+
+def test_a_liquidations_only_connection_is_never_recycled_for_silence(make_cfg, monkeypatch):
+    # A quiet market has no liquidations: that silence is data, not a stall.
+    monkeypatch.setattr(core, "CONNECTION_SILENCE", 0.2)
+    monkeypatch.setattr(core, "POLL_SECONDS", 0.05)
+    rec = core.Recorder(make_cfg(RECORDER_SYMBOLS="", RECORDER_MARKET_STREAMS="forceOrder@arr"))
+    t = wall_ms()
+    closes = drive(rec, "market", [
+        ("event", "connected", t),
+        msg("!forceOrder@arr", {"o": {"s": "ETHUSDT"}}, t + 100),
+        0.6,  # three times CONNECTION_SILENCE without a liquidation anywhere
+    ], settle=0.1)
+    assert closes == []
+    assert [g for g in gaps(rec) if g["reason"] == "stall"] == []
+
+
+def test_silence_means_stall_only_with_a_continuous_stream():
+    assert core.silence_means_stall(["!forceOrder@arr"]) is False
+    assert core.silence_means_stall(["btcusdt@forceOrder"]) is False
+    assert core.silence_means_stall(["btcusdt@forceOrder", "btcusdt@markPrice@1s"]) is True
+    assert core.silence_means_stall(["btcusdt@bookTicker"]) is True
 
 
 def test_one_quiet_stream_is_neither_a_gap_nor_a_recycle(make_cfg, monkeypatch):
