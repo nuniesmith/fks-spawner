@@ -20,6 +20,8 @@ Files, under DATA_DIR:
                                        message: the raw frame plus our receive
                                        time; gzipped once the UTC day closes
   <SYMBOL>/snapshots/YYYY-MM-DD.jsonl  REST snapshots, same envelope
+  ALL/<stream>/YYYY-MM-DD.jsonl        market-wide streams (every symbol in
+                                       one feed, e.g. all liquidations)
   _gaps/YYYY-MM-DD.jsonl               {"group", "start_ms", "end_ms",
                                        "reason"} for every stretch a
                                        connection recorded nothing: missing
@@ -50,7 +52,7 @@ import aiohttp
 import websocket
 import websocket._handshake as _ws_handshake
 
-from .config import Config, stream_dir
+from .config import Config, stream_dir, stream_identity
 
 log = logging.getLogger("recorder")
 
@@ -194,9 +196,9 @@ class Status:
         self.streams: dict[str, dict] = {}
         for group, names in subs.items():
             for name in names:
-                symbol, stream = name.split("@", 1)
+                symbol, stream = stream_identity(name)
                 self.streams[name] = {
-                    "symbol": symbol.upper(),
+                    "symbol": symbol,
                     "stream": stream,
                     "group": group,
                     "count": 0,
@@ -680,9 +682,10 @@ async def run(cfg: Config, serve=None) -> None:
         except (NotImplementedError, RuntimeError):
             pass
     log.info(
-        "recorder %s starting: %s %s, streams %s, REST %s every %ss, data %s, proxy %s",
-        cfg.bot_id, cfg.venue.name, ",".join(cfg.symbols), ",".join(cfg.streams) or "-",
-        ",".join(cfg.rest) or "-", cfg.rest_seconds, cfg.data_dir, "set" if cfg.proxy else "none",
+        "recorder %s starting: %s %s, streams %s, market-wide %s, REST %s every %ss, data %s, proxy %s",
+        cfg.bot_id, cfg.venue.name, ",".join(cfg.symbols) or "-", ",".join(cfg.streams) or "-",
+        ",".join(cfg.market_streams) or "-", ",".join(cfg.rest) or "-", cfg.rest_seconds,
+        cfg.data_dir, "set" if cfg.proxy else "none",
     )
     bridges = []
     for group, names in cfg.subscriptions().items():
@@ -698,9 +701,11 @@ async def run(cfg: Config, serve=None) -> None:
             )
             for b in bridges
         ]
-        if cfg.rest:
+        # REST snapshots and the OI backfill are per symbol: nothing to do for
+        # a market-wide-only recorder.
+        if cfg.rest and cfg.symbols:
             tasks.append(asyncio.create_task(rest_task(cfg, session, rec.snapshot_writers, rec.status, stop), name="rest"))
-        if cfg.backfill_oi:
+        if cfg.backfill_oi and cfg.symbols:
             tasks.append(asyncio.create_task(backfill_task(cfg, session, rec.snapshot_writers, rec.status, stop), name="oi-backfill"))
         tasks.append(asyncio.create_task(flush_loop(rec.all_writers(), stop), name="flush"))
         tasks.append(asyncio.create_task(rec.status.flusher(stop), name="status"))
