@@ -42,6 +42,24 @@ pub enum TemplateKind {
     Job,
 }
 
+/// A job's access to the lake: `read` mounts `LAKE_ROOT/raw` read-only at
+/// `/lake` (`LAKE_DIR`), so a search reads any recorded or downloaded
+/// dataset and can change none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LakeAccess {
+    Read,
+}
+
+/// A job's database access: `research` hands it the scoped research URL
+/// (`BACKTEST_DB_URL`, the `fks_backtest` role) as `FKS_DB_URL`, injected at
+/// spawn and never saved with the instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseAccess {
+    Research,
+}
+
 /// Where a recorder's files go: `LAKE_ROOT/raw/<venue>/<market>/<instance>`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +96,12 @@ pub struct Template {
     pub restart_policy: Option<RestartPolicy>,
     #[serde(default)]
     pub data: Option<DataSpec>,
+    /// Jobs only: read the whole lake.
+    #[serde(default)]
+    pub lake: Option<LakeAccess>,
+    /// Jobs only: the scoped research database.
+    #[serde(default)]
+    pub database: Option<DatabaseAccess>,
     /// The form: a JSON Schema subset (module docs).
     pub params: Value,
     /// Form field -> the env var it sets.
@@ -217,6 +241,33 @@ pub fn validate_template(t: &Template, allowed_image_prefix: &str) -> Result<(),
         return Err(format!(
             "mode {m:?} must be lower-case letters, digits and '-'"
         ));
+    }
+    if t.kind != TemplateKind::Job && (t.lake.is_some() || t.database.is_some()) {
+        return Err("only a job reads the lake or gets the research database".into());
+    }
+    if t.kind == TemplateKind::Job {
+        // A job runs once. A restart, or a second mode that isn't one-shot,
+        // would run it again: for a search that means its trials counted
+        // twice in N (EDGE_PROCESS §3-4).
+        let one_shot = crate::supervisor::ONE_SHOT_MODE;
+        if let Some(m) = t.modes.iter().find(|m| m.as_str() != one_shot) {
+            return Err(format!(
+                "a job runs once, so its only mode is {one_shot}, not {m}"
+            ));
+        }
+        if t.restart_policy.as_ref().is_some_and(|p| p.enabled) {
+            return Err("a job runs once; a restart policy would run it again".into());
+        }
+        if !t.secrets_allowed.is_empty() {
+            return Err("a job gets no exchange keys".into());
+        }
+        if t.data.is_some() {
+            return Err(
+                "a job has no recorder folder (data); it writes to jobs/<instance> and reads the \
+                 lake with \"lake\": \"read\""
+                    .into(),
+            );
+        }
     }
     if t.kind == TemplateKind::Recorder {
         if let Some(m) = t.modes.iter().find(|m| MONEY_MODES.contains(&m.as_str())) {
@@ -635,6 +686,81 @@ mod tests {
             validate_template(&t, PREFIX)
                 .unwrap_err()
                 .contains("data.venue")
+        );
+    }
+
+    fn job() -> Template {
+        serde_json::from_value(json!({
+            "id": "job.edge-search",
+            "version": 1,
+            "kind": "job",
+            "display_name": "Edge search",
+            "image": "ghcr.io/nuniesmith/fks-bot-edge-search:latest",
+            "modes": ["backtest"],
+            "lake": "read",
+            "database": "research",
+            "env": {"hypothesis_id": "EDGE_HYPOTHESIS_ID"},
+            "params": {
+                "type": "object",
+                "required": ["hypothesis_id"],
+                "properties": {"hypothesis_id": {"type": "integer", "minimum": 1}}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_job_runs_once_with_no_keys_and_no_recorder_folder() {
+        validate_template(&job(), PREFIX).expect("the job template is valid");
+        let refused = |t: &Template, needle: &str| {
+            let err = validate_template(t, PREFIX).unwrap_err();
+            assert!(err.contains(needle), "{err:?} should mention {needle:?}");
+        };
+        let mut t = job();
+        t.modes = vec!["backtest".into(), "paper".into()];
+        refused(&t, "its only mode is backtest");
+        let mut t = job();
+        t.restart_policy = Some(serde_json::from_value(json!({"enabled": true})).unwrap());
+        refused(&t, "run it again");
+        let mut t = job();
+        t.secrets_allowed = vec!["kraken".into()];
+        refused(&t, "no exchange keys");
+        let mut t = job();
+        t.data = Some(DataSpec {
+            venue: "binance".into(),
+            market: "usdm".into(),
+        });
+        refused(&t, "no recorder folder");
+        // An inert restart policy is fine.
+        let mut t = job();
+        t.restart_policy = Some(serde_json::from_value(json!({"enabled": false})).unwrap());
+        validate_template(&t, PREFIX).expect("an off policy is no restart");
+    }
+
+    #[test]
+    fn only_a_job_reads_the_lake_or_gets_the_research_database() {
+        let mut t = recorder();
+        t.lake = Some(LakeAccess::Read);
+        assert!(
+            validate_template(&t, PREFIX)
+                .unwrap_err()
+                .contains("only a job")
+        );
+        let mut t = recorder();
+        t.database = Some(DatabaseAccess::Research);
+        assert!(
+            validate_template(&t, PREFIX)
+                .unwrap_err()
+                .contains("only a job")
+        );
+        let unknown = serde_json::from_value::<Template>(json!({
+            "id": "job.x", "version": 1, "kind": "job", "display_name": "x",
+            "image": "ghcr.io/nuniesmith/fks-bot-x:latest", "modes": ["backtest"],
+            "lake": "write", "params": {"type": "object", "properties": {}}
+        }));
+        assert!(
+            unknown.is_err(),
+            "a lake access other than read doesn't parse"
         );
     }
 

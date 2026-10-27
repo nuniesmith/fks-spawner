@@ -1694,6 +1694,11 @@ async fn create_instance_handler(
         Err(SpawnerError::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
+    // Before anything is saved: a research job without the scoped URL has
+    // nowhere to write its result.
+    let spawn = plan
+        .spawn_request_with(&state.config.backtest_database_url)
+        .map_err(SpawnerError::InvalidRequest)?;
     ensure_template_image(&state, &plan.image).await?;
     if let Some(dir) = &plan.data_dir
         && let Err(why) =
@@ -1705,7 +1710,7 @@ async fn create_instance_handler(
         ));
     }
     store.upsert_config(&plan.config_request()).await?;
-    match spawn_bot(&state, plan.spawn_request()).await {
+    match spawn_bot(&state, spawn).await {
         Ok(resp) => {
             info!(
                 instance = %plan.name,
@@ -2204,7 +2209,9 @@ pub async fn respawn_from_config(
         if let Some(dir) = &plan.data_dir {
             instances::prepare_data_dir(dir, None).map_err(SpawnerError::InvalidRequest)?;
         }
-        let mut req = plan.spawn_request();
+        let mut req = plan
+            .spawn_request_with(&state.config.backtest_database_url)
+            .map_err(SpawnerError::InvalidRequest)?;
         req.bot_id = Some(bot_id);
         // An instance's account comes from its saved config (templates do
         // not declare one yet), never from the plan.
@@ -2213,6 +2220,7 @@ pub async fn respawn_from_config(
     } else {
         SpawnRequest {
             data_dir: None,
+            lake_read: None,
             image: cfg.image.clone(),
             bot_id: Some(bot_id),
             account: cfg.account.clone(),

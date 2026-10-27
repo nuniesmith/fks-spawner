@@ -68,6 +68,11 @@ pub struct SpawnRequest {
     /// path; only the instance path sets it, from the template and name.
     #[serde(skip)]
     pub data_dir: Option<std::path::PathBuf>,
+
+    /// The lake, mounted READ-ONLY at `/lake`: a job instance's input
+    /// (`crate::templates::LakeAccess`). Never deserialized either.
+    #[serde(skip)]
+    pub lake_read: Option<std::path::PathBuf>,
 }
 
 fn default_mode() -> String {
