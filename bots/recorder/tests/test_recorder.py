@@ -148,3 +148,25 @@ def test_previous_heartbeat_ignores_a_missing_or_broken_file(tmp_path):
     bad = tmp_path / "status.json"
     bad.write_text("{not json")
     assert core.previous_heartbeat_ms(bad) is None
+
+
+def test_a_healthy_connection_that_drops_reconnects_at_once():
+    # 10-27 01:23 UTC: hours of healthy bookTicker, then a venue-side drop.
+    # The backoff had grown from earlier drops; a healthy connection resets it.
+    delay, nxt = core.reconnect_backoff(32.0, connected_for=2 * 3600)
+    assert delay == core.RECONNECT_FIRST
+    assert nxt == 2 * core.RECONNECT_FIRST
+
+
+def test_repeated_failures_back_off_to_the_cap():
+    backoff, delays = core.RECONNECT_FIRST, []
+    for _ in range(8):  # the venue keeps refusing: never opens
+        delay, backoff = core.reconnect_backoff(backoff, connected_for=None)
+        delays.append(delay)
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+def test_a_short_lived_connection_continues_the_backoff():
+    # Opened, then dropped within seconds: still flapping, keep backing off.
+    delay, nxt = core.reconnect_backoff(8.0, connected_for=5.0)
+    assert (delay, nxt) == (8.0, 16.0)

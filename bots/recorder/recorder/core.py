@@ -69,6 +69,15 @@ HEARTBEAT_SECONDS = 10
 # How long a drain waits for a message before checking its connection's
 # health; also how soon it notices it should stop.
 POLL_SECONDS = 1.0
+# Reconnect pacing. Every second offline is data nobody can fetch later, so a
+# connection that was healthy retries almost at once; only a venue that keeps
+# refusing earns a longer wait. (Binance allows 300 connection attempts per 5
+# minutes per IP, far above anything this produces.)
+RECONNECT_FIRST = 1.0
+RECONNECT_MAX = 30.0
+# A connection that stayed up this long was healthy: its drop starts the
+# backoff over instead of continuing it.
+HEALTHY_SECONDS = 60.0
 
 
 def now_ms() -> int:
@@ -322,13 +331,33 @@ def _proxy_kwargs(proxy: str | None) -> dict:
     return kwargs
 
 
+def reconnect_backoff(backoff: float, connected_for: float | None) -> tuple[float, float]:
+    """(seconds to wait before reconnecting, the backoff after that attempt).
+
+    `connected_for` is how long the connection that just ended was open, None
+    if it never opened. A healthy one (HEALTHY_SECONDS or longer) resets the
+    backoff, so an occasional venue-side drop costs about a second; repeated
+    failures double the wait up to RECONNECT_MAX.
+
+    Until 2026-10-27 the backoff never reset: after a few drops in a day,
+    every later drop waited up to a minute (54 s of bookTicker lost to two
+    drops at 01:23 UTC on 10-27, while both recorders had been healthy for
+    hours).
+    """
+    if connected_for is not None and connected_for >= HEALTHY_SECONDS:
+        backoff = RECONNECT_FIRST
+    return min(backoff, RECONNECT_MAX), min(backoff * 2, RECONNECT_MAX)
+
+
 def ws_thread(bridge: StreamBridge, proxy: str | None) -> None:
     url = f"{bridge.base_url}?streams={'/'.join(bridge.streams)}"
     proxy_kwargs = _proxy_kwargs(proxy)
-    backoff = 1.0
+    backoff = RECONNECT_FIRST
     while not bridge.stop_flag.is_set():
+        opened_at: list[float] = []
 
         def on_open(_app):
+            opened_at.append(time.monotonic())
             bridge.push(("event", "connected", now_ms()))
 
         def on_message(_app, message):
@@ -354,10 +383,11 @@ def ws_thread(bridge: StreamBridge, proxy: str | None) -> None:
         bridge.app = None
         if bridge.stop_flag.is_set():
             break
-        delay = min(backoff, 60.0) * random.uniform(0.8, 1.2)
+        connected_for = time.monotonic() - opened_at[0] if opened_at else None
+        base, backoff = reconnect_backoff(backoff, connected_for)
+        delay = base * random.uniform(0.8, 1.2)
         log.info("%s reconnecting in %.1fs", bridge.group, delay)
         bridge.stop_flag.wait(timeout=delay)
-        backoff = min(backoff * 2, 60.0)
 
 
 class GroupState:
