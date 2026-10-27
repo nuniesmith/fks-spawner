@@ -77,8 +77,11 @@ fsynced, and renamed into place only after its sha256 matches the published
 - `/health`: 200 while the heartbeat (written every 10 s) is under 60 s old,
   else 503.
 - `/status`: the heartbeat as JSON (`"kind": "history"`), with each series'
-  counts: `expected`, `present`, `pending`, `not_published`, `errors`, `bytes`,
-  and the `first` and `last` dates on disk.
+  counts from the last finished check (`expected`, `present`, `pending`,
+  `not_published`, `errors`, `bytes`, and the `first` and `last` dates on
+  disk), and the running check's progress in `cycle` (`planned`, `checked`).
+  A check counts into a new table and swaps it in when done, so the counts
+  never dip to zero mid-check.
 - `/metrics`: Prometheus text:
   - `fks_history_files{dataset,symbol,interval,state}`, the counts above by
     state (`interval="-"` for funding and metrics);

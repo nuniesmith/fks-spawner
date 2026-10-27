@@ -1,6 +1,7 @@
 import hashlib
 import json
 
+from conftest import TODAY
 from history import core
 
 SEP = "https://archive.test/data/spot/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2026-09.zip"
@@ -81,3 +82,26 @@ def test_parse_checksum():
     assert core.parse_checksum(f"{digest}  X.zip\n", "X.zip") == digest
     assert core.parse_checksum(f"{digest}  Y.zip\n", "X.zip") is None
     assert core.parse_checksum("not a checksum", "X.zip") is None
+
+
+def test_counts_stay_until_the_next_check_finishes(make_cfg, archive, cycle):
+    """A gauge that dipped to zero while a check ran would reset every alert
+    that holds on it, so the last finished check's counts stay up."""
+    import asyncio
+
+    cfg = make_cfg(HISTORY_INTERVALS="1d", HISTORY_START="2026-09")
+    archive.publish(SEP, b"x")
+    archive.bad.add(SEP.replace("2026-09", "2026-10-01").replace("monthly", "daily") + ".CHECKSUM")
+    status = cycle(cfg, archive)
+    assert status.series["klines/BTCUSDT/1d"]["errors"] == 1
+    seen: list[int] = []
+
+    async def slow(url: str):
+        seen.append(status.series["klines/BTCUSDT/1d"]["errors"])
+        return await archive.fetch(url)
+
+    asyncio.run(core.run_cycle(cfg, slow, status, core.NotPublished(cfg.data_dir),
+                               core.Manifest(cfg.data_dir), TODAY))
+    assert seen and set(seen) == {1}  # the old counts, all through the check
+    assert status.series["klines/BTCUSDT/1d"]["errors"] == 1
+    assert (status.cycle["planned"], status.cycle["checked"]) == (36, 36)

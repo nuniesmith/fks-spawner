@@ -114,7 +114,13 @@ def _series_key(t: Target) -> str:
 
 
 class Status:
-    """What /status and /metrics report, persisted to _state/status.json."""
+    """What /status and /metrics report, persisted to _state/status.json.
+
+    `series` holds the last FINISHED check's counts: a check counts into a
+    new table and swaps it in when done, so a gauge never dips to zero while
+    a check runs (alert rules hold on it for hours). `cycle` shows the
+    running check's progress.
+    """
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -126,6 +132,8 @@ class Status:
             "started_at_ms": None,
             "finished_at_ms": None,
             "next_at_ms": None,
+            "planned": 0,
+            "checked": 0,
             "downloaded": 0,
             "errors": 0,
         }
@@ -138,7 +146,8 @@ class Status:
     def path(self) -> Path:
         return self.cfg.data_dir / "_state" / "status.json"
 
-    def reset_series(self, plan: list[Target]) -> None:
+    @staticmethod
+    def new_series(plan: list[Target]) -> dict[str, dict]:
         series: dict[str, dict] = {}
         for t in plan:
             s = series.setdefault(_series_key(t), {
@@ -147,11 +156,12 @@ class Status:
                 "bytes": 0, "first": None, "last": None,
             })
             s["expected"] += 1
-        self.series = series
+        return series
 
-    def count(self, t: Target, state: str, size: int = 0) -> None:
-        s = self.series[_series_key(t)]
+    def count(self, series: dict[str, dict], t: Target, state: str, size: int = 0) -> None:
+        s = series[_series_key(t)]
         s[state] += 1
+        self.cycle["checked"] += 1
         if state == "present":
             s["bytes"] += size
             s["first"] = t.stamp if s["first"] is None or t.stamp < s["first"] else s["first"]
@@ -230,20 +240,20 @@ async def fetch_one(cfg: Config, t: Target, fetch: Fetch, manifest: Manifest) ->
 async def run_cycle(cfg: Config, fetch: Fetch, status: Status, memo: NotPublished,
                     manifest: Manifest, today: date) -> None:
     plan = targets(cfg, today)
-    status.reset_series(plan)
+    series = Status.new_series(plan)
     started = now_ms()
-    status.cycle.update(running=True, started_at_ms=started, downloaded=0, errors=0)
+    status.cycle.update(running=True, started_at_ms=started, planned=len(plan), checked=0, downloaded=0, errors=0)
     sem = asyncio.Semaphore(cfg.concurrency)
 
     async def one(t: Target) -> None:
         if memo.skip(t.filename, started):
-            status.count(t, "not_published")
+            status.count(series, t, "not_published")
             return
         async with sem:
             try:
                 state, size = await fetch_one(cfg, t, fetch, manifest)
             except Exception as exc:  # retried next cycle
-                status.count(t, "errors")
+                status.count(series, t, "errors")
                 status.cycle["errors"] += 1
                 status.errors_total += 1
                 status.recent_errors.append({"file": t.filename, "error": str(exc)[:200], "at_ms": now_ms()})
@@ -252,19 +262,20 @@ async def run_cycle(cfg: Config, fetch: Fetch, status: Status, memo: NotPublishe
         if state == "missing":
             if (today - t.last_day).days > RECENT_DAYS:
                 memo.add(t.filename, started)
-                status.count(t, "not_published")
+                status.count(series, t, "not_published")
             else:
-                status.count(t, "pending")
+                status.count(series, t, "pending")
             return
         if state == "downloaded":
             status.cycle["downloaded"] += 1
             status.downloads_total += 1
             log.info("downloaded %s (%d bytes)", t.filename, size)
-        status.count(t, "present", size)
+        status.count(series, t, "present", size)
 
     await asyncio.gather(*(one(t) for t in plan))
     memo.save()
     finished = now_ms()
+    status.series = series
     status.cycle.update(running=False, finished_at_ms=finished)
     if status.cycle["errors"] == 0:
         status.last_success_ms = finished
