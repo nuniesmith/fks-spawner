@@ -331,6 +331,47 @@ fn reject_contradictory_execution_mode(
     ))
 }
 
+/// Refuse a live spawn that carries exchange credentials but declares no
+/// `account`.
+///
+/// The account lease (`crate::leases`) is the one guard against two bots
+/// trading one exchange account, and it only applies to a spawn that declares
+/// its account. Without this check an undeclared live trader skips it: on
+/// 2026-10-30 a saved config applied to the Advanced page's spawn form (which
+/// dropped `bot_id` and `account`) started a SECOND live Kraken bot beside
+/// crypto-regime, unleased, on the same key. Credentials are recognised both
+/// as `secrets` (spawn-time injection) and as a typed `*_API_SECRET` in
+/// `env`.
+///
+/// Pure so the decision is testable without Docker or a DB.
+fn reject_unleased_live_trader(
+    mode: &str,
+    secrets: &[String],
+    env: &std::collections::HashMap<String, String>,
+    account: Option<&str>,
+) -> Result<(), String> {
+    if mode != "live" || account.is_some_and(|a| !a.trim().is_empty()) {
+        return Ok(());
+    }
+    let mut creds: Vec<String> = secrets.to_vec();
+    creds.extend(
+        env.iter()
+            .filter(|(k, v)| k.ends_with("_API_SECRET") && !v.is_empty())
+            .map(|(k, _)| k.clone()),
+    );
+    if creds.is_empty() {
+        return Ok(());
+    }
+    creds.sort();
+    Err(format!(
+        "refusing to spawn: mode='live' with exchange credentials ({}) but no `account`. \
+         Without one the account lease can't stop a second bot trading the same \
+         account. Declare it (e.g. kraken:spot:default), or respawn the saved config \
+         (↻) instead of spawning it again.",
+        creds.join(", ")
+    ))
+}
+
 /// Resolve each requested exchange's stored credentials and inject them into
 /// `env` as `{EXCHANGE}_API_KEY` / `_API_SECRET` (+ `_API_PASSPHRASE` when
 /// stored). Shared by the `/spawn` path and the respawn PRE-FLIGHT so both
@@ -504,6 +545,11 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     if let Err(why) = reject_contradictory_execution_mode(&req.mode, &req.env) {
         return Err(SpawnerError::InvalidRequest(why));
     }
+    if let Err(why) =
+        reject_unleased_live_trader(&req.mode, &req.secrets, &req.env, req.account.as_deref())
+    {
+        return Err(SpawnerError::InvalidRequest(why));
+    }
 
     // A read of a saved config shows credentials as the redaction marker
     // (crate::redact). Spawning with the marker would hand the bot the literal
@@ -585,6 +631,27 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     // those reasons never takes a lease it would only have to roll back;
     // before the Docker create, which is the point of no return. No declared
     // account = no lease and no behaviour change.
+    // ── A bot that already has a container ─────────────────────────────────
+    // is respawned (stop + remove + spawn), never spawned again. Docker would
+    // refuse the name anyway, but only AFTER the lease step: the same bot_id
+    // re-acquires its own lease (clearing its container), and the failed
+    // spawn's rollback then deletes it, leaving the running bot unleased.
+    // Respawn paths remove the old container first, so they pass.
+    if let Some(bot_id) = req.bot_id.as_deref().filter(|s| !s.is_empty())
+        && let Some(existing) = state
+            .docker
+            .list_bots()
+            .await?
+            .into_iter()
+            .find(|c| c.bot_id == bot_id)
+    {
+        return Err(SpawnerError::Refused(format!(
+            "bot '{bot_id}' already has a container ({}, {}); respawn its saved config \
+             (↻) to restart it, or remove the container first",
+            existing.name, existing.state
+        )));
+    }
+
     #[cfg(feature = "db")]
     let (req, account_lease) = acquire_account_lease(state, req).await?;
 
@@ -2302,6 +2369,16 @@ pub async fn respawn_from_config(
     if let Err(why) = reject_contradictory_execution_mode(&spawn_req.mode, &spawn_req.env) {
         return Err(SpawnerError::InvalidRequest(why));
     }
+    // Same reason: a saved live config with keys and no account would come
+    // back unleased. Refused before the old container is torn down.
+    if let Err(why) = reject_unleased_live_trader(
+        &spawn_req.mode,
+        &spawn_req.secrets,
+        &spawn_req.env,
+        spawn_req.account.as_deref(),
+    ) {
+        return Err(SpawnerError::InvalidRequest(why));
+    }
 
     // 5. Concurrency cap — count RUNNING bots EXCLUDING the container we are
     //    about to remove (removing it frees its slot), matching exactly what
@@ -3403,6 +3480,46 @@ async fn retire_deployment_handler(
             ))
         }
         None => Ok(ladder_not_found(format!("no deployment {id}"))),
+    }
+}
+
+#[cfg(test)]
+mod unleased_live_trader_tests {
+    use super::reject_unleased_live_trader as check;
+    use std::collections::HashMap;
+
+    fn kraken() -> Vec<String> {
+        vec!["kraken".to_string()]
+    }
+
+    #[test]
+    fn a_live_spawn_with_keys_and_no_account_is_refused() {
+        let why = check("live", &kraken(), &HashMap::new(), None).unwrap_err();
+        assert!(why.contains("kraken") && why.contains("account"), "{why}");
+        assert!(check("live", &kraken(), &HashMap::new(), Some("  ")).is_err());
+    }
+
+    #[test]
+    fn typed_credentials_count_too() {
+        let env = HashMap::from([("KRAKEN_API_SECRET".to_string(), "s".to_string())]);
+        assert!(check("live", &[], &env, None).is_err());
+        let empty = HashMap::from([("KRAKEN_API_SECRET".to_string(), String::new())]);
+        assert!(check("live", &[], &empty, None).is_ok());
+    }
+
+    #[test]
+    fn a_declared_account_a_keyless_bot_or_a_non_live_mode_passes() {
+        assert!(
+            check(
+                "live",
+                &kraken(),
+                &HashMap::new(),
+                Some("kraken:spot:default")
+            )
+            .is_ok()
+        );
+        assert!(check("live", &[], &HashMap::new(), None).is_ok());
+        assert!(check("paper", &kraken(), &HashMap::new(), None).is_ok());
     }
 }
 
