@@ -57,6 +57,11 @@
 // of them on one account again — UI respawn, botsync races and template
 // instances included.
 //
+// That holds only for bots that DECLARE their account, so a live spawn with
+// exchange credentials and no `account` is refused at admission
+// (`api::reject_unleased_live_trader`). Until 2026-10-30 it wasn't, and a
+// re-spawned saved config ran a second, unleased Kraken trader.
+//
 // This module owns the pure decision + validation + heartbeat loop; the SQL
 // lives with the rest of the store in `crate::db`. NOT the spot order-hold
 // system (unresolved-fill holds inside the spot bot, bots/spot-portfolio) —
