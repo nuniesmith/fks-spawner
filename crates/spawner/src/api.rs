@@ -631,6 +631,27 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
     // those reasons never takes a lease it would only have to roll back;
     // before the Docker create, which is the point of no return. No declared
     // account = no lease and no behaviour change.
+    // ── A bot that already has a container ─────────────────────────────────
+    // is respawned (stop + remove + spawn), never spawned again. Docker would
+    // refuse the name anyway, but only AFTER the lease step: the same bot_id
+    // re-acquires its own lease (clearing its container), and the failed
+    // spawn's rollback then deletes it, leaving the running bot unleased.
+    // Respawn paths remove the old container first, so they pass.
+    if let Some(bot_id) = req.bot_id.as_deref().filter(|s| !s.is_empty())
+        && let Some(existing) = state
+            .docker
+            .list_bots()
+            .await?
+            .into_iter()
+            .find(|c| c.bot_id == bot_id)
+    {
+        return Err(SpawnerError::Refused(format!(
+            "bot '{bot_id}' already has a container ({}, {}); respawn its saved config \
+             (↻) to restart it, or remove the container first",
+            existing.name, existing.state
+        )));
+    }
+
     #[cfg(feature = "db")]
     let (req, account_lease) = acquire_account_lease(state, req).await?;
 

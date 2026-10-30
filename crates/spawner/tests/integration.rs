@@ -464,6 +464,65 @@ async fn spawn_declaring_an_account_without_a_db_is_refused() {
 }
 
 #[tokio::test]
+async fn a_live_spawn_with_keys_and_no_account_is_refused() {
+    // 2026-10-30: a saved config re-spawned without its account ran a second
+    // live Kraken bot beside crypto-regime, unleased. Refused at admission.
+    let (app, mock) = build_app(test_config(""));
+    let body = serde_json::json!({
+        "image": "fks-bot-example:latest",
+        "mode": "live",
+        "secrets": ["kraken"]
+    })
+    .to_string();
+
+    let resp = app
+        .oneshot(
+            Request::post("/spawn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let payload = body_string(resp).await;
+    assert!(payload.contains("no `account`"), "body was: {payload}");
+    assert_eq!(mock.state.lock().unwrap().containers.len(), 0);
+}
+
+#[tokio::test]
+async fn spawning_a_bot_that_already_has_a_container_is_a_409() {
+    // Docker would refuse the name too, but only after the lease step, whose
+    // rollback would delete the RUNNING bot's lease. Refused before it.
+    let (app, mock) = build_app(test_config(""));
+    let body = serde_json::json!({
+        "image": "fks-bot-example:latest",
+        "bot_id": "crypto-regime",
+        "mode": "paper"
+    })
+    .to_string();
+    let spawn = |body: String| {
+        Request::post("/spawn")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let first = app.clone().oneshot(spawn(body.clone())).await.unwrap();
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = app.oneshot(spawn(body)).await.unwrap();
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let payload = body_string(second).await;
+    assert!(
+        payload.contains("already has a container"),
+        "body was: {payload}"
+    );
+    assert_eq!(mock.state.lock().unwrap().containers.len(), 1);
+}
+
+#[tokio::test]
 async fn spawn_carrying_the_redaction_placeholder_is_refused() {
     // GET /configs shows credentials as the placeholder (spawner::redact). A
     // spawn built from that read must not hand the bot the literal string.
