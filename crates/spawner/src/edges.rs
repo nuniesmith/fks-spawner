@@ -237,7 +237,7 @@ pub fn build_backtest_spawn_request(
     ]);
     SpawnRequest {
         data_dir: None,
-        lake_read: None,
+        webhooks: Default::default(),
         image: image.to_string(),
         bot_id: Some(backtest_bot_id(edge_id, run_id)),
         account: None,

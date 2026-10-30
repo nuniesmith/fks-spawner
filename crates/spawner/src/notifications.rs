@@ -537,6 +537,12 @@ mod dispatcher {
                 if ch.kind != "discord_webhook" {
                     continue;
                 }
+                // A bot's own channel (its webhook set at spawn,
+                // crate::webhooks) gets none of the platform's events, not
+                // even the always-delivered ones: its owner switched them off.
+                if !ch.platform_events {
+                    continue;
+                }
                 if !channel_wants(&ch.events, &ev.event) {
                     continue;
                 }

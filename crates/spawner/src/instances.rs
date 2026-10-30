@@ -217,6 +217,7 @@ impl InstancePlan {
             memory_mb: self.memory_mb,
             env: self.env.clone().into_iter().collect(),
             secrets: Vec::new(),
+            webhooks: Default::default(),
             bot_id: Some(self.name.clone()),
             account: None,
             restart_policy: self.restart_policy.clone(),
@@ -271,7 +272,7 @@ impl InstancePlan {
             entrypoint: None,
             secrets: Vec::new(),
             data_dir: self.data_dir.clone(),
-            lake_read: self.lake_read.clone(),
+            webhooks: Default::default(),
         }
     }
 }

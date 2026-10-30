@@ -379,6 +379,7 @@ async fn sql_path_roundtrips_against_ephemeral_postgres() {
     exercise_edge_ladder(&store, &pg).await;
     exercise_notification_log(&store).await;
     exercise_dispatcher_ledger(&store).await;
+    exercise_bot_webhooks(&store).await;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,6 +398,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         memory_mb: Some(512),
         env: env.clone(),
         secrets: vec!["kraken".to_string()],
+        webhooks: Default::default(),
         // Backward-compat: this template carries NO bot_id (like configs saved
         // before the field existed) — it must round-trip as None.
         bot_id: None,
@@ -416,6 +418,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
         memory_mb: Some(1024),
         env,
         secrets: vec!["kraken".to_string(), "kucoin".to_string()],
+        webhooks: Default::default(),
         bot_id: Some("crypto-spot-live".to_string()),
         account: None,
         restart_policy: Some(RestartPolicy {
@@ -499,6 +502,7 @@ async fn exercise_bot_configs(store: &BotRunStore) {
             memory_mb: None,
             env: HashMap::new(),
             secrets: vec![],
+            webhooks: Default::default(),
             bot_id: None,
             account: None,
             restart_policy: None,
@@ -571,6 +575,7 @@ async fn exercise_template_instance_configs(store: &BotRunStore, pg: &DockerPost
         memory_mb: Some(256),
         env: HashMap::new(),
         secrets: vec![],
+        webhooks: Default::default(),
         bot_id: Some("rec-btc".to_string()),
         account: None,
         restart_policy: None,
@@ -597,6 +602,7 @@ async fn exercise_template_instance_configs(store: &BotRunStore, pg: &DockerPost
         memory_mb: None,
         env: HashMap::new(),
         secrets: vec![],
+        webhooks: Default::default(),
         bot_id: None,
         account: None,
         restart_policy: None,
@@ -1404,7 +1410,13 @@ async fn exercise_dispatcher_ledger(store: &BotRunStore) {
     // A catch-all channel pointing at an unroutable target: the POST fails fast
     // (connection refused), so the dispatcher records `send_failed`.
     store
-        .upsert_channel("ops-all", "discord_webhook", "http://127.0.0.1:1/hook", &[])
+        .upsert_channel(
+            "ops-all",
+            "discord_webhook",
+            "http://127.0.0.1:1/hook",
+            &[],
+            true,
+        )
         .await
         .expect("configure channel");
 
@@ -1452,6 +1464,115 @@ async fn exercise_dispatcher_ledger(store: &BotRunStore) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// A bot's own webhooks (crate::webhooks): a Settings channel set at spawn,
+// and kept out of the platform's events
+// ─────────────────────────────────────────────────────────────────────────────
+async fn exercise_bot_webhooks(store: &BotRunStore) {
+    use std::collections::BTreeMap;
+
+    store
+        .upsert_channel(
+            "crypto",
+            "discord_webhook",
+            "http://127.0.0.1:1/crypto-hook",
+            &[],
+            false,
+        )
+        .await
+        .expect("a bot-only channel");
+    let listed = store.list_channels().await.expect("list");
+    let crypto = listed.iter().find(|c| c.name == "crypto").expect("listed");
+    assert!(!crypto.platform_events);
+    assert!(
+        listed
+            .iter()
+            .any(|c| c.name == "ops-all" && c.platform_events)
+    );
+
+    // The config names the channel; the URL never lands in the saved row.
+    let webhooks = BTreeMap::from([
+        (
+            "CRYPTO_DISCORD_WEBHOOK_URL".to_string(),
+            "crypto".to_string(),
+        ),
+        (
+            "SPARE_WEBHOOK_URL".to_string(),
+            "no-such-channel".to_string(),
+        ),
+    ]);
+    store
+        .upsert_config(&ConfigRequest {
+            name: "crypto-regime-test".to_string(),
+            image: "ghcr.io/nuniesmith/fks-bot-crypto:latest".to_string(),
+            mode: "paper".to_string(),
+            cpu_limit: None,
+            memory_mb: None,
+            env: HashMap::from([("TZ".to_string(), "UTC".to_string())]),
+            secrets: vec![],
+            webhooks: webhooks.clone(),
+            bot_id: Some("crypto-regime-test".to_string()),
+            account: None,
+            restart_policy: None,
+            template: None,
+        })
+        .await
+        .expect("save");
+    let saved = store
+        .get_config("crypto-regime-test")
+        .await
+        .expect("get")
+        .expect("saved");
+    assert_eq!(saved.webhooks, webhooks);
+    assert!(!saved.env.contains_key("CRYPTO_DISCORD_WEBHOOK_URL"));
+
+    // At spawn: the channel's URL in env; a missing channel is skipped, not fatal.
+    let mut env = saved.env.clone();
+    let unresolved = spawner::webhooks::inject(Some(store), &saved.webhooks, &mut env).await;
+    assert_eq!(
+        env.get("CRYPTO_DISCORD_WEBHOOK_URL").map(String::as_str),
+        Some("http://127.0.0.1:1/crypto-hook")
+    );
+    assert_eq!(unresolved, vec!["SPARE_WEBHOOK_URL".to_string()]);
+    assert!(!env.contains_key("SPARE_WEBHOOK_URL"));
+
+    // The dispatcher never sends the platform's events to it, not even an
+    // always-delivered one; the catch-all channel still gets them.
+    let resp = spawner::models::SpawnResponse {
+        container_id: "cid-crash".to_string(),
+        container_name: "fks-bot-btc".to_string(),
+        bot_id: "btc".to_string(),
+        image: "fks-bot-recorder:latest".to_string(),
+        mode: "record".to_string(),
+        started_at: chrono::Utc::now(),
+    };
+    NotificationDispatcher::new(store.clone())
+        .dispatch(NotificationEvent::spawned(&resp))
+        .await;
+    let mut rows = Vec::new();
+    for _ in 0..50 {
+        rows = store
+            .list_notification_log(50, Some("bot_spawned"))
+            .await
+            .expect("ledger");
+        if rows
+            .iter()
+            .any(|r| r.channel_name == "ops-all" && r.bot_id == "btc")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r.channel_name == "ops-all" && r.bot_id == "btc")
+    );
+    assert!(
+        rows.iter().all(|r| r.channel_name != "crypto"),
+        "a bot-only channel gets no platform events"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // account_leases — one live bot per exchange account (crate::leases).
 // The guard itself, driven through the store's real SQL: two saved configs
 // declaring the SAME account (the Oct-2026 two-traders-one-Kraken shape) —
@@ -1474,6 +1595,7 @@ async fn exercise_account_leases(store: &BotRunStore) {
                 memory_mb: None,
                 env: HashMap::new(),
                 secrets: vec!["kraken".to_string()],
+                webhooks: Default::default(),
                 bot_id: Some(bot_id.to_string()),
                 account: Some(ACCOUNT.to_string()),
                 restart_policy: None,

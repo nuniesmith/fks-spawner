@@ -569,6 +569,14 @@ async fn spawn_bot(state: &AppState, req: SpawnRequest) -> Result<SpawnResponse,
             let secrets = std::mem::take(&mut req.secrets);
             inject_secrets(store, &secrets, &mut req.env).await?;
         }
+        // A bot's webhooks from Settings (crate::webhooks): never fatal, a
+        // live trader must not stay down over its Discord reports.
+        if !req.webhooks.is_empty() {
+            crate::webhooks::validate(&req.webhooks, &req.env)
+                .map_err(SpawnerError::InvalidRequest)?;
+            let webhooks = std::mem::take(&mut req.webhooks);
+            crate::webhooks::inject(state.store.as_ref(), &webhooks, &mut req.env).await;
+        }
         req
     };
 
@@ -1238,7 +1246,9 @@ async fn save_notification_handler(
     };
 
     // AWAIT the write — confirm the channel persisted before reporting success.
-    store.upsert_channel(&name, &kind, url, &events).await?;
+    store
+        .upsert_channel(&name, &kind, url, &events, req.platform_events)
+        .await?;
 
     // Log only the name/kind — never the webhook URL.
     info!(name = %name, kind = %kind, "stored notification channel");
@@ -1476,6 +1486,14 @@ async fn save_config_handler(
                 "ok": false,
                 "error": "name and image are required",
             })),
+        ));
+    }
+    // A webhook comes from Settings (crate::webhooks), checked before the
+    // store so a bad mapping is a 400 with or without a database.
+    if let Err(why) = crate::webhooks::validate(&req.webhooks, &req.env) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": why })),
         ));
     }
 
@@ -2220,7 +2238,7 @@ pub async fn respawn_from_config(
     } else {
         SpawnRequest {
             data_dir: None,
-            lake_read: None,
+            webhooks: cfg.webhooks.clone(),
             image: cfg.image.clone(),
             bot_id: Some(bot_id),
             account: cfg.account.clone(),
@@ -2261,6 +2279,13 @@ pub async fn respawn_from_config(
         };
         let secrets = std::mem::take(&mut spawn_req.secrets);
         inject_secrets(store, &secrets, &mut spawn_req.env).await?;
+    }
+    // 3b. Its webhooks from Settings (crate::webhooks): resolved now, from
+    //     the channel as it is now, so a rotated webhook takes effect on this
+    //     respawn. A missing channel is logged, never fatal.
+    if !spawn_req.webhooks.is_empty() {
+        let webhooks = std::mem::take(&mut spawn_req.webhooks);
+        crate::webhooks::inject(state.store.as_ref(), &webhooks, &mut spawn_req.env).await;
     }
     // 4. Declared mode vs requested capability, on the FULLY RESOLVED env.
     //

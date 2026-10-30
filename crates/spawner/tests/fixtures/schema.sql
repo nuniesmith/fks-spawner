@@ -122,6 +122,10 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- fks 026: a bot's own channel opts out of the platform's events.
+ALTER TABLE notification_channels
+    ADD COLUMN IF NOT EXISTS platform_events BOOLEAN NOT NULL DEFAULT TRUE;
+
 DROP TRIGGER IF EXISTS trg_notification_channels_updated_at ON notification_channels;
 CREATE TRIGGER trg_notification_channels_updated_at
     BEFORE UPDATE ON notification_channels
