@@ -17,6 +17,14 @@
 //! that folder at `/data`. A new recorder is refused when the lake's disk
 //! has less than `LAKE_MIN_FREE_GB` free; a respawn never is, because
 //! refusing it would only punch a gap in a dataset that already exists.
+//!
+//! A JOB (a one-shot template: a search, a collector) writes to
+//! `LAKE_ROOT/jobs/<instance>` at `/data`, and with `"lake": "read"` gets
+//! `LAKE_ROOT/raw` READ-ONLY at `/lake`. With `"database": "research"` the
+//! API adds the scoped research URL at spawn (`FKS_DB_URL`); it is never
+//! saved with the instance. A job runs once: the template refuses restarts,
+//! the supervisor never restarts a one-shot, and boot reconciliation never
+//! re-runs one.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,10 +35,14 @@ use serde_json::{Map, Value};
 use crate::config::InstancesConfig;
 use crate::models::{ConfigRequest, SpawnRequest, TemplateRef};
 use crate::supervisor::RestartPolicy;
-use crate::templates::{Template, TemplateKind, TemplateSet, env_for, validate_params};
+use crate::templates::{
+    DatabaseAccess, LakeAccess, Template, TemplateKind, TemplateSet, env_for, validate_params,
+};
 
 /// Mounted at this path in every instance that has a data folder.
 pub const DATA_MOUNT: &str = "/data";
+/// Where a job that reads the lake finds it (read-only).
+pub const LAKE_MOUNT: &str = "/lake";
 
 /// `POST /instances` and `POST /instances/validate`.
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +76,11 @@ pub struct InstancePlan {
     pub restart_policy: Option<RestartPolicy>,
     /// The host folder mounted at `/data`, for templates that record data.
     pub data_dir: Option<PathBuf>,
+    /// The lake, mounted read-only at `/lake` (jobs with `"lake": "read"`).
+    pub lake_read: Option<PathBuf>,
+    /// The API adds the research database URL at spawn (jobs with
+    /// `"database": "research"`).
+    pub research_db: bool,
 }
 
 /// Why an instance can't be planned: an unknown template (404) or input that
@@ -96,9 +113,13 @@ pub fn validate_instance_name(name: &str) -> Result<(), String> {
     }
 }
 
-/// `LAKE_ROOT/raw/<venue>/<market>/<name>`. The parts were checked when the
-/// template loaded and when the name was.
+/// An instance's own folder: `LAKE_ROOT/raw/<venue>/<market>/<name>` for a
+/// recorder, `LAKE_ROOT/jobs/<name>` for a job. The parts were checked when
+/// the template loaded and when the name was.
 pub fn lake_dir(root: &Path, template: &Template, name: &str) -> Option<PathBuf> {
+    if template.kind == TemplateKind::Job {
+        return Some(root.join("jobs").join(name));
+    }
     let data = template.data.as_ref()?;
     Some(
         root.join("raw")
@@ -145,10 +166,11 @@ fn build(
     mode: Option<&str>,
     params: &Value,
 ) -> Result<InstancePlan, PlanError> {
-    if template.kind != TemplateKind::Recorder {
+    if template.kind == TemplateKind::Bot {
         return Err(PlanError::invalid(format!(
-            "{} is a {:?} template; only recorders can be instances until account leases exist",
-            template.id, template.kind
+            "{} is a bot template; bots become instances with the forward harness \
+             (EDGE_PROCESS §5), not yet",
+            template.id
         )));
     }
     validate_instance_name(name).map_err(PlanError::invalid)?;
@@ -165,6 +187,7 @@ fn build(
     let params = validate_params(template, params).map_err(PlanError::Invalid)?;
     let env = env_for(template, &params);
     let data_dir = lake_dir(&cfg.lake_root, template, name);
+    let lake_read = (template.lake == Some(LakeAccess::Read)).then(|| cfg.lake_root.join("raw"));
     Ok(InstancePlan {
         name: name.to_string(),
         template_id: template.id.clone(),
@@ -178,6 +201,8 @@ fn build(
         memory_mb: template.resources.memory_mb,
         restart_policy: template.restart_policy.clone(),
         data_dir,
+        lake_read,
+        research_db: template.database == Some(DatabaseAccess::Research),
     })
 }
 
@@ -203,6 +228,28 @@ impl InstancePlan {
         }
     }
 
+    /// The container to run, plus the research database URL when the template
+    /// asks for it (`"database": "research"`) as `FKS_DB_URL`. Added here, at
+    /// spawn, so it's never saved with the instance or shown by
+    /// `/instances/validate`. Without a URL the job is refused: its result
+    /// would have nowhere to go, and the spawner's own full-privilege URL is
+    /// never handed out.
+    pub fn spawn_request_with(&self, research_db_url: &str) -> Result<SpawnRequest, String> {
+        let mut req = self.spawn_request();
+        if self.research_db {
+            let url = research_db_url.trim();
+            if url.is_empty() {
+                return Err(format!(
+                    "{} needs the research database: set BACKTEST_DB_URL (the scoped \
+                     fks_backtest role) on the spawner",
+                    self.template_id
+                ));
+            }
+            req.env.insert("FKS_DB_URL".to_string(), url.to_string());
+        }
+        Ok(req)
+    }
+
     /// The container to run.
     pub fn spawn_request(&self) -> SpawnRequest {
         let mut labels = std::collections::HashMap::new();
@@ -224,6 +271,7 @@ impl InstancePlan {
             entrypoint: None,
             secrets: Vec::new(),
             data_dir: self.data_dir.clone(),
+            lake_read: self.lake_read.clone(),
         }
     }
 }
@@ -394,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn only_recorders_can_be_instances_for_now() {
+    fn bots_are_not_instances_yet() {
         let mut t = recorder();
         t.kind = TemplateKind::Bot;
         let mut s = TemplateSet::default();
@@ -404,7 +452,81 @@ mod tests {
         else {
             panic!("invalid")
         };
-        assert!(why[0].contains("only recorders"));
+        assert!(why[0].contains("forward harness"), "{why:?}");
+    }
+
+    fn job() -> Template {
+        serde_json::from_value(json!({
+            "id": "job.edge-search",
+            "version": 1,
+            "kind": "job",
+            "display_name": "Edge search",
+            "image": "ghcr.io/nuniesmith/fks-bot-edge-search:latest",
+            "modes": ["backtest"],
+            "lake": "read",
+            "database": "research",
+            "env": {"hypothesis_id": "EDGE_HYPOTHESIS_ID"},
+            "params": {
+                "type": "object",
+                "required": ["hypothesis_id"],
+                "properties": {"hypothesis_id": {"type": "integer", "minimum": 1}}
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_job_writes_its_own_folder_and_reads_the_lake() {
+        let mut s = TemplateSet::default();
+        s.templates.insert("job.edge-search".into(), job());
+        let mut r = req("search-7", json!({"hypothesis_id": 7}));
+        r.template = "job.edge-search".into();
+        let p = plan(&s, &cfg(), &r).expect("a job plans");
+        assert_eq!(p.mode, "backtest");
+        assert_eq!(
+            p.data_dir,
+            Some(PathBuf::from("/srv/fks-lake/jobs/search-7"))
+        );
+        assert_eq!(p.lake_read, Some(PathBuf::from("/srv/fks-lake/raw")));
+        assert!(p.research_db);
+        assert_eq!(
+            p.env.get("EDGE_HYPOTHESIS_ID").map(String::as_str),
+            Some("7")
+        );
+        let spawn = p.spawn_request();
+        assert_eq!(spawn.lake_read, p.lake_read);
+        assert!(
+            !spawn.env.contains_key("FKS_DB_URL")
+                && !p.config_request().env.contains_key("FKS_DB_URL"),
+            "the database URL is added by the API at spawn, never by the plan or the saved config"
+        );
+        // The URL comes in at spawn, and a research job without one is refused.
+        let with = p
+            .spawn_request_with("postgres://fks_backtest@db/fks_db")
+            .expect("spawns");
+        assert_eq!(
+            with.env.get("FKS_DB_URL").map(String::as_str),
+            Some("postgres://fks_backtest@db/fks_db")
+        );
+        assert!(
+            p.spawn_request_with("  ")
+                .unwrap_err()
+                .contains("BACKTEST_DB_URL")
+        );
+    }
+
+    #[test]
+    fn a_recorder_gets_no_lake_and_no_database() {
+        let mut s = TemplateSet::default();
+        s.templates
+            .insert("recorder.binance-usdm".into(), recorder());
+        let p = plan(&s, &cfg(), &req("btc", json!({"symbols": ["BTCUSDT"]}))).expect("plans");
+        assert!(p.lake_read.is_none() && !p.research_db);
+        let spawn = p
+            .spawn_request_with("postgres://fks_backtest@db/fks_db")
+            .expect("spawns");
+        assert!(!spawn.env.contains_key("FKS_DB_URL"));
+        assert!(spawn.lake_read.is_none());
     }
 
     #[test]

@@ -1774,6 +1774,7 @@ async fn remove_existing_bot_stops_and_removes_when_present() {
 
     mock.spawn(SpawnRequest {
         data_dir: None,
+        lake_read: None,
         image: "fks-bot-example:latest".to_string(),
         bot_id: Some("crypto-spot-live".to_string()),
         account: None,
@@ -1911,6 +1912,7 @@ fn config_row(image: &str, bot_id: &str, secrets: Vec<String>) -> spawner::db::B
 async fn seed_running(mock: &MockDockerClient, image: &str, bot_id: &str) {
     mock.spawn(SpawnRequest {
         data_dir: None,
+        lake_read: None,
         image: image.to_string(),
         bot_id: Some(bot_id.to_string()),
         account: None,
@@ -2184,6 +2186,7 @@ async fn net_worth_sampler_targets_only_running_bots() {
     for bot_id in ["alpha", "beta"] {
         mock.spawn(SpawnRequest {
             data_dir: None,
+            lake_read: None,
             image: "fks-bot-example:latest".to_string(),
             bot_id: Some(bot_id.to_string()),
             account: None,

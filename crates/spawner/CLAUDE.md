@@ -433,9 +433,19 @@ Hardened (auth + HTTP integration tests) and DB-backed in `fks_db`:
   from the template as it is now, in respawn's pre-flight, so a missing
   template or a saved value it no longer accepts fails with the old container
   still up. A blob naming a template that doesn't parse is refused, never run
-  as a plain config (that would lose a recorder's data folder). Only
-  recorders can be instances until account leases exist; a recorder template
-  can't list `live`/`dry-run` modes or secrets. The data folder lives under
+  as a plain config (that would lose a recorder's data folder). Recorders and
+  **jobs** can be instances; bots wait for the forward harness. A recorder
+  template can't list `live`/`dry-run` modes or secrets. **A job runs once:**
+  its only mode is the one-shot `backtest` (never restarted or quarantined by
+  the supervisor), its template may not enable a restart policy or list
+  secrets, and **boot reconciliation never re-runs an interrupted one** (a
+  search run twice counts its trials twice in N; re-running is an explicit
+  `POST /instances/{name}/start`). A job writes to `LAKE_ROOT/jobs/<instance>`
+  at `/data`; with `"lake": "read"` it also gets `LAKE_ROOT/raw` READ-ONLY at
+  `/lake` (`LAKE_DIR`), and with `"database": "research"` the scoped
+  `BACKTEST_DB_URL` (fks_backtest role) as `FKS_DB_URL`, added at spawn by
+  `InstancePlan::spawn_request_with`: never saved with the instance, never
+  shown by `/instances/validate`, and the job is refused without it. The data folder lives under
   `LAKE_ROOT` (default `/srv/fks-lake`), mounted into the spawner at the SAME
   path because Docker resolves bind sources on the host; the spawner runs as
   uid 1000, the uid the recorder image runs as, so the folders it creates are

@@ -55,7 +55,9 @@ use crate::prometheus_sd;
 /// The `fks.mode` label one-shot backtest containers carry. They are EXPECTED
 /// to exit on their own (and their `bot_runs` row is intentionally left open),
 /// so they are NEVER treated as crashes and prune on the short retention.
-const ONE_SHOT_MODE: &str = "backtest";
+/// The mode of a container that runs once and exits (edge backtests and
+/// job instances): never restarted, never quarantined, pruned when old.
+pub const ONE_SHOT_MODE: &str = "backtest";
 /// The `fks.mode` label live-money bots carry — quarantined from fast prune.
 const LIVE_MODE: &str = "live";
 
