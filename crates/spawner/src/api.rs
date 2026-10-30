@@ -2238,6 +2238,7 @@ pub async fn respawn_from_config(
     } else {
         SpawnRequest {
             data_dir: None,
+            lake_read: None,
             webhooks: cfg.webhooks.clone(),
             image: cfg.image.clone(),
             bot_id: Some(bot_id),
