@@ -21,11 +21,13 @@ on:
             - "LICENSE"
             - "**/LICENSE"
             - ".gitignore"
-            # Python; their own workflows are recorder.yml and history.yml.
+            # Python; their own workflows are recorder.yml, history.yml and edge-search.yml.
             - "bots/recorder/**"
             - ".github/workflows/recorder.yml"
             - "bots/history/**"
             - ".github/workflows/history.yml"
+            - "bots/edge-search/**"
+            - ".github/workflows/edge-search.yml"
     push:
         branches: [main]
         paths-ignore:
@@ -33,11 +35,13 @@ on:
             - "LICENSE"
             - "**/LICENSE"
             - ".gitignore"
-            # Python; their own workflows are recorder.yml and history.yml.
+            # Python; their own workflows are recorder.yml, history.yml and edge-search.yml.
             - "bots/recorder/**"
             - ".github/workflows/recorder.yml"
             - "bots/history/**"
             - ".github/workflows/history.yml"
+            - "bots/edge-search/**"
+            - ".github/workflows/edge-search.yml"
 
 concurrency:
     group: rust-${{ github.workflow }}-${{ github.ref }}

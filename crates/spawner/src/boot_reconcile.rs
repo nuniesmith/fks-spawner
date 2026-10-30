@@ -71,6 +71,9 @@ pub struct ConfigRunState {
     pub config_name: String,
     pub bot_id: String,
     pub last_status: Option<String>,
+    /// The saved config's mode: a one-shot (a job, `supervisor::ONE_SHOT_MODE`)
+    /// is never re-run here.
+    pub mode: String,
 }
 
 /// A bot `decide` selected for respawn, with the status that triggered it
@@ -102,6 +105,10 @@ pub struct ReconcilePlan {
     pub already_errored: Vec<String>,
     /// Bots with no `bot_runs` row at all — a saved config never spawned.
     pub never_spawned: Vec<String>,
+    /// One-shot jobs a reboot interrupted. Never re-run here: a search run
+    /// twice counts its trials twice in N. Re-running one is an operator's
+    /// call (`POST /instances/{name}/start`).
+    pub one_shot_interrupted: Vec<String>,
 }
 
 /// Decide which bots to respawn at boot.
@@ -130,6 +137,11 @@ pub fn decide(configs: &[ConfigRunState], currently_running: &HashSet<String>) -
         }
 
         match c.last_status.as_deref() {
+            Some(status)
+                if run_is_open(Some(status)) && c.mode == crate::supervisor::ONE_SHOT_MODE =>
+            {
+                plan.one_shot_interrupted.push(c.bot_id.clone());
+            }
             Some(status) if run_is_open(Some(status)) => {
                 plan.respawn.push(ReconcileTarget {
                     config_name: c.config_name.clone(),
@@ -228,6 +240,7 @@ pub async fn run(state: &AppState) {
                 config_name: cfg.name.clone(),
                 bot_id,
                 last_status,
+                mode: cfg.mode.clone(),
             }),
             Err(e) => warn!(
                 error = %e,
@@ -280,6 +293,13 @@ pub async fn run(state: &AppState) {
     }
     for bot_id in &plan.never_spawned {
         info!(bot_id = %bot_id, "boot reconciliation: saved config never spawned — nothing to do");
+    }
+    for bot_id in &plan.one_shot_interrupted {
+        warn!(
+            bot_id = %bot_id,
+            "boot reconciliation: a one-shot job was interrupted and is NOT re-run (a search run \
+             twice counts its trials twice); start it again by hand if it should run"
+        );
     }
 
     if plan.respawn.is_empty() {
@@ -375,7 +395,26 @@ mod tests {
             config_name: config_name.to_string(),
             bot_id: bot_id.to_string(),
             last_status: last_status.map(str::to_string),
+            mode: "paper".to_string(),
         }
+    }
+
+    #[test]
+    fn an_interrupted_one_shot_job_is_never_re_run() {
+        // A search a reboot cut off mid-run: re-running it would count its
+        // trials twice in N. A paper bot in the same state IS respawned.
+        let mut job = state("search-7", "search-7", Some("running"));
+        job.mode = "backtest".to_string();
+        let bot = state("paper-bot", "paper-bot", Some("running"));
+        let plan = decide(&[job, bot], &HashSet::new());
+        assert_eq!(plan.one_shot_interrupted, vec!["search-7".to_string()]);
+        assert_eq!(
+            plan.respawn
+                .iter()
+                .map(|t| t.bot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["paper-bot"]
+        );
     }
 
     // ── the tonight's-incident scenario ─────────────────────────────────────

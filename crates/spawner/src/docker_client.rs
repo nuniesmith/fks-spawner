@@ -296,6 +296,11 @@ impl DockerClient {
                     .as_ref()
                     .map(|_| format!("DATA_DIR={}", crate::instances::DATA_MOUNT)),
             )
+            .chain(
+                req.lake_read
+                    .as_ref()
+                    .map(|_| format!("LAKE_DIR={}", crate::instances::LAKE_MOUNT)),
+            )
             .collect();
 
         // ── Resource limits ───────────────────────────────────────────────────
@@ -322,6 +327,7 @@ impl DockerClient {
             self.config.default_cpu_shares,
             &bot_id,
             req.data_dir.as_deref(),
+            req.lake_read.as_deref(),
         );
 
         let networking_config = NetworkingConfig {
@@ -824,6 +830,7 @@ fn build_bot_host_config(
     cpu_shares: i64,
     bot_id: &str,
     data_dir: Option<&std::path::Path>,
+    lake_read: Option<&std::path::Path>,
 ) -> HostConfig {
     // Per-bot state volume (see BOT_STATE_MOUNT). Named volume, not a host
     // bind: no host path is exposed to the bot and Docker manages the
@@ -841,6 +848,16 @@ fn build_bot_host_config(
             "{}:{}:rw",
             dir.display(),
             crate::instances::DATA_MOUNT
+        ));
+    }
+    // A job's input: the whole lake, read-only, so a search can read any
+    // dataset and change none of it. Also spawner-computed (`lake_read` isn't
+    // deserialized).
+    if let Some(dir) = lake_read {
+        binds.push(format!(
+            "{}:{}:ro",
+            dir.display(),
+            crate::instances::LAKE_MOUNT
         ));
     }
     HostConfig {
@@ -1013,7 +1030,7 @@ mod tests {
 
     #[test]
     fn bot_host_config_enforces_security_contract() {
-        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "crypto-spot", None);
+        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "crypto-spot", None, None);
         // The hardening that was missing: drop every Linux capability.
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
         // Per-bot state volume: present, bot-specific (NOT shared — a shared
@@ -1061,19 +1078,40 @@ mod tests {
 
     #[test]
     fn an_instance_data_folder_is_the_one_extra_bind_and_lands_at_data() {
-        let plain = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", None);
+        let plain = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", None, None);
         assert_eq!(
             plain.binds.as_ref().map(Vec::len),
             Some(1),
             "only the state volume"
         );
         let dir = std::path::Path::new("/srv/fks-lake/raw/binance/usdm/btc");
-        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", Some(dir));
+        let hc = build_bot_host_config(512 * 1024 * 1024, 100_000, 1024, "rec", Some(dir), None);
         let binds = hc.binds.expect("binds");
         assert_eq!(binds.len(), 2);
         assert_eq!(binds[1], "/srv/fks-lake/raw/binance/usdm/btc:/data:rw");
         // the hardened posture is unchanged by the extra bind
         assert_eq!(hc.cap_drop, Some(vec!["ALL".to_string()]));
+    }
+
+    #[test]
+    fn a_job_reads_the_lake_read_only_and_writes_only_its_own_folder() {
+        let out = std::path::Path::new("/srv/fks-lake/jobs/search-1");
+        let lake = std::path::Path::new("/srv/fks-lake/raw");
+        let hc = build_bot_host_config(
+            512 * 1024 * 1024,
+            100_000,
+            1024,
+            "job",
+            Some(out),
+            Some(lake),
+        );
+        let binds = hc.binds.expect("binds");
+        assert_eq!(binds.len(), 3);
+        assert_eq!(binds[1], "/srv/fks-lake/jobs/search-1:/data:rw");
+        assert_eq!(
+            binds[2], "/srv/fks-lake/raw:/lake:ro",
+            "the lake is never writable to a job"
+        );
     }
 
     fn valid_spawn_req() -> SpawnRequest {

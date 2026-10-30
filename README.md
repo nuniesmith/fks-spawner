@@ -15,8 +15,9 @@ orchestration root that deploys all of this).
 | `bots/spot-portfolio/` | **production** multi-exchange spot rebalancer. Own `README.md` + `SPOT.md`. Path-depends on `../../crates/crypto-bot-core`. |
 | `bots/recorder/` | Python. Records raw public market data (Binance USDⓈ-M websockets and REST), append-only, with a gap ledger; run from a recorder template. Own `README.md`. |
 | `bots/history/` | Python. Downloads Binance's public archive (data.binance.vision: klines, funding, metrics), checksum-verified, and keeps it current; run from a history template. Own `README.md`. |
+| `bots/edge-search/` | Python. One search of a registered hypothesis (EDGE_PROCESS step 3–4): walk-forward on training folds, the holdout scored once, verdict U1–U9, the experiment written through the scoped research role; a one-shot job. Own `README.md`. |
 
-Every crate here (the two Python bots aside) is a **standalone Cargo workspace** (each has its own
+Every crate here (the Python bots aside) is a **standalone Cargo workspace** (each has its own
 `[workspace]` block + committed `Cargo.lock`) resolving crates.io / git deps —
 there is deliberately no root `Cargo.toml`. The `crates/` + `bots/` layout
 mirrors the original `fks` tree so `spot-portfolio`'s relative path dep keeps
