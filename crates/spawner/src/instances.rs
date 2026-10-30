@@ -272,6 +272,7 @@ impl InstancePlan {
             entrypoint: None,
             secrets: Vec::new(),
             data_dir: self.data_dir.clone(),
+            lake_read: self.lake_read.clone(),
             webhooks: Default::default(),
         }
     }
