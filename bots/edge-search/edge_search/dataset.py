@@ -16,7 +16,9 @@ stitched 1-minute series per root instead: <ROOT>/1m/<ROOT>-1m-<period>.csv.gz
 (open_time_ms,open,high,low,close,volume), with <ROOT>/rolls.csv and
 <ROOT>/roll_flips.csv naming the days a series changes contract. Several
 folders can be joined with '+' (the imported cache, then the recorder that
-keeps it current): for a minute in more than one, the FIRST folder wins.
+keeps it current): for a UTC day in more than one, the FIRST folder wins the
+whole day. Per minute, a partial day in one folder could be completed from
+another one on a different contract, and pass as one clean session.
 
 Two traps from the archive, handled here (bots/history README):
   - spot klines are in MICROSECONDS from 2025 on, milliseconds before, and
@@ -234,10 +236,15 @@ def load_cme_minutes(lake: Path, spec: DatasetSpec, root: str) -> MinuteBars:
     rows = np.vstack(parts) if parts else np.zeros((0, 7))
     if not len(rows):
         raise DatasetError(f"{root}: no bars between {spec.start} and {spec.end}")
-    # By time, then by folder rank: the first row of each minute is the
-    # earliest-named folder's, which wins.
-    rows = rows[np.lexsort((rows[:, 6], rows[:, 0]))]
-    first = np.concatenate([[True], rows[1:, 0] != rows[:-1, 0]])
-    rows = rows[first]
+    # A UTC day belongs to the earliest-named folder that has any bar in it:
+    # never a day stitched from two folders (two contracts, possibly).
+    day = (rows[:, 0] // 86_400_000).astype(np.int64)
+    owner: dict[int, int] = {}
+    for d, r in zip(day.tolist(), rows[:, 6].astype(int).tolist()):
+        if d not in owner or r < owner[d]:
+            owner[d] = r
+    rows = rows[np.array([owner[d] == r for d, r in zip(day.tolist(), rows[:, 6].astype(int).tolist())])]
+    rows = rows[np.argsort(rows[:, 0], kind="stable")]
+    rows = rows[np.concatenate([[True], rows[1:, 0] != rows[:-1, 0]])]
     return MinuteBars(root=root, open_ms=rows[:, 0].astype(np.int64), open=rows[:, 1], high=rows[:, 2],
                       low=rows[:, 3], close=rows[:, 4], volume=rows[:, 5], roll_days=roll_days)

@@ -31,8 +31,9 @@ re-runs it: a search run twice counts its trials twice in N.
   milliseconds.
   A CME folder (`raw/cme/...`, the `orb` family) is one stitched 1-minute
   series per root, `<ROOT>/1m/<ROOT>-1m-<period>.csv.gz`, with `rolls.csv`
-  and `roll_flips.csv`. Folders join with `+`, the first winning a minute:
-  `raw/cme/massive-cache+raw/cme/massive 1m 2024-09-09..2027-05-31`.
+  and `roll_flips.csv`. Folders join with `+`, the first winning a whole UTC
+day (never a session stitched from two folders):
+  `raw/cme/massive-cache+raw/cme/massive/cme 1m 2024-09-09..2027-05-31`.
 - **params**: the family's parameters, each a range with a step (the grid)
   or a list of choices. `trend-band` tunes `lookback` (bars) and `band`
   (a fraction); `orb` tunes `orb_minutes`, `target_r` and `exit`

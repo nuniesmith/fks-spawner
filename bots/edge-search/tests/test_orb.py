@@ -338,10 +338,14 @@ def write_month(folder, root, rows):
         w.writerows(rows)
 
 
-def test_two_folders_join_and_the_first_wins_a_minute(tmp_path):
+def test_two_folders_join_and_the_first_wins_a_whole_day(tmp_path):
     t = session_start_ms(date(2026, 10, 20))
+    nxt = session_start_ms(date(2026, 10, 21))
     write_month(tmp_path / "cme/cache", "ES", [(t, 1, 2, 0.5, 1.5, 10), (t + 60_000, 1, 2, 0.5, 1.5, 10)])
-    write_month(tmp_path / "cme/live", "ES", [(t + 60_000, 9, 9, 9, 9, 1), (t + 120_000, 3, 4, 2, 3, 7)])
+    # The live folder's 10-20 bars (one overlapping, one the cache lacks) are
+    # ignored: that day is the cache's. Its 10-21 bar is used.
+    write_month(tmp_path / "cme/live", "ES", [(t + 60_000, 9, 9, 9, 9, 1), (t + 120_000, 3, 4, 2, 3, 7),
+                                              (nxt, 5, 6, 4, 5, 2)])
     with (tmp_path / "cme/cache/ES/rolls.csv").open("w") as f:
         f.write("day,from_contract,to_contract,gap_points,detected_by\n2026-10-16,ESZ6,ESH7,60,volume\n")
     with (tmp_path / "cme/live/ES/roll_flips.csv").open("w") as f:
@@ -349,7 +353,7 @@ def test_two_folders_join_and_the_first_wins_a_minute(tmp_path):
     spec = parse_spec("raw/cme/cache+raw/cme/live 1m 2026-10-01..2026-10-31")
     assert spec.paths == ["cme/cache", "cme/live"]
     b = load_cme_minutes(tmp_path, spec, "ES")
-    assert list(b.close) == [1.5, 1.5, 3.0]
+    assert list(b.close) == [1.5, 1.5, 5.0]
     assert b.roll_days == {date(2026, 10, 16), date(2026, 10, 15)}
     with pytest.raises(DatasetError, match="1-minute"):
         load_cme_minutes(tmp_path, parse_spec("raw/cme/cache 5m 2026-10-01..2026-10-31"), "ES")
