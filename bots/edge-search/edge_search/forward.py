@@ -16,7 +16,14 @@ revision is recorded with every session. Each poll it:
   3. records it in the forward ledger (edge_forward_sessions). The database
      adds it to forward_sessions_observed, and refuses a session it can't
      admit: one before the forward start, not over yet, or more than 10†
-     days late (a gap stays a gap).
+     days late (a gap stays a gap);
+  4. reads the deployment's health (fks 030, edge_deployment_health): the
+     forward band and the CUSUM against the experiment's holdout. A breach
+     is the database's to act on: it retires the deployment in the same
+     transaction as the session that breached, and the runner goes idle.
+
+It keeps replaying once the deployment is live (fks 030): the model's
+sessions are what the monitor watches for decay.
 
 A day whose files aren't in the lake yet stops the scan until the next poll
 (the recorder writes days in order); a US exchange holiday, or a day whose
@@ -63,6 +70,8 @@ log = logging.getLogger("edge-forward")
 #: How late a session may still be recorded: fks 029's edge_forward_late_days().
 LATE_DAYS = 10
 FAMILIES = ("orb",)
+#: The stages whose sessions are recorded (fks 030: through live).
+RUN_STAGES = ("forward", "live")
 
 
 class ForwardError(ValueError):
@@ -114,6 +123,7 @@ class Deployment:
     observed: int
     family: str
     hypothesis: Hypothesis
+    retired_reason: str | None = None
 
     @property
     def symbols(self) -> list[str]:
@@ -251,6 +261,23 @@ def render_metrics(doc: dict) -> str:
     lines += g("fks_forward_last_scan_gaps", "Days the last scan passed as gaps (too late to record).",
                scan_out.get("gaps", 0))
     lines += g("fks_forward_error", "1 when the last scan failed.", 1 if doc.get("error") else 0)
+    lines += g("fks_forward_retired", "1 once the deployment is retired (by the monitor or by hand).",
+               1 if doc.get("stage") == "retired" else 0)
+    health = doc.get("health") or {}
+    if health.get("applies"):
+        band, cusum = health.get("band") or {}, health.get("cusum") or {}
+
+        def num(v):
+            return "NaN" if v is None else v
+
+        lines += g("fks_forward_band_mean", "Mean of the forward window's sessions so far.", num(band.get("mean")))
+        lines += g("fks_forward_band_floor", "The band's floor for the declared window (the holdout's 5th pct).",
+                   num(band.get("floor")))
+        lines += g("fks_forward_band_failed", "1 when the forward window failed the band.",
+                   1 if band.get("verdict") == "fail" else 0)
+        lines += g("fks_forward_cusum", "The monitor's CUSUM; it alarms above fks_forward_cusum_h.",
+                   num(cusum.get("value")))
+        lines += g("fks_forward_cusum_h", "The CUSUM's alarm threshold.", num(cusum.get("h")))
     return "\n".join(lines) + "\n"
 
 
@@ -289,7 +316,7 @@ def load_deployment(conn, deployment_id: int) -> Deployment:
     row = conn.execute(
         "SELECT d.id, d.experiment_id, d.symbol, d.stage, d.params_snapshot, d.since, "
         "       d.forward_sessions_required, d.forward_sessions_observed, "
-        "       e.config_fingerprint, e.hypothesis_id "
+        "       e.config_fingerprint, e.hypothesis_id, d.retired_reason "
         "FROM edge_deployments d JOIN edge_experiments e ON e.id = d.experiment_id "
         "WHERE d.id = %s",
         (deployment_id,),
@@ -305,7 +332,17 @@ def load_deployment(conn, deployment_id: int) -> Deployment:
     params = row[4] if isinstance(row[4], dict) else json.loads(row[4])
     return Deployment(id=int(row[0]), experiment_id=int(row[1]), symbol=row[2], stage=row[3],
                       params=params, since=row[5], required=row[6], observed=int(row[7]),
-                      family=str(row[8]).split(":", 1)[0], hypothesis=h)
+                      family=str(row[8]).split(":", 1)[0], hypothesis=h, retired_reason=row[10])
+
+
+def load_health(conn, deployment_id: int) -> dict | None:
+    """edge_deployment_health (fks 030), or None before 030 is applied."""
+    from . import db
+
+    if not db.has_function(conn, "edge_deployment_health"):
+        return None
+    (doc,) = conn.execute("SELECT edge_deployment_health(%s)", (deployment_id,)).fetchone()
+    return json.loads(doc) if isinstance(doc, str) else doc
 
 
 def last_recorded(conn, deployment_id: int) -> date | None:
@@ -370,14 +407,20 @@ def main() -> int:
                 dep.check()
                 status.update(stage=dep.stage, symbol=dep.symbol, family=dep.family,
                               required=dep.required, observed=dep.observed)
-                if dep.stage != "forward":
-                    status.update(phase=f"idle: the deployment is at {dep.stage}", error=None)
+                if dep.stage not in RUN_STAGES:
+                    status.update(phase=f"idle: the deployment is at {dep.stage}", error=None,
+                                  health=load_health(conn, dep.id))
                 else:
                     today = datetime.now(timezone.utc).date()
                     out = scan(dep, cfg.lake_dir, today, last_recorded(conn, dep.id),
                                make_recorder(conn, dep, cfg))
                     dep = load_deployment(conn, cfg.deployment_id)
-                    status.update(phase="watching", observed=dep.observed, last_scan=out, error=None,
+                    if dep.stage == "retired":
+                        log.warning("deployment %d was retired: %s", dep.id, dep.retired_reason)
+                    status.update(phase="watching" if dep.stage in RUN_STAGES
+                                  else f"idle: the deployment is at {dep.stage}",
+                                  stage=dep.stage, observed=dep.observed, last_scan=out,
+                                  health=load_health(conn, dep.id), error=None,
                                   scanned_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         except ForwardError as e:
             log.error("%s", e)

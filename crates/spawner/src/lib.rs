@@ -21,6 +21,8 @@ pub mod coverage;
 pub mod db;
 pub mod docker_client;
 pub mod edge_decay;
+#[cfg(feature = "db")]
+pub mod edge_monitor;
 pub mod edges;
 pub mod error;
 pub mod instances;

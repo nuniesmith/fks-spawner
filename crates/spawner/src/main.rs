@@ -322,6 +322,33 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ── Background: the edge monitor's deliveries ───────────────────────────────
+    // Postgres judges every recorded forward/live session (fks 030) and
+    // retires a deployment that breaches; this sends each retirement as an
+    // edge_decay notification. Supervised: a dead loop would retire edges
+    // silently. See crate::edge_monitor.
+    #[cfg(feature = "db")]
+    if state.store.is_some() {
+        let monitor_state = state.clone();
+        tokio::spawn(async move {
+            spawner::task_supervisor::supervise(
+                "edge-monitor-delivery",
+                || false,
+                move || {
+                    let state = monitor_state.clone();
+                    async move {
+                        spawner::edge_monitor::run(state).await;
+                    }
+                },
+            )
+            .await;
+        });
+        info!(
+            poll_secs = spawner::edge_monitor::POLL.as_secs(),
+            "edge-monitor delivery started"
+        );
+    }
+
     // ── Background: weekly edge-backtest scheduler (EDGE-DECAY DETECTION) ────────
     // On a weekly cadence (default Sun 16:00 UTC — before the advisor's Sun
     // 18:00 ET report) it fires each ACTIVE, containerized edge's backtest

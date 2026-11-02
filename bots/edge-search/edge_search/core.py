@@ -33,6 +33,7 @@ log = logging.getLogger("edge-search")
 
 
 def experiment_row(h, spec, result: Result, study: str, finished: datetime) -> dict:
+    hold = [float(x) for x in result.best.holdout]
     return {
         "study_name": study,
         "config_fingerprint": result.fingerprint,
@@ -59,6 +60,11 @@ def experiment_row(h, spec, result: Result, study: str, finished: datetime) -> d
         # fks 029: the selection is on record, and a deployment trades
         # exactly it (params_snapshot = selected_params).
         "selected_params": result.best.params,
+        # fks 030: the selection's holdout sessions, in order: what its
+        # forward and live sessions are judged against (the monitor).
+        # An empty series, or one with a non-finite session, is left
+        # unrecorded, and that experiment can't go forward.
+        "holdout_returns": hold if hold and np.isfinite(hold).all() else None,
     }
 
 
@@ -134,6 +140,10 @@ def main() -> int:
                 log.warning("fks 029 isn't applied: the selection isn't recorded, so this "
                             "search can't be deployed")
                 row.pop("selected_params")
+            if not db.has_column(conn, "edge_experiments", "holdout_returns"):
+                log.warning("fks 030 isn't applied: the holdout series isn't recorded, so "
+                            "this search can't go forward")
+                row.pop("holdout_returns")
             write_artifacts(cfg.data_dir / study, result, row)
             new_id = db.write_experiment(conn, row)
     except (SearchError, DatasetError) as e:

@@ -1435,8 +1435,12 @@ impl BotRunStore {
                         hypothesis_id, registered_at, tuned_params, n_trials, train_days, \
                         test_days, folds, holdout_folds, selection_score, holdout_score, \
                         baseline_holdout_score, overfit_gap, selection_trades, holdout_trades, \
-                        verdict, verdict_reasons, outcome, finished_at, created_at \
-                 FROM edge_experiments \
+                        verdict, verdict_reasons, outcome, finished_at, created_at, \
+                        to_jsonb(e) -> 'selected_params' AS selected_params, \
+                        CASE WHEN jsonb_typeof(to_jsonb(e) -> 'holdout_returns') = 'array' \
+                             THEN jsonb_array_length(to_jsonb(e) -> 'holdout_returns') \
+                        END AS holdout_sessions \
+                 FROM edge_experiments e \
                  ORDER BY COALESCE(finished_at, created_at) DESC LIMIT 500",
                 "COALESCE(finished_at, created_at) DESC",
             ),
@@ -1471,7 +1475,72 @@ impl BotRunStore {
             .map_err(map_sqlx)?;
             board.insert(key.into(), list);
         }
+        // fks 030: each deployment's health (the forward band and the CUSUM),
+        // by id. Absent before 030 is applied.
+        let monitor: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'edge_deployment_health')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if monitor {
+            let health: serde_json::Value = sqlx::query_scalar(
+                "SELECT COALESCE(jsonb_object_agg(id::text, edge_deployment_health(id)), '{}'::jsonb) \
+                 FROM (SELECT id FROM edge_deployments ORDER BY updated_at DESC LIMIT 500) d",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+            board.insert("health".into(), health);
+        }
         Ok(serde_json::Value::Object(board))
+    }
+
+    /// What the edge monitor (fks 030) did and the spawner hasn't delivered,
+    /// oldest first. Empty before 030 is applied.
+    pub async fn undelivered_monitor_events(
+        &self,
+    ) -> Result<Vec<crate::edge_monitor::MonitorEvent>, SpawnerError> {
+        let table: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('edge_monitor_events')::text")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+        if table.is_none() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT m.id, m.deployment_id, m.kind, m.reason, d.symbol \
+             FROM edge_monitor_events m JOIN edge_deployments d ON d.id = m.deployment_id \
+             WHERE m.delivered_at IS NULL ORDER BY m.id LIMIT 100",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::edge_monitor::MonitorEvent {
+                    id: r.try_get("id").map_err(map_sqlx)?,
+                    deployment_id: r.try_get("deployment_id").map_err(map_sqlx)?,
+                    kind: r.try_get("kind").map_err(map_sqlx)?,
+                    reason: r.try_get("reason").map_err(map_sqlx)?,
+                    symbol: r.try_get("symbol").map_err(map_sqlx)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Record that a monitor event was dispatched (030 lets it be set once).
+    pub async fn mark_monitor_event_delivered(&self, id: i64) -> Result<(), SpawnerError> {
+        sqlx::query(
+            "UPDATE edge_monitor_events SET delivered_at = now() \
+             WHERE id = $1 AND delivered_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(())
     }
 
     /// Register a hypothesis (stage 2). `registered_at` is the database's
