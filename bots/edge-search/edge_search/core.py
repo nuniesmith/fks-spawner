@@ -79,6 +79,9 @@ def write_artifacts(folder: Path, result: Result, row: dict) -> None:
         "trials_total_for_edge": result.trials_total,
         "deflated_sharpe": result.dsr,
         "random_beaten_share": result.random_share,
+        "evidence": result.evidence,
+        "holdout_trades_by_symbol": result.holdout_trades_by_symbol,
+        "regimes": result.regimes,
         "clauses": [{"id": c.id, "ok": c.ok, "text": c.text} for c in result.verdict.clauses],
         "thresholds": THRESHOLDS,
     }

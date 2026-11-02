@@ -1483,8 +1483,8 @@ impl BotRunStore {
     ) -> Result<serde_json::Value, SpawnerError> {
         sqlx::query_scalar(
             "INSERT INTO edge_hypotheses (edge_id, idea, symbols, dataset, holdout_share, params, \
-                                          baseline, metric, costs, registered_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                                          baseline, metric, costs, registered_by, evidence) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              RETURNING to_jsonb(edge_hypotheses.*)",
         )
         .bind(edge_id)
@@ -1497,6 +1497,7 @@ impl BotRunStore {
         .bind(&h.metric)
         .bind(&h.costs)
         .bind(h.registered_by.as_deref())
+        .bind(&h.evidence)
         .fetch_one(&self.pool)
         .await
         .map_err(map_ladder)

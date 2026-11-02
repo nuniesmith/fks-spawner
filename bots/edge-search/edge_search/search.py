@@ -26,7 +26,7 @@ from datetime import datetime
 import numpy as np
 
 from . import engine
-from .config import BASELINES, MAX_TRIALS, METRICS, THRESHOLDS
+from .config import BASELINES, EVIDENCE_PATHS, MAX_TRIALS, METRICS, THRESHOLDS
 from .dataset import Bars, DatasetSpec, align, coverage
 from .verdict import (
     Verdict,
@@ -55,6 +55,8 @@ class Hypothesis:
     metric: str
     costs: dict
     registered_at: datetime
+    # fks 028: declared at registration and frozen. 'trades' = U4 as written.
+    evidence: str = "trades"
 
 
 @dataclass
@@ -95,6 +97,46 @@ class Result:
     times: np.ndarray
     holdout_start: int
     baseline_pool: np.ndarray
+    evidence: str = "trades"
+    holdout_trades_by_symbol: dict | None = None
+    regimes: dict | None = None
+
+
+def regimes(closes: np.ndarray, hold: int, n: int, bar_ms: int, metric: str,
+            bars_per_year: float, selection: np.ndarray, baseline: np.ndarray) -> dict:
+    """The holdout split by market regime, for the record (not a clause).
+
+    Holdout bar t earns the return of a position decided at t-1, so its regime
+    is known at t-1 too: "up" when the coins' mean trailing return over
+    `regime_lookback_days`, from t-1-L to t-1, is positive; "down" otherwise.
+    Coins not listed yet are left out of the mean; a bar with no coin that
+    has L bars of history is "unlabeled". Each regime is scored with the
+    hypothesis's metric, for the selection and the baseline alike.
+    """
+    days = THRESHOLDS["regime_lookback_days"]
+    lb = max(1, round(days * 86_400_000 / bar_ms))
+    labels: list[str] = []
+    for t in range(hold, n):
+        a, b = t - 1, t - 1 - lb
+        if b < 0:
+            labels.append("unlabeled")
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r = closes[:, a] / closes[:, b] - 1.0
+        r = r[np.isfinite(r)]
+        labels.append("unlabeled" if r.size == 0 else ("up" if float(r.mean()) > 0 else "down"))
+    lab = np.array(labels)
+    out: dict = {"lookback_days": days}
+    for name in ("up", "down"):
+        mask = lab == name
+        k = int(mask.sum())
+        out[name] = {
+            "bars": k,
+            "selection": engine.score(metric, selection[mask], bars_per_year) if k > 1 else None,
+            "baseline": engine.score(metric, baseline[mask], bars_per_year) if k > 1 else None,
+        }
+    out["unlabeled_bars"] = int((lab == "unlabeled").sum())
+    return out
 
 
 def metric_of(h: Hypothesis) -> str:
@@ -119,6 +161,7 @@ def fingerprint(family: str, h: Hypothesis, spec: DatasetSpec, names: list[str],
             "metric": metric_of(h),
             "baseline": h.baseline,
             "thresholds": THRESHOLDS["version"],
+            "evidence": h.evidence,
         },
         sort_keys=True,
     )
@@ -136,6 +179,8 @@ def run_search(
     progress=None,
 ) -> Result:
     metric = metric_of(h)
+    if h.evidence not in EVIDENCE_PATHS:
+        raise SearchError(f"evidence {h.evidence!r} isn't one this job judges: {list(EVIDENCE_PATHS)}")
     if h.baseline not in BASELINES:
         raise SearchError(f"baseline {h.baseline!r} isn't one this job computes: {list(BASELINES)}")
     try:
@@ -220,9 +265,22 @@ def run_search(
           f"registered {h.registered_at:%Y-%m-%d %H:%M} UTC, before the search")
     v.add("U3", holdout_score > baseline_holdout,
           f"holdout {holdout_score:.4g} vs {h.baseline} {baseline_holdout:.4g}")
-    v.add("U4", holdout_trades >= THRESHOLDS["min_holdout_trades"],
-          f"{holdout_trades} holdout trades over {len(series)} symbols "
-          f"(need {THRESHOLDS['min_holdout_trades']})")
+    per_symbol = {b.symbol: engine.trades(best_pos[i:i + 1], hold, n) for i, b in enumerate(series)}
+    if h.evidence == "low-frequency":
+        # EDGE_PROCESS §3–4: a low-frequency edge can't reach 30 trades on any
+        # history; it must instead hold with ONE parameter set across many
+        # coins, every one of which trades in the holdout.
+        need_t = THRESHOLDS["low_frequency_min_holdout_trades"]
+        need_s = THRESHOLDS["low_frequency_min_symbols"]
+        traded = [s for s, k in per_symbol.items() if k > 0]
+        v.add("U4", holdout_trades >= need_t and len(traded) >= need_s and len(traded) == len(series),
+              f"low-frequency path: {holdout_trades} holdout trades pooled (need {need_t}); "
+              f"{len(traded)} of {len(series)} symbols traded (need {need_s}, and all of them): "
+              + ", ".join(f"{s} {k}" for s, k in per_symbol.items()))
+    else:
+        v.add("U4", holdout_trades >= THRESHOLDS["min_holdout_trades"],
+              f"{holdout_trades} holdout trades over {len(series)} symbols "
+              f"(need {THRESHOLDS['min_holdout_trades']})")
     retention = THRESHOLDS["overfit_retention"]
     keeps = (best.selection > baseline_selection and holdout_score > baseline_holdout
              and holdout_score >= retention * best.selection)
@@ -261,6 +319,8 @@ def run_search(
     v.add("U9", not edge, "no parameter on its range's edge" if not edge
           else "on the range's edge: " + ", ".join(edge))
 
+    regime_split = regimes(closes, hold, n, bar_ms, metric, bars_per_year, holdout, base_hold[hold:])
+
     return Result(
         family=family,
         names=names,
@@ -286,4 +346,7 @@ def run_search(
         times=times,
         holdout_start=hold,
         baseline_pool=base_hold,
+        evidence=h.evidence,
+        holdout_trades_by_symbol=per_symbol,
+        regimes=regime_split,
     )

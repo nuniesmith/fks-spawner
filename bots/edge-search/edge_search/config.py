@@ -29,7 +29,7 @@ from typing import Mapping
 
 THRESHOLDS = {
     # EDGE_PROCESS §9 proposals, 2026-10-26. Bump the version on any change.
-    "version": "edge-process-2026-10-26-proposed",
+    "version": "edge-process-2026-11-02-proposed",
     # U1: share of the window's bars present, per symbol.
     "min_coverage": 0.99,
     # U4: holdout trades, pooled over the symbols.
@@ -43,7 +43,18 @@ THRESHOLDS = {
     "random_strategies": 1000,
     # The walk-forward over the training part.
     "folds": 4,
+    # The low-frequency path (a hypothesis with evidence = 'low-frequency',
+    # fks 028): U4 becomes a pooled floor over many coins with one shared
+    # parameter set. Both numbers are † proposals (EDGE_PROCESS §9).
+    "low_frequency_min_holdout_trades": 10,
+    "low_frequency_min_symbols": 3,
+    # The regime split, reported for every search: a holdout bar is "up" when
+    # the coins' mean trailing return over this many days, known at the bar
+    # before, is positive. Report only, not a clause.
+    "regime_lookback_days": 200,
 }
+
+EVIDENCE_PATHS = ("trades", "low-frequency")
 
 # The metrics a hypothesis may name (EDGE_PROCESS §2.5), all net of costs.
 METRICS = {
