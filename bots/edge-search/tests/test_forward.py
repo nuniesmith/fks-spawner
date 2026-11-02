@@ -76,7 +76,7 @@ def test_an_observation_names_the_files_it_read(lake):
     dep = deployment()
     out = forward.observe(dep, lake, DAYS[2])
     refs = out.observation.data_ref
-    assert [r["path"].split("/")[3] for r in refs] == ["ES", "NQ", "MGC"]
+    assert [r["path"].split("/")[3] for r in refs] == ["ES", "NQ", "GC"]
     p = lake / refs[0]["path"]
     assert refs[0]["sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
     trades = out.observation.trade["trades"]
@@ -94,7 +94,7 @@ def test_weekends_holidays_and_missing_days(lake):
 def test_a_flat_session_returns_exactly_zero(tmp_path):
     folder = tmp_path / "cme" / "massive" / "cme"
     day = date(2026, 11, 4)
-    for root, n in (("ES", 390), ("NQ", 390), ("MGC", 310)):
+    for root, n in (("ES", 390), ("NQ", 390), ("GC", 310)):
         write_recorder_days(folder, T.minute_bars(root, {day: T.orb_session(n=n)}))
     out = forward.observe(deployment(), tmp_path, day)
     assert out.kind == "session" and not out.observation.traded

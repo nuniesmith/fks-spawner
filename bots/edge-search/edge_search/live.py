@@ -262,7 +262,7 @@ def choose(order: list[str], prev_volume: Mapping[str, float]) -> str | None:
 
 
 #: When CME stops trading on an early-close day (New York time), by root.
-EARLY_CLOSE = {"ES": time(13, 15), "NQ": time(13, 15), "GC": time(13, 45), "MGC": time(13, 45)}
+EARLY_CLOSE = {"ES": time(13, 15), "NQ": time(13, 15), "GC": time(13, 45)}
 
 
 def early_close_days(y: int) -> set[date]:

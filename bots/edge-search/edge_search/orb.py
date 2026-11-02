@@ -79,7 +79,10 @@ CONTRACTS = {
     "NQ": Contract("NQ", 0.25, 20.0, *_EQ),
     "MNQ": Contract("NQ", 0.25, 2.0, *_EQ),
     "GC": Contract("GC", 0.10, 100.0, *_GOLD),
-    "MGC": Contract("MGC", 0.10, 10.0, *_GOLD),
+    # Micro gold trades on gold's prices, like MES/MNQ on ES/NQ: the same
+    # underlying and contract months, one tenth the size. The Databento
+    # decade (2014-24) has no MGC series at all, and GC's is the liquid one.
+    "MGC": Contract("GC", 0.10, 10.0, *_GOLD),
 }
 
 

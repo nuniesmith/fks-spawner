@@ -14,7 +14,9 @@ a month; rows are merged by open time.
 CME futures folders (raw/cme/..., read by the `orb` family) hold one
 stitched 1-minute series per root instead: <ROOT>/1m/<ROOT>-1m-<period>.csv.gz
 (open_time_ms,open,high,low,close,volume), with <ROOT>/rolls.csv and
-<ROOT>/roll_flips.csv naming the days a series changes contract. Several
+<ROOT>/roll_flips.csv naming the days a series changes contract, and
+<ROOT>/excluded_days.csv (day_utc, reason) the days its vendor flagged as
+degraded (Databento): none of those days is traded. Several
 folders can be joined with '+' (the imported cache, then the recorder that
 keeps it current): for a UTC day in more than one, the FIRST folder wins the
 whole day. Per minute, a partial day in one folder could be completed from
@@ -224,6 +226,7 @@ def load_cme_minutes(lake: Path, spec: DatasetSpec, root: str) -> MinuteBars:
         found = found or bool(files)
         roll_days |= _day_column(folder / "rolls.csv", "day")
         roll_days |= _day_column(folder / "roll_flips.csv", "day_utc")
+        roll_days |= _day_column(folder / "excluded_days.csv", "day_utc")
         for f in files:
             try:
                 a = _read_minutes(f)

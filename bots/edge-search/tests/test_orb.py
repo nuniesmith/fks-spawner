@@ -181,6 +181,7 @@ def test_micro_contracts_trade_the_full_size_series_with_their_own_point_value()
     data = orb.prepare(["MES"], [minute_bars("ES", {d: s})], spec_for([d]), COSTS)
     (t,) = orb.trades_for(data, {"orb_minutes": 15, "target_r": 2.0, "exit": "target"})
     assert orb.contract("MES").root == "ES"
+    assert orb.contract("MGC").root == "GC"  # micro gold on gold's prices (Databento has no MGC)
     assert t.ret == pytest.approx((4990.0 - 0.25 - 5001.25) / 5001.25 - 4.0 / (5001.25 * 5))
 
 
@@ -237,7 +238,7 @@ def series_for(days, momentum):
     return [
         minute_bars("ES", market(days, 1, momentum)),
         minute_bars("NQ", market(days, 2, momentum, base=20000.0)),
-        minute_bars("MGC", market(days, 3, momentum, n=310, base=3000.0)),
+        minute_bars("GC", market(days, 3, momentum, n=310, base=3000.0)),
     ]
 
 
@@ -296,7 +297,7 @@ def test_an_orb_search_that_cant_run_as_registered_says_why(over, needle):
     days = DAYS[:60]
     series = series_for(days, 0.0)
     if len(h.symbols) == 3 and h.symbols[-1] == "CL":
-        series[-1] = minute_bars("MGC", market(days, 3, 0.0, n=310, base=3000.0))
+        series[-1] = minute_bars("GC", market(days, 3, 0.0, n=310, base=3000.0))
     with pytest.raises(search.SearchError, match=needle):
         search.run_search(h, "orb", window(days), series, prior_trials=0, now=NOW)
 
@@ -359,3 +360,14 @@ def test_two_folders_join_and_the_first_wins_a_whole_day(tmp_path):
         load_cme_minutes(tmp_path, parse_spec("raw/cme/cache 5m 2026-10-01..2026-10-31"), "ES")
     with pytest.raises(DatasetError, match="one folder"):
         load_bars(tmp_path, spec, "ES")
+
+
+def test_vendor_flagged_degraded_days_are_not_traded(tmp_path):
+    folder = tmp_path / "cme" / "databento" / "ES"
+    (folder / "1m").mkdir(parents=True)
+    with gzip.open(folder / "1m" / "ES-1m-2026-10-01.csv.gz", "wt") as f:
+        f.write(f"open_time_ms,open,high,low,close,volume\n{session_start_ms(date(2026, 10, 1))},1,1,1,1,1\n")
+    (folder / "excluded_days.csv").write_text("day_utc,reason\n2026-10-01,degraded (databento)\n")
+    b = load_cme_minutes(tmp_path, parse_spec("raw/cme/databento 1m 2026-09-30..2026-10-02"), "ES")
+    assert date(2026, 10, 1) in b.roll_days
+

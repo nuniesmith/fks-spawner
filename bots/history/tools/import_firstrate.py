@@ -21,9 +21,10 @@ the search reads it like any CME folder (`raw/cme/firstrate 1m A..B`):
     _manifest.jsonl                           one line per file written, and
                                               one per source file read (sha256)
 
-THE ROLL, the recorder's rule (cme_history/stitch.py): a UTC day follows
-the contract with the most volume on the previous trading day (known before
-the day starts), never moving back to an earlier contract month. On a day
+THE ROLL, the recorder's rule (tools/contracts.py, as cme_history does it):
+a UTC day follows the contract with the most volume on the previous WEEKDAY
+(known before the day starts), never moving back to an earlier contract
+month. On a day
 the followed contract has no bars any more (it expired), the most-traded
 later one is taken. A roll day is listed in rolls.csv, and the search
 doesn't trade a listed day.
@@ -44,44 +45,37 @@ decides what is searched; this tool imports what it is given.
 from __future__ import annotations
 
 import collections
-import csv
-import gzip
 import hashlib
 import io
 import json
 import re
 import sys
 import zipfile
-from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# The importers' shared code sits beside this file (run as a script, with -I,
+# its folder isn't on sys.path by itself).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from contracts import (  # noqa: E402
+    HEADER,
+    MONTHS,
+    Contract,
+    ImportError_,
+    Row,
+    choose_days,
+    csv_gz,
+    gap,
+    new_root_folder,
+    utc_day,
+    write_rolls,
+)
+
 EASTERN = ZoneInfo("America/New_York")
-MONTHS = "FGHJKMNQUVXZ"
 NAME = re.compile(r"^(?P<root>[A-Z0-9]{1,4})_(?P<month>[FGHJKMNQUVXZ])(?P<yy>\d{2})_1min\.(txt|csv)$")
-HEADER = ["open_time_ms", "open", "high", "low", "close", "volume"]
-
-Row = tuple[int, float, float, float, float, float]
-
-
-class ImportError_(ValueError):
-    """The input can't be imported as it is; the message says where."""
-
-
-@dataclass(frozen=True)
-class Contract:
-    root: str
-    month: int  # 1..12
-    year: int
-
-    @property
-    def code(self) -> str:
-        return f"{self.root}{MONTHS[self.month - 1]}{self.year % 100:02d}"
-
-    @property
-    def order(self) -> tuple[int, int]:
-        return (self.year, self.month)
+__all__ = ["HEADER", "MONTHS", "Contract", "ImportError_", "run", "parse", "utc_ms", "contract_of", "stitch"]
 
 
 def contract_of(name: str) -> Contract:
@@ -147,58 +141,20 @@ def sources(paths: list[Path]):
             yield p.name, data.decode(), digest, p
 
 
-def utc_day(t: int) -> date:
-    return datetime.fromtimestamp(t / 1000, UTC).date()
-
-
 def stitch(by_contract: dict[Contract, list[Row]]) -> tuple[dict[date, tuple[Contract, list[Row]]], list[dict]]:
-    """One contract per UTC day, by the previous trading day's volume, never back."""
+    """One contract per UTC day (contracts.choose_days), with its rows."""
     days: dict[Contract, dict[date, list[Row]]] = {}
     for k, rows in by_contract.items():
         per: dict[date, list[Row]] = collections.defaultdict(list)
         for r in rows:
             per[utc_day(r[0])].append(r)
         days[k] = per
-    order = sorted(by_contract, key=lambda k: k.order)
-    all_days = sorted({d for per in days.values() for d in per})
-    chosen: dict[date, tuple[Contract, list[Row]]] = {}
-    rolls: list[dict] = []
-    current: Contract | None = None
-    prev: date | None = None
-    for d in all_days:
-        pool = order[order.index(current):] if current is not None else order
-        trading = [k for k in pool if days[k].get(d)]
-        if not trading:
-            prev = d
-            continue
-        vol = {k: sum(r[5] for r in days[k].get(prev, [])) for k in trading} if prev else {}
-        best = max(trading, key=lambda k: (vol.get(k, 0.0), -trading.index(k)))
-        if vol.get(best, 0.0) <= 0:
-            best = current if current in trading else trading[0]
-        if current is not None and best != current:
-            rolls.append({"day": d.isoformat(), "from_contract": current.code, "to_contract": best.code,
-                          "gap_points": gap(days[current].get(d, []), days[best][d]), "detected_by": "volume"})
-        current = best
-        chosen[d] = (best, days[best][d])
-        prev = d
-    return chosen, rolls
-
-
-def gap(old: list[Row], new: list[Row]) -> float | str:
-    closes = {r[0]: r[4] for r in old}
-    for r in new:
-        if r[0] in closes:
-            return round(r[4] - closes[r[0]], 6)
-    return ""
-
-
-def csv_gz(rows: list[Row]) -> bytes:
-    buf = io.StringIO()
-    w = csv.writer(buf, lineterminator="\n")
-    w.writerow(HEADER)
-    for r in rows:
-        w.writerow([r[0], *(repr(float(x)) for x in r[1:])])
-    return gzip.compress(buf.getvalue().encode(), mtime=0)
+    volumes = {k: {d: sum(r[5] for r in rows) for d, rows in per.items()} for k, per in days.items()}
+    chosen, rolls = choose_days(volumes)
+    out = {d: (k, days[k][d]) for d, k in chosen.items()}
+    return out, [{"day": d.isoformat(), "from_contract": a.code, "to_contract": b.code,
+                  "gap_points": gap(days[a].get(d, []), days[b][d]), "detected_by": "volume"}
+                 for d, a, b in rolls]
 
 
 def run(out: Path, paths: list[Path]) -> dict:
@@ -220,10 +176,7 @@ def run(out: Path, paths: list[Path]) -> dict:
     summary: dict = {}
     for root, contracts in sorted(by_root.items()):
         chosen, rolls = stitch(contracts)
-        folder = out / root
-        if folder.exists():
-            raise ImportError_(f"{folder} exists: the lake is append-only, import into a new folder")
-        (folder / "1m").mkdir(parents=True)
+        folder = new_root_folder(out, root)
         for d, (k, rows) in sorted(chosen.items()):
             path = folder / "1m" / f"{root}-1m-{d.isoformat()}.csv.gz"
             data = csv_gz(rows)
@@ -231,11 +184,7 @@ def run(out: Path, paths: list[Path]) -> dict:
             manifest.append({"path": str(path.relative_to(out)), "sha256": hashlib.sha256(data).hexdigest(),
                              "bytes": len(data), "rows": len(rows), "symbol": root, "contract": k.code,
                              "dataset": "bars", "imported_at": now})
-        with (folder / "rolls.csv").open("w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["day", "from_contract", "to_contract", "gap_points", "detected_by"],
-                               lineterminator="\n")
-            w.writeheader()
-            w.writerows(rolls)
+        write_rolls(folder, rolls)
         days = sorted(chosen)
         summary[root] = {"contracts": len(contracts), "days": len(days), "rolls": len(rolls),
                          "first": days[0].isoformat() if days else None,
