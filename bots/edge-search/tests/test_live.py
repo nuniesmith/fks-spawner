@@ -198,3 +198,101 @@ def test_a_signal_is_recorded_then_sent_once_and_marked_delivered():
     ev2 = live.Event("entry", "MES", date(2026, 11, 4), 0, 1, 1.0, 0.5, 2.0, "x")
     live.say(ledger, cfg, ev2, "ESZ6", lambda t: False)
     assert ledger.delivered == {1}
+
+
+# ── Safety (2026-11-02 review) ───────────────────────────────────────────────
+
+
+def test_a_late_signal_says_so_and_not_to_chase_it():
+    cfg = live.load_config({"EDGE_DEPLOYMENT_ID": "4", "FKS_DB_URL": "x", "MASSIVE_API_KEY": "k",
+                            "FKS_CODE_REVISION": "abc"})
+    bar = 1_793_799_000_000
+    ev = live.Event("entry", "MES", date(2026, 11, 4), bar, 1, 6012.25, 5998.0, 6040.75, "close beyond")
+    ledger, sent = Ledger(), []
+    # Said 75 minutes after its bar closed: LATE, with the advice, and noted in the ledger.
+    assert live.say(ledger, cfg, ev, "ESZ6", lambda t: sent.append(t) or True, now_ms=bar + 60_000 + 75 * 60_000)
+    assert sent[0].startswith("[LIVE] LATE by 75 min: MES (ESZ6) ENTER LONG ~6012.25")
+    assert sent[0].endswith("For the record: don't chase it.")
+    # On time (the bar just closed): no tag.
+    ev2 = live.Event("range", "MES", date(2026, 11, 5), bar, reason="15-minute range")
+    live.say(ledger, cfg, ev2, "ESZ6", lambda t: sent.append(t) or True, now_ms=bar + 61_000)
+    assert "LATE" not in sent[1]
+    exit_ev = live.Event("exit", "MES", date(2026, 11, 6), bar, 1, 6040.75, 5998.0, 6040.75, "the target")
+    live.say(ledger, cfg, exit_ev, "ESZ6", lambda t: sent.append(t) or True, now_ms=bar + 20 * 60_000)
+    assert sent[2].endswith("If you're still in, the model is out.")
+
+
+def test_early_closes_block_the_equity_session_not_gold():
+    # 2026: Thanksgiving Nov 26 -> Friday Nov 27; Christmas Eve is a Thursday.
+    assert date(2026, 11, 27) in live.early_close_days(2026)
+    assert date(2026, 12, 24) in live.early_close_days(2026)
+    assert date(2026, 7, 3) not in live.early_close_days(2026)  # a Friday: the observed holiday
+    assert date(2025, 7, 3) in live.early_close_days(2025)  # a Thursday
+    assert date(2022, 12, 24) not in live.early_close_days(2022)  # a Saturday
+    m = FakeMassive({("ESZ6", date(2026, 11, 25)): 900, ("ESZ6", date(2026, 11, 24)): 900,
+                     ("MGCZ6", date(2026, 11, 25)): 900, ("MGCZ6", date(2026, 11, 24)): 900})
+    d = live.plan_day(m, ["MES", "MGC"], date(2026, 11, 27))
+    assert "early close (trading stops 13:15 ET" in d.blocked["MES"]
+    assert "MGC" not in d.blocked  # metals stop 13:45 ET, after gold's 13:30 session
+
+
+def test_a_named_channel_without_its_webhook_is_an_error():
+    base = {"EDGE_DEPLOYMENT_ID": "4", "FKS_DB_URL": "x", "MASSIVE_API_KEY": "k", "FKS_CODE_REVISION": "abc"}
+    assert live.config_problem(live.load_config(base)) is None  # no channel: record-only, by choice
+    named = live.load_config({**base, "SIGNAL_CHANNEL": "futures"})
+    assert "channel 'futures' was named but its webhook didn't arrive" in live.config_problem(named)
+    ok = live.load_config({**base, "SIGNAL_CHANNEL": "futures", "SIGNAL_DISCORD_WEBHOOK_URL": "https://x"})
+    assert live.config_problem(ok) is None
+    assert "fks_signal_error 1" in live.render_metrics({"config_error": "x"})
+    assert "fks_signal_error 0" in live.render_metrics({})
+
+
+def session_rows(day, upto=None):
+    return rows_of(T.series_for([day], 0.0002)[0], day)[:upto]
+
+
+class Dep:
+    def __init__(self, params):
+        self.symbols = ["ES"]
+        self.params = params
+        self.hypothesis = type("H", (), {"costs": T.COSTS})()
+
+
+def a_traded_day(params):
+    for day in DAYS:
+        b = T.series_for([day], 0.0002)[0]
+        want = searched("ES", b, day, params, T.COSTS)
+        if want is not None and want[3] > want[0] + 3:
+            return day, want
+    raise AssertionError("no session with a trade that lasts")
+
+
+def test_retired_with_a_trade_open_only_its_exit_is_said():
+    p = {"orb_minutes": 15, "target_r": 2.0, "exit": "trail"}
+    day, (e_min, side, entry, x_min, px) = a_traded_day(p)
+    rows = session_rows(day)
+    today = live.Day(day, {"ES": "ESZ6"}, {}, {"ESZ6": {r[0]: r for r in rows}})
+    cfg = live.load_config({"EDGE_DEPLOYMENT_ID": "4", "FKS_DB_URL": "x", "MASSIVE_API_KEY": "k",
+                            "FKS_CODE_REVISION": "abc"})
+    start, _ = live.session_bounds("ES", day)
+    ledger, sent = Ledger(), []
+    # Before the exit, with the entry said: one trade open.
+    mid = live.Day(day, {"ES": "ESZ6"}, {}, {"ESZ6": {r[0]: r for r in rows[:e_min + 2]}})
+    out = live.step(ledger, cfg, Dep(p), mid, start + (e_min + 2) * 60_000, lambda t: sent.append(t) or True)
+    assert out["open"] == 1 and [k for _, _, k in ledger.rows] == ["range", "entry"]
+    # Retired: exits only. After the exit bar, the exit is said and nothing else.
+    out = live.step(ledger, cfg, Dep(p), today, start + (x_min + 1) * 60_000 + 1,
+                    lambda t: sent.append(t) or True, exits_only=True)
+    assert [k for _, _, k in ledger.rows] == ["range", "entry", "exit"] and out["open"] == 0
+
+
+def test_a_stale_feed_counts_only_inside_a_traded_session():
+    day = date(2026, 11, 4)
+    dep = Dep({"orb_minutes": 15, "target_r": 2.0, "exit": "trail"})
+    start, end = live.session_bounds("ES", day)
+    today = live.Day(day, {"ES": "ESZ6"}, {})
+    assert live.feed_stale(dep, today, start + 3_600_000, start + 3_600_000 - 200_000)  # 200 s, in session
+    assert not live.feed_stale(dep, today, start + 3_600_000, start + 3_600_000 - 60_000)  # a minute: fine
+    assert not live.feed_stale(dep, today, end + 3_600_000, end)  # after the close
+    blocked = live.Day(day, {"ES": "ESZ6"}, {"ES": "a roll day"})
+    assert not live.feed_stale(dep, blocked, start + 3_600_000, start)  # not traded today
