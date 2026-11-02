@@ -82,13 +82,21 @@ pub struct ParamSpec {
 }
 
 /// Costs in basis points: Kraken tier 1 is 40 maker, 80 taker
-/// (EDGE_PROCESS §2.5), plus a stated slippage.
+/// (EDGE_PROCESS §2.5), plus a stated slippage. A futures hypothesis (the
+/// search job's `orb` family) states per-contract costs instead, with the
+/// bps at 0: the job refuses one that sets both.
 #[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Costs {
     pub maker_bps: f64,
     pub taker_bps: f64,
     pub slippage_bps: f64,
+    /// Futures: commission per contract, round turn, in dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commission_usd_rt: Option<f64>,
+    /// Futures: slippage per side, in ticks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slippage_ticks: Option<f64>,
 }
 
 /// A hypothesis that passed validation, normalized for the INSERT.
@@ -253,6 +261,22 @@ pub fn validate_hypothesis(req: &HypothesisRequest) -> Result<ValidHypothesis, V
         if !(v.is_finite() && (0.0..=1000.0).contains(&v)) {
             errors.push(format!("costs.{name} must be between 0 and 1000 bps"));
         }
+    }
+    if let Some(v) = c.commission_usd_rt
+        && !(v.is_finite() && (0.0..=1000.0).contains(&v))
+    {
+        errors.push("costs.commission_usd_rt must be between 0 and 1000 dollars".to_string());
+    }
+    if let Some(v) = c.slippage_ticks
+        && !(v.is_finite() && (0.0..=100.0).contains(&v))
+    {
+        errors.push("costs.slippage_ticks must be between 0 and 100 ticks".to_string());
+    }
+    if c.commission_usd_rt.is_some() != c.slippage_ticks.is_some() {
+        errors.push(
+            "costs: a futures hypothesis states both commission_usd_rt and slippage_ticks"
+                .to_string(),
+        );
     }
 
     let registered_by = req
@@ -445,6 +469,36 @@ mod tests {
             "registered_by": "  jordan  "
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn futures_costs_are_optional_bounded_and_come_in_pairs() {
+        let mut h = hypothesis();
+        h.costs = serde_json::from_value(json!({
+            "maker_bps": 0, "taker_bps": 0, "slippage_bps": 0,
+            "commission_usd_rt": 1.5, "slippage_ticks": 1
+        }))
+        .unwrap();
+        let v = validate_hypothesis(&h).unwrap();
+        assert_eq!(v.costs["commission_usd_rt"], 1.5);
+        assert_eq!(v.costs["slippage_ticks"], 1.0);
+        // A crypto hypothesis's costs are stored as before: no null fields.
+        assert!(
+            validate_hypothesis(&hypothesis())
+                .unwrap()
+                .costs
+                .get("slippage_ticks")
+                .is_none()
+        );
+        h.costs.slippage_ticks = None;
+        let errs = validate_hypothesis(&h).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("both")), "{errs:?}");
+        h.costs.slippage_ticks = Some(-1.0);
+        let errs = validate_hypothesis(&h).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("slippage_ticks must be")),
+            "{errs:?}"
+        );
     }
 
     #[test]

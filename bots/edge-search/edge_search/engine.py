@@ -23,6 +23,9 @@ import numpy as np
 
 FAMILIES = {
     "trend-band": ("lookback", "band"),
+    # A session family (edge_search/orb.py): judged on a session grid, not
+    # through `positions`.
+    "orb": ("orb_minutes", "target_r", "exit"),
 }
 
 
@@ -89,6 +92,8 @@ def trend_band_positions(closes: np.ndarray, lookback: int, band: float) -> np.n
 def positions(family: str, closes: np.ndarray, params: dict) -> np.ndarray:
     if family == "trend-band":
         return trend_band_positions(closes, int(params["lookback"]), float(params["band"]))
+    if family == "orb":
+        raise FamilyError("orb trades sessions, not bar positions (edge_search/orb.py)")
     raise FamilyError(f"unknown family {family!r}; this job knows {sorted(FAMILIES)}")
 
 
