@@ -51,7 +51,9 @@ def render_metrics(doc: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def serve(status: Status, port: int) -> ThreadingHTTPServer:
+def serve(status, port: int, render=render_metrics) -> ThreadingHTTPServer:
+    """Serve `status` (anything with snapshot() -> dict); `render` turns
+    the snapshot into /metrics (the search's by default)."""
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):  # quiet
             pass
@@ -61,7 +63,7 @@ def serve(status: Status, port: int) -> ThreadingHTTPServer:
             if self.path == "/health":
                 body, ctype = json.dumps({"ok": True}).encode(), "application/json"
             elif self.path == "/metrics":
-                body, ctype = render_metrics(doc).encode(), "text/plain; version=0.0.4"
+                body, ctype = render(doc).encode(), "text/plain; version=0.0.4"
             elif self.path == "/status":
                 body, ctype = json.dumps(doc).encode(), "application/json"
             else:

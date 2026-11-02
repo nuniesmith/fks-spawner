@@ -1186,8 +1186,9 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         // A CTE, so psql prints the id and not the INSERT's command tag.
         pg.psql_scalar(&format!(
             "WITH ins AS (INSERT INTO edge_experiments (study_name, config_fingerprint, symbol, \
-             bar_minutes, n_trials, verdict, finished_at, hypothesis_id) \
-             VALUES ('{name}', 'fp-liq', 'BTCUSDT', 5, 40, '{verdict}', now(), {second}) \
+             bar_minutes, n_trials, verdict, finished_at, hypothesis_id, selected_params) \
+             VALUES ('{name}', 'fp-liq', 'BTCUSDT', 5, 40, '{verdict}', now(), {second}, \
+                     '{{\"threshold_usd\": 5000000}}') \
              RETURNING id) SELECT id FROM ins"
         ))
         .parse::<i64>()
@@ -1217,7 +1218,8 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
             experiment_id,
             account_id: account.to_string(),
             symbol: "BTCUSDT".to_string(),
-            params_snapshot: serde_json::json!({"threshold_usd": 5_000_000}),
+            // Left out: the experiment's selection is deployed (fks 029).
+            params_snapshot: None,
             execution: execution.map(str::to_string),
         })
         .expect("valid deployment")
@@ -1228,6 +1230,18 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         .expect("deployment");
     let good_id = good["id"].as_i64().expect("id");
     assert_eq!(good["stage"], "backtest");
+    assert_eq!(
+        good["params_snapshot"],
+        serde_json::json!({"threshold_usd": 5_000_000}),
+        "a deployment trades its experiment's selection"
+    );
+    // Parameters the search didn't select are refused (fks 029).
+    let mut untested = deployment(usable, "ladder-personal", None);
+    untested.params_snapshot = Some(serde_json::json!({"threshold_usd": 1}));
+    refused(
+        store.create_deployment(&untested).await,
+        "not what experiment",
+    );
     assert_eq!(good["execution"], "manual");
     let bad_id = store
         .create_deployment(&deployment(rejected, "ladder-personal", None))
@@ -1280,10 +1294,26 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         store.promote_deployment(good_id, Promotion::Live).await,
         "requires 20 forward session(s), only 0 observed",
     );
-    // The forward harness (not built yet) counts sessions; stand in for it.
+    // Writing the counter is the forgery fks 029 refuses: it is the forward
+    // ledger's row count.
+    let forged = sqlx::query("UPDATE edge_deployments SET forward_sessions_observed = 20 WHERE id = $1")
+        .bind(good_id)
+        .execute(&pool)
+        .await
+        .expect_err("a written counter must be refused");
+    assert!(forged.to_string().contains("counted from edge_forward_sessions"), "{forged}");
+    // Stand in for 20 days of the forward runner: the ledger's own admission
+    // rules (dates, lateness) are 029's suite; lifted here for a deployment
+    // promoted moments ago.
     pg.psql_scalar(&format!(
-        "WITH up AS (UPDATE edge_deployments SET forward_sessions_observed = 20 \
-         WHERE id = {good_id} RETURNING id) SELECT id FROM up"
+        "ALTER TABLE edge_forward_sessions DISABLE TRIGGER trg_edge_forward_sessions_admit; \
+         INSERT INTO edge_forward_sessions (deployment_id, session_date, symbol, traded, trade, \
+             session_return, data_ref, runner, code_version) \
+         SELECT {good_id}, current_date - g, 'BTCUSDT', FALSE, NULL, 0, \
+                '[{{\"path\": \"x\", \"sha256\": \"0\"}}]', 'test', 'test' \
+           FROM generate_series(1, 20) g; \
+         ALTER TABLE edge_forward_sessions ENABLE TRIGGER trg_edge_forward_sessions_admit; \
+         SELECT forward_sessions_observed FROM edge_deployments WHERE id = {good_id}"
     ));
     let live = store
         .promote_deployment(good_id, Promotion::Live)

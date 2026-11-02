@@ -58,6 +58,8 @@ jobs:
               with:
                   context: .
                   file: bots/edge-search/Dockerfile
+                  build-args: |
+                      REVISION=${{ github.sha }}
                   push: ${{ github.event_name == 'push' }}
                   tags: |
                       ghcr.io/nuniesmith/fks-bot-edge-search:latest

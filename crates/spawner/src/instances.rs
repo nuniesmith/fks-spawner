@@ -169,13 +169,6 @@ fn build(
     mode: Option<&str>,
     params: &Value,
 ) -> Result<InstancePlan, PlanError> {
-    if template.kind == TemplateKind::Bot {
-        return Err(PlanError::invalid(format!(
-            "{} is a bot template; bots become instances with the forward harness \
-             (EDGE_PROCESS §5), not yet",
-            template.id
-        )));
-    }
     validate_instance_name(name).map_err(PlanError::invalid)?;
     let mode = match mode {
         Some(m) if template.modes.iter().any(|x| x == m) => m.to_string(),
@@ -187,6 +180,13 @@ fn build(
         }
         None => template.modes[0].clone(),
     };
+    if template.kind == TemplateKind::Bot && mode != crate::templates::PAPER_MODE {
+        return Err(PlanError::invalid(format!(
+            "{} runs as an instance on paper only, for now (the forward runner, EDGE_PROCESS \
+             §5); live bots come with the live harness (§6)",
+            template.id
+        )));
+    }
     let params = validate_params(template, params).map_err(PlanError::Invalid)?;
     let env = env_for(template, &params);
     let data_dir = lake_dir(&cfg.lake_root, template, name);
@@ -467,18 +467,49 @@ mod tests {
         assert_eq!(why, vec!["symbols: needs at least 1 item(s)".to_string()]);
     }
 
+    fn paper_bot() -> Template {
+        serde_json::from_value(json!({
+            "id": "bot.edge-forward",
+            "version": 1,
+            "kind": "bot",
+            "display_name": "Forward runner",
+            "image": "ghcr.io/nuniesmith/fks-bot-edge-search:latest",
+            "modes": ["paper"],
+            "restart_policy": {"enabled": true},
+            "lake": "read",
+            "database": "research",
+            "env": {"deployment_id": "EDGE_DEPLOYMENT_ID"},
+            "params": {
+                "type": "object",
+                "required": ["deployment_id"],
+                "properties": {"deployment_id": {"type": "integer", "minimum": 1}}
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn bots_are_not_instances_yet() {
-        let mut t = recorder();
-        t.kind = TemplateKind::Bot;
+    fn a_bot_is_an_instance_on_paper_only() {
         let mut s = TemplateSet::default();
+        s.templates.insert("bot.edge-forward".into(), paper_bot());
+        let mut r = req("fwd-3", json!({"deployment_id": 3}));
+        r.template = "bot.edge-forward".into();
+        let p = plan(&s, &cfg(), &r).expect("a paper bot plans");
+        assert_eq!(p.mode, "paper");
+        assert_eq!(p.lake_read, Some(PathBuf::from("/srv/fks-lake/raw")));
+        assert!(p.research_db && p.data_dir.is_none() && p.secrets.is_empty());
+        assert_eq!(p.env["EDGE_DEPLOYMENT_ID"], "3");
+        // A bot template that also lists live still can't be planned live.
+        let mut t = paper_bot();
+        t.modes = vec!["paper".into(), "live".into()];
+        t.lake = None;
+        t.database = None;
         s.templates.insert(t.id.clone(), t);
-        let PlanError::Invalid(why) =
-            plan(&s, &cfg(), &req("btc", json!({"symbols": ["BTCUSDT"]}))).unwrap_err()
-        else {
+        r.mode = Some("live".into());
+        let PlanError::Invalid(why) = plan(&s, &cfg(), &r).unwrap_err() else {
             panic!("invalid")
         };
-        assert!(why[0].contains("forward harness"), "{why:?}");
+        assert!(why[0].contains("paper only"), "{why:?}");
     }
 
     fn job() -> Template {

@@ -1529,10 +1529,15 @@ impl BotRunStore {
         &self,
         d: &crate::ladder::ValidDeployment,
     ) -> Result<serde_json::Value, SpawnerError> {
+        // Without a params_snapshot, the experiment's selection (fks 029),
+        // read via to_jsonb so a database without that column still answers
+        // (NULL, refused by NOT NULL rather than a missing-column error).
         sqlx::query_scalar(
             "INSERT INTO edge_deployments (experiment_id, account_id, symbol, execution, \
                                            params_snapshot) \
-             VALUES ($1, $2, $3, $4, $5) RETURNING to_jsonb(edge_deployments.*)",
+             VALUES ($1, $2, $3, $4, COALESCE($5, (SELECT to_jsonb(e) -> 'selected_params' \
+                                                   FROM edge_experiments e WHERE e.id = $1))) \
+             RETURNING to_jsonb(edge_deployments.*)",
         )
         .bind(d.experiment_id)
         .bind(&d.account_id)

@@ -45,6 +45,14 @@ def prior_trials(conn: psycopg.Connection, edge_id: str) -> int:
     return int(n)
 
 
+def has_column(conn: psycopg.Connection, table: str, column: str) -> bool:
+    (n,) = conn.execute(
+        "SELECT count(*) FROM information_schema.columns WHERE table_name = %s AND column_name = %s",
+        (table, column),
+    ).fetchone()
+    return bool(n)
+
+
 def write_experiment(conn: psycopg.Connection, row: dict) -> int:
     cols = list(row)
     values = [json.dumps(v) if isinstance(v, dict) else v for v in row.values()]

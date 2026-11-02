@@ -118,6 +118,10 @@ const RESERVED_ENV: &[&str] = &["FKS_BOT_ID", "FKS_BOT_MODE", "DATA_DIR"];
 /// Modes a recorder may never run in: it holds no keys and places nothing.
 const MONEY_MODES: &[&str] = &["live", "dry-run"];
 
+/// The one mode a bot instance runs in, for now (EDGE_PROCESS §5: forward
+/// is paper; live bots come with the live harness, §6).
+pub const PAPER_MODE: &str = "paper";
+
 const FORM_KEYS: &[&str] = &["type", "properties", "required", "title", "description"];
 const FIELD_KEYS: &[&str] = &[
     "type",
@@ -246,8 +250,17 @@ pub fn validate_template(t: &Template, allowed_image_prefix: &str) -> Result<(),
             "mode {m:?} must be lower-case letters, digits and '-'"
         ));
     }
-    if t.kind != TemplateKind::Job && (t.lake.is_some() || t.database.is_some()) {
-        return Err("only a job reads the lake or gets the research database".into());
+    // A paper bot (the forward runner, EDGE_PROCESS §5) reads the lake and
+    // writes the forward ledger through the research role, like a job. A bot
+    // that could trade never gets either: live bots come with the live
+    // harness.
+    let paper_bot = t.kind == TemplateKind::Bot && t.modes.iter().all(|m| m == PAPER_MODE);
+    if (t.lake.is_some() || t.database.is_some()) && t.kind != TemplateKind::Job && !paper_bot {
+        return Err(
+            "only a job, or a bot whose only mode is paper, reads the lake or gets the research \
+             database"
+                .into(),
+        );
     }
     if t.kind == TemplateKind::Job {
         // A job runs once. A restart, or a second mode that isn't one-shot,
@@ -662,6 +675,30 @@ mod tests {
                 .unwrap_err()
                 .contains("allowed prefix")
         );
+    }
+
+    #[test]
+    fn only_a_paper_bot_reads_the_lake_besides_a_job() {
+        let mut t = recorder();
+        t.kind = TemplateKind::Bot;
+        t.data = None;
+        t.modes = vec!["paper".into()];
+        t.lake = Some(LakeAccess::Read);
+        t.database = Some(DatabaseAccess::Research);
+        assert!(
+            validate_template(&t, PREFIX).is_ok(),
+            "{:?}",
+            validate_template(&t, PREFIX)
+        );
+        t.modes = vec!["paper".into(), "live".into()];
+        assert!(
+            validate_template(&t, PREFIX)
+                .unwrap_err()
+                .contains("only mode is paper")
+        );
+        let mut r = recorder();
+        r.lake = Some(LakeAccess::Read);
+        assert!(validate_template(&r, PREFIX).is_err());
     }
 
     #[test]
