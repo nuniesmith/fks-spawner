@@ -27,9 +27,29 @@ the placeholder is dropped and the code's close-out is the exit.
 
 WHAT IT CAN'T KNOW YET. The search skips a session with under 98% of its
 minutes; live, that is only known at the close, so the runner trades the
-session and says so in the exit if it ended short. Roll days ARE known in
-advance (the contract changes): like the search, the runner doesn't trade
-them. US exchange holidays likewise.
+session and says so in the exit if it ended short. What IS known in advance
+isn't traded, like the search: roll days (the contract changes), US
+exchange holidays, and the early closes that cut a session short (the day
+after Thanksgiving and Christmas Eve, and July 3 when it's a Monday to
+Thursday: CME's equity products stop at 13:15 ET, metals at 13:45 ET, so
+the 16:00 ET equity session is short and the 13:30 ET gold one isn't).
+
+LATE. A signal is meant to be acted on: one said more than 2 minutes after
+its bar closed (a runner started, or restarted, mid-session finds the
+morning already decided) is recorded, marked LATE in the message and the
+ledger's reason, and says not to chase it.
+
+RETIRED MID-SESSION. A deployment retired while a trade is open (by the
+monitor or by hand) keeps its runner watching that trade until it exits,
+saying only exits (fks 032 admits an exit for an entry already said); then
+the runner goes idle.
+
+WHAT IT REPORTS. fks_signal_error is 1 when the last step failed, when
+Massive refused the key, or when a channel was named but its webhook didn't
+arrive (a misspelled or deleted channel: signals would only be logged);
+fks_signal_feed_stale is 1 inside a session that is being traded while no
+bar has come for 3 minutes. Both have alert rules (fks
+prometheus/alerts/edge-ladder.yml).
 
 THE CONTRACT. Each root follows the contract with the most volume on the
 previous weekday, among the three nearest (the CME recorder's rule), read
@@ -44,6 +64,8 @@ Settings (environment):
                                 (a real-time futures plan: Futures Advanced)
   SIGNAL_DISCORD_WEBHOOK_URL    from Settings -> Notifications; without it
                                 the signals are recorded and logged only
+  SIGNAL_CHANNEL                that channel's name (the template sets both),
+                                so a channel that didn't resolve is an error
   FKS_CODE_REVISION             baked into the image
   MASSIVE_WS_URL                default wss://socket.massive.com/futures
   MASSIVE_BASE_URL              default https://api.massive.com
@@ -63,7 +85,7 @@ import time as clock
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, Mapping
 
@@ -76,6 +98,12 @@ log = logging.getLogger("edge-signal")
 
 ET = orb.ET
 RUN_STAGES = ("forward", "live")
+#: A signal said this long after its bar closed is LATE (module docs).
+LATE_MS = 120_000
+#: Inside a traded session, this long without a bar is a stale feed.
+FEED_STALE_S = 180
+#: How long to wait before asking Massive again after it refused the key.
+REFUSED_RETRY_S = 1800
 WS_URL = "wss://socket.massive.com/futures"
 BASE_URL = "https://api.massive.com"
 USER_AGENT = "fks-edge-signal/1 (+https://github.com/nuniesmith/fks-spawner)"
@@ -233,6 +261,30 @@ def choose(order: list[str], prev_volume: Mapping[str, float]) -> str | None:
     return best if prev_volume.get(best, 0.0) > 0 else order[0]
 
 
+#: When CME stops trading on an early-close day (New York time), by root.
+EARLY_CLOSE = {"ES": time(13, 15), "NQ": time(13, 15), "GC": time(13, 45), "MGC": time(13, 45)}
+
+
+def early_close_days(y: int) -> set[date]:
+    """CME's US early closes in year `y` (verify against CME's holiday
+    calendar each year): the day after Thanksgiving, Christmas Eve on a
+    weekday, and July 3 when it falls Monday to Thursday (on a Friday it is
+    the observed holiday)."""
+    thanksgiving = orb._nth(y, 11, 3, 4)
+    out = {thanksgiving + timedelta(1)}
+    for d in (date(y, 12, 24), date(y, 7, 3)):
+        if d.weekday() < (5 if d.month == 12 else 4):
+            out.add(d)
+    return out
+
+
+def early_close(symbol: str, day: date) -> time | None:
+    """The time `symbol`'s market stops on `day` if it's an early close."""
+    if day not in early_close_days(day.year):
+        return None
+    return EARLY_CLOSE.get(orb.contract(symbol).root)
+
+
 def previous_weekday(d: date) -> date:
     d -= timedelta(1)
     while d.weekday() >= 5:
@@ -313,6 +365,7 @@ class Config:
     per_minute: int
     bot_id: str
     port: int
+    channel: str | None = None
 
 
 def load_config(env: Mapping[str, str] | None = None) -> Config:
@@ -335,7 +388,16 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
                   env.get("SIGNAL_DISCORD_WEBHOOK_URL", "").strip() or None,
                   env["FKS_CODE_REVISION"].strip(), env.get("MASSIVE_WS_URL", WS_URL),
                   env.get("MASSIVE_BASE_URL", BASE_URL), per_minute,
-                  env.get("FKS_BOT_ID", "edge-signal"), port)
+                  env.get("FKS_BOT_ID", "edge-signal"), port,
+                  env.get("SIGNAL_CHANNEL", "").strip() or None)
+
+
+def config_problem(cfg: Config) -> str | None:
+    """Why signals would go nowhere although a channel was named."""
+    if cfg.channel and not cfg.webhook:
+        return (f"channel {cfg.channel!r} was named but its webhook didn't arrive (is it in Settings "
+                f"-> Notifications?): signals are recorded and logged, not sent")
+    return None
 
 
 def post_discord(url: str, text: str, opener: Callable = urllib.request.urlopen) -> bool:
@@ -381,8 +443,12 @@ def plan_day(m: Massive, symbols: list[str], day: date) -> Day:
             blocked[sym] = f"no {root} contract listed for {day}"
             continue
         contracts[sym] = today
+        cut = early_close(sym, day)
         if day in holidays:
             blocked[sym] = "a US exchange holiday"
+        elif cut is not None and cut < orb.contract(sym).end:
+            blocked[sym] = (f"an early close (trading stops {cut:%H:%M} ET, before the session's "
+                            f"{orb.contract(sym).end:%H:%M}): the search doesn't trade short sessions")
         elif yesterday and yesterday != today:
             blocked[sym] = f"a roll day ({yesterday} -> {today}): the search doesn't trade those"
     return Day(day, contracts, blocked)
@@ -408,22 +474,52 @@ def deliver(conn, signal_id: int) -> None:
     conn.commit()
 
 
+def lateness_ms(ev: Event, now_ms: int) -> int:
+    """How long after its bar closed the event is being said."""
+    return now_ms - (ev.bar_ms + 60_000)
+
+
+def late_text(ev: Event, text: str, late_ms: int) -> str:
+    """A late event's message: what it was, and that it isn't a call to act."""
+    minutes = max(1, round(late_ms / 60_000))
+    tag, _, rest = text.partition("] ")
+    advice = {"entry": "for the record: don't chase it",
+              "exit": "if you're still in, the model is out",
+              "range": "for the record"}[ev.kind]
+    return f"{tag}] LATE by {minutes} min: {rest}. {advice[0].upper()}{advice[1:]}."
+
+
 def say(conn, cfg: Config, ev: Event, contract: str,
-        send: Callable[[str], bool]) -> bool:
-    """Record, then send, then mark delivered. False when already said."""
-    new = record(conn, cfg, ev, contract)
+        send: Callable[[str], bool], now_ms: int | None = None) -> bool:
+    """Record, then send, then mark delivered. False when already said, or
+    when the ledger refuses it (its rules decide; the reason is logged)."""
+    import psycopg
+
+    late = lateness_ms(ev, now_ms) if now_ms is not None else 0
+    if late > LATE_MS:
+        ev = replace(ev, reason=f"{ev.reason} [said {round(late / 60_000)} min after its bar]")
+    try:
+        new = record(conn, cfg, ev, contract)
+    except psycopg.errors.CheckViolation as e:
+        conn.rollback()
+        log.warning("%s %s %s refused by the ledger: %s", ev.symbol, ev.day, ev.kind, str(e).splitlines()[0])
+        return False
     if new is None:
         return False
     signal_id, stage = new
     text = message(ev, contract, stage)
+    if late > LATE_MS:
+        text = late_text(ev, text, late)
     log.info("%s", text)
     if send(text):
         deliver(conn, signal_id)
     return True
 
 
-def step(conn, cfg: Config, dep, today: Day, now_ms: int, send: Callable[[str], bool]) -> dict:
-    """Evaluate every symbol on the bars so far; say what's new."""
+def step(conn, cfg: Config, dep, today: Day, now_ms: int, send: Callable[[str], bool],
+         exits_only: bool = False) -> dict:
+    """Evaluate every symbol on the bars so far; say what's new. With
+    `exits_only` (the deployment was retired with a trade open), only exits."""
     said = 0
     status = {}
     for sym in dep.symbols:
@@ -434,9 +530,24 @@ def step(conn, cfg: Config, dep, today: Day, now_ms: int, send: Callable[[str], 
         rows = list(today.rows.get(ticker, {}).values())
         s = evaluate(sym, today.day, rows, dep.params, dep.hypothesis.costs, now_ms)
         for ev in s.events:
-            said += say(conn, cfg, ev, ticker, send)
+            if exits_only and ev.kind != "exit":
+                continue
+            said += say(conn, cfg, ev, ticker, send, now_ms)
         status[sym] = ("open" if s.open_trade else s.events[-1].kind if s.events else "waiting")
-    return {"said": said, "symbols": status}
+    return {"said": said, "symbols": status, "open": sum(1 for v in status.values() if v == "open")}
+
+
+def feed_stale(dep, today: Day, now_ms: int, last_bar_ms: int) -> bool:
+    """Inside a session being traded, and no bar for FEED_STALE_S."""
+    if now_ms - last_bar_ms <= FEED_STALE_S * 1000:
+        return False
+    for sym in dep.symbols:
+        if sym in today.blocked or sym not in today.contracts:
+            continue
+        start, end = session_bounds(sym, today.day)
+        if start <= now_ms < end:
+            return True
+    return False
 
 
 def render_metrics(doc: dict) -> str:
@@ -449,7 +560,15 @@ def render_metrics(doc: dict) -> str:
     lines += g("fks_signal_last_bar_age_seconds", "Seconds since the last bar arrived (NaN before one).",
                doc.get("last_bar_age", "NaN"))
     lines += g("fks_signal_said_total", "Signals said since start.", doc.get("said_total", 0))
-    lines += g("fks_signal_error", "1 when the last step failed.", 1 if doc.get("error") else 0)
+    lines += g("fks_signal_error",
+               "1 when the last step failed, Massive refused the key, or a named channel has no webhook.",
+               1 if doc.get("error") or doc.get("config_error") else 0)
+    lines += g("fks_signal_feed_stale", "1 inside a traded session with no bar for 3 minutes.",
+               1 if doc.get("feed_stale") else 0)
+    lines += g("fks_signal_open_trades", "Trades the runner is watching (entered, not yet exited).",
+               doc.get("open_trades", 0))
+    lines += g("fks_signal_winding_down", "1 while a retired deployment's open trade is watched to its exit.",
+               1 if doc.get("winding_down") else 0)
     return "\n".join(lines) + "\n"
 
 
@@ -464,9 +583,11 @@ async def _socket(cfg: Config, tickers: list[str], on_bar: Callable[[str, tuple]
                 if msg.get("ev") == "status":
                     log.info("massive: %s %s", msg.get("status"), msg.get("message"))
                     if msg.get("status") == "auth_failed":
-                        raise SignalError("massive refused the key (auth_failed): a real-time futures plan?")
-                    status.update(connected=msg.get("status") == "auth_success" or status.snapshot().get(
-                        "connected", False))
+                        raise SignalError(f"massive refused the key (auth_failed: {msg.get('message')}): "
+                                          f"live signals need a real-time futures plan (Futures Advanced)")
+                    if msg.get("status") == "auth_success":
+                        # A refusal from an earlier try no longer applies.
+                        status.update(connected=True, config_error=config_problem(cfg))
                     continue
                 got = socket_bar(msg)
                 if got:
@@ -488,12 +609,15 @@ def main() -> int:
 
     status = Status(cfg)  # type: ignore[arg-type]
     status.update(kind="bot", bot="edge-signal", bot_id=cfg.bot_id, deployment_id=cfg.deployment_id,
-                  phase="starting", code_version=cfg.code_version, said_total=0, error=None)
+                  phase="starting", code_version=cfg.code_version, said_total=0, error=None,
+                  config_error=config_problem(cfg))
+    if config_problem(cfg):
+        log.error("%s", config_problem(cfg))
     serve_status(status, cfg.port, render=render_metrics)
     massive = Massive(cfg.massive_key, cfg.base_url, cfg.per_minute)
     send = (lambda text: post_discord(cfg.webhook, text)) if cfg.webhook else (lambda text: False)
-    if not cfg.webhook:
-        log.warning("no SIGNAL_DISCORD_WEBHOOK_URL: signals are recorded and logged, not sent")
+    if not cfg.webhook and not cfg.channel:
+        log.warning("no channel named: signals are recorded and logged, not sent")
     stop = asyncio.Event()
 
     async def nap(seconds: float) -> None:
@@ -531,21 +655,33 @@ def main() -> int:
 
                     sock = asyncio.create_task(_socket(cfg, sorted(set(today.contracts.values())), on_bar,
                                                        status))
+                    winding = False
                     try:
                         while not stop.is_set() and datetime.now(ET).date() == day:
                             if sock.done():
                                 sock.result()  # raises the socket's error
                                 raise ConnectionError("the market-data socket closed")
-                            out = step(conn, cfg, dep, today, int(clock.time() * 1000), send)
+                            now_ms = int(clock.time() * 1000)
+                            out = step(conn, cfg, dep, today, now_ms, send, exits_only=winding)
                             snap = status.snapshot()
                             status.update(last_step=out, said_total=snap.get("said_total", 0) + out["said"],
-                                          last_bar_age=round(clock.time() - last_bar[0], 1), error=None)
-                            dep = load_deployment(conn, cfg.deployment_id)
-                            if dep.stage not in RUN_STAGES:
+                                          last_bar_age=round(clock.time() - last_bar[0], 1), error=None,
+                                          open_trades=out["open"], winding_down=winding,
+                                          feed_stale=feed_stale(dep, today, now_ms, int(last_bar[0] * 1000)))
+                            if winding and out["open"] == 0:
                                 break
+                            stage = load_deployment(conn, cfg.deployment_id).stage
+                            if stage not in RUN_STAGES and not winding:
+                                if out["open"] == 0:
+                                    break
+                                # Retired with a trade open: watch it to its exit.
+                                log.warning("deployment %d is now %s with %d trade(s) open: saying "
+                                            "their exits only", dep.id, stage, out["open"])
+                                winding = True
                             await nap(15)
                     finally:
                         sock.cancel()
+                        status.update(winding_down=False, feed_stale=False)
                     backoff = 5
             except ForwardError as e:  # what this deployment is can't be signalled
                 log.error("%s", e)
@@ -553,9 +689,13 @@ def main() -> int:
                 return 2
             except Exception as e:  # the feed, the database: retried, slower each time
                 if "auth_failed" in str(e):
-                    log.error("%s", e)
-                    status.update(phase="refused", error=str(e), connected=False)
-                    return 2
+                    # Stay up and say why (an exit would be a crash loop under
+                    # the restart policy); ask again now and then, in case the
+                    # plan changes.
+                    log.error("%s (asking again in %ss)", e, REFUSED_RETRY_S)
+                    status.update(phase="refused", config_error=str(e), connected=False)
+                    await nap(REFUSED_RETRY_S)
+                    continue
                 log.error("signal runner: %s (retrying in %ss)", e, backoff)
                 status.update(phase="error", error=str(e), connected=False)
                 await nap(backoff)
