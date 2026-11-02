@@ -137,6 +137,10 @@ const FIELD_KEYS: &[&str] = &[
 ];
 const ITEM_KEYS: &[&str] = &["type", "enum", "minLength", "maxLength", "x-format"];
 
+/// The stored credentials a RECORDER template may name: data vendors' API
+/// keys, injected as `{NAME}_API_KEY` like an exchange's. Never an exchange.
+pub const DATA_VENDOR_SECRETS: &[&str] = &["massive"];
+
 /// The templates in a folder, and what was wrong with the ones that aren't.
 #[derive(Debug, Default)]
 pub struct TemplateSet {
@@ -275,8 +279,18 @@ pub fn validate_template(t: &Template, allowed_image_prefix: &str) -> Result<(),
                 "a recorder can't run in mode {m}: it holds no keys and trades nothing"
             ));
         }
-        if !t.secrets_allowed.is_empty() {
-            return Err("a recorder records public data and gets no secrets".into());
+        // A recorder trades nothing and holds no exchange keys. A data
+        // vendor's API key (Massive's minute bars) is the one exception: it
+        // reads data, it can't place an order.
+        if let Some(s) = t
+            .secrets_allowed
+            .iter()
+            .find(|s| !DATA_VENDOR_SECRETS.contains(&s.as_str()))
+        {
+            return Err(format!(
+                "a recorder records data and gets no exchange keys: {s:?} isn't a data \
+                 vendor's ({DATA_VENDOR_SECRETS:?})"
+            ));
         }
         let Some(data) = &t.data else {
             return Err("a recorder needs data.venue and data.market (where its files go)".into());
@@ -664,8 +678,13 @@ mod tests {
         assert!(
             validate_template(&t, PREFIX)
                 .unwrap_err()
-                .contains("no secrets")
+                .contains("no exchange keys")
         );
+        // A data vendor's key is allowed, and only that.
+        t.secrets_allowed = vec!["massive".into()];
+        assert!(validate_template(&t, PREFIX).is_ok());
+        t.secrets_allowed = vec!["massive".into(), "kraken".into()];
+        assert!(validate_template(&t, PREFIX).is_err());
     }
 
     #[test]
