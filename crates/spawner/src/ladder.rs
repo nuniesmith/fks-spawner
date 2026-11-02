@@ -334,7 +334,10 @@ pub struct DeploymentRequest {
     pub symbol: String,
     /// The parameters actually traded, frozen with the row: "the object being
     /// traded and the object that was tested must be provably the same".
-    pub params_snapshot: Value,
+    /// Leave it out: the spawner takes the experiment's `selected_params`
+    /// (fks 029), and the database refuses any other value.
+    #[serde(default)]
+    pub params_snapshot: Option<Value>,
     /// `manual` (default) or `auto`.
     #[serde(default)]
     pub execution: Option<String>,
@@ -345,7 +348,8 @@ pub struct ValidDeployment {
     pub experiment_id: i64,
     pub account_id: String,
     pub symbol: String,
-    pub params_snapshot: Value,
+    /// `None`: the experiment's selection (the INSERT reads it).
+    pub params_snapshot: Option<Value>,
     pub execution: String,
 }
 
@@ -361,9 +365,11 @@ pub fn validate_deployment(req: &DeploymentRequest) -> Result<ValidDeployment, V
             "symbol {symbol:?} isn't a symbol (A-Z and 0-9, 2-20 long)"
         ));
     }
-    if !req.params_snapshot.is_object() {
+    if req.params_snapshot.as_ref().is_some_and(|p| !p.is_object()) {
         errors.push(
-            "params_snapshot must be a JSON object: the parameters this deployment trades".into(),
+            "params_snapshot must be a JSON object, or left out to deploy the experiment's \
+             selection"
+                .into(),
         );
     }
     let execution = req
@@ -653,7 +659,7 @@ mod tests {
             experiment_id: 3,
             account_id: " kraken-spot ".into(),
             symbol: "btcusd".into(),
-            params_snapshot: json!({"band": 0.05}),
+            params_snapshot: None,
             execution: None,
         };
         let d = validate_deployment(&req).unwrap();
@@ -666,7 +672,7 @@ mod tests {
             ("kraken-spot", "BTCUSD", "manual")
         );
         let bad = DeploymentRequest {
-            params_snapshot: json!([1]),
+            params_snapshot: Some(json!([1])),
             execution: Some("yolo".into()),
             ..req
         };

@@ -21,9 +21,14 @@ COPY bots/edge-search/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bots/edge-search/edge_search ./edge_search
 
+# The git revision this image was built from: the forward runner records it
+# with every session it observes (fks 029, edge_forward_sessions.code_version),
+# and refuses to run without it. CI passes it; a local build can too.
+ARG REVISION=""
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
-    LAKE_DIR=/lake
+    LAKE_DIR=/lake \
+    FKS_CODE_REVISION=${REVISION}
 USER search
 EXPOSE 9091
 CMD ["python", "-m", "edge_search"]

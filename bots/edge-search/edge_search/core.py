@@ -56,6 +56,9 @@ def experiment_row(h, spec, result: Result, study: str, finished: datetime) -> d
         "verdict": result.verdict.label,
         "verdict_reasons": result.verdict.reasons,
         "finished_at": finished,
+        # fks 029: the selection is on record, and a deployment trades
+        # exactly it (params_snapshot = selected_params).
+        "selected_params": result.best.params,
     }
 
 
@@ -127,6 +130,10 @@ def main() -> int:
             finished = datetime.now(timezone.utc)
             study = f"{h.edge_id}-h{h.id}-{finished:%Y%m%dT%H%M%SZ}"
             row = experiment_row(h, spec, result, study, finished)
+            if not db.has_column(conn, "edge_experiments", "selected_params"):
+                log.warning("fks 029 isn't applied: the selection isn't recorded, so this "
+                            "search can't be deployed")
+                row.pop("selected_params")
             write_artifacts(cfg.data_dir / study, result, row)
             new_id = db.write_experiment(conn, row)
     except (SearchError, DatasetError) as e:
