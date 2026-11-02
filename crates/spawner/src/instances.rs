@@ -81,6 +81,9 @@ pub struct InstancePlan {
     /// The API adds the research database URL at spawn (jobs with
     /// `"database": "research"`).
     pub research_db: bool,
+    /// Stored credentials injected at spawn: a recorder's data-vendor keys
+    /// (`templates::DATA_VENDOR_SECRETS`, validated with the template).
+    pub secrets: Vec<String>,
 }
 
 /// Why an instance can't be planned: an unknown template (404) or input that
@@ -203,6 +206,11 @@ fn build(
         data_dir,
         lake_read,
         research_db: template.database == Some(DatabaseAccess::Research),
+        secrets: if template.kind == TemplateKind::Recorder {
+            template.secrets_allowed.clone()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -216,7 +224,7 @@ impl InstancePlan {
             cpu_limit: self.cpu_limit,
             memory_mb: self.memory_mb,
             env: self.env.clone().into_iter().collect(),
-            secrets: Vec::new(),
+            secrets: self.secrets.clone(),
             webhooks: Default::default(),
             bot_id: Some(self.name.clone()),
             account: None,
@@ -270,7 +278,7 @@ impl InstancePlan {
             memory_limit_mb: self.memory_mb.map(i64::from),
             cmd: None,
             entrypoint: None,
-            secrets: Vec::new(),
+            secrets: self.secrets.clone(),
             data_dir: self.data_dir.clone(),
             lake_read: self.lake_read.clone(),
             webhooks: Default::default(),
@@ -383,6 +391,22 @@ mod tests {
             params,
             mode: None,
         }
+    }
+
+    #[test]
+    fn a_data_vendor_recorder_gets_its_key_at_every_spawn() {
+        let mut t = recorder();
+        t.id = "history.cme-massive".into();
+        t.secrets_allowed = vec!["massive".into()];
+        let mut set = TemplateSet::default();
+        set.templates.insert(t.id.clone(), t);
+        let mut r = req("cme", json!({"symbols": ["ES"]}));
+        r.template = "history.cme-massive".into();
+        let p = plan(&set, &cfg(), &r).expect("plans");
+        assert_eq!(p.secrets, vec!["massive".to_string()]);
+        assert_eq!(p.spawn_request().secrets, vec!["massive".to_string()]);
+        // The saved config carries it, so a respawn injects the stored key too.
+        assert_eq!(p.config_request().secrets, vec!["massive".to_string()]);
     }
 
     #[test]
