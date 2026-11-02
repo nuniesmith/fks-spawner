@@ -2,3 +2,5 @@ numpy>=2,<3
 psycopg[binary]>=3.2,<4
 # zoneinfo needs a tz database; python:slim may not ship one
 tzdata>=2024.1
+# the signal runner's market-data socket (Massive)
+websockets>=13,<16

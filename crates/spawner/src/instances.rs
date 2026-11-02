@@ -81,9 +81,12 @@ pub struct InstancePlan {
     /// The API adds the research database URL at spawn (jobs with
     /// `"database": "research"`).
     pub research_db: bool,
-    /// Stored credentials injected at spawn: a recorder's data-vendor keys
-    /// (`templates::DATA_VENDOR_SECRETS`, validated with the template).
+    /// Stored credentials injected at spawn: a recorder's or a paper bot's
+    /// data-vendor keys (`templates::DATA_VENDOR_SECRETS`, validated with the
+    /// template).
     pub secrets: Vec<String>,
+    /// Env var -> Settings channel, resolved at every spawn (crate::webhooks).
+    pub webhooks: BTreeMap<String, String>,
 }
 
 /// Why an instance can't be planned: an unknown template (404) or input that
@@ -189,6 +192,7 @@ fn build(
     }
     let params = validate_params(template, params).map_err(PlanError::Invalid)?;
     let env = env_for(template, &params);
+    let webhooks = crate::templates::webhooks_for(template, &params);
     let data_dir = lake_dir(&cfg.lake_root, template, name);
     let lake_read = (template.lake == Some(LakeAccess::Read)).then(|| cfg.lake_root.join("raw"));
     Ok(InstancePlan {
@@ -206,11 +210,21 @@ fn build(
         data_dir,
         lake_read,
         research_db: template.database == Some(DatabaseAccess::Research),
-        secrets: if template.kind == TemplateKind::Recorder {
+        // Validated with the template: data vendors' keys only, and only for
+        // a recorder or a bot whose ONLY mode is paper. A bot template that
+        // could also run live names no key an instance gets.
+        secrets: if template.kind == TemplateKind::Recorder
+            || (template.kind == TemplateKind::Bot
+                && template
+                    .modes
+                    .iter()
+                    .all(|m| m == crate::templates::PAPER_MODE))
+        {
             template.secrets_allowed.clone()
         } else {
             Vec::new()
         },
+        webhooks,
     })
 }
 
@@ -225,7 +239,7 @@ impl InstancePlan {
             memory_mb: self.memory_mb,
             env: self.env.clone().into_iter().collect(),
             secrets: self.secrets.clone(),
-            webhooks: Default::default(),
+            webhooks: self.webhooks.clone(),
             bot_id: Some(self.name.clone()),
             account: None,
             restart_policy: self.restart_policy.clone(),
@@ -281,7 +295,7 @@ impl InstancePlan {
             secrets: self.secrets.clone(),
             data_dir: self.data_dir.clone(),
             lake_read: self.lake_read.clone(),
-            webhooks: Default::default(),
+            webhooks: self.webhooks.clone(),
         }
     }
 }
@@ -486,6 +500,63 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn signal_bot() -> Template {
+        let mut t = paper_bot();
+        t.id = "bot.edge-signal".into();
+        t.secrets_allowed = vec!["massive".into()];
+        t.lake = None;
+        t.params = json!({
+            "type": "object",
+            "required": ["deployment_id"],
+            "properties": {
+                "deployment_id": {"type": "integer", "minimum": 1},
+                "channel": {"type": "string", "maxLength": 64}
+            }
+        });
+        t.webhooks
+            .insert("SIGNAL_DISCORD_WEBHOOK_URL".into(), "channel".into());
+        t
+    }
+
+    #[test]
+    fn a_paper_signal_bot_gets_its_feed_key_and_its_channel() {
+        let mut s = TemplateSet::default();
+        let t = signal_bot();
+        crate::templates::validate_template(&t, "ghcr.io/nuniesmith/").expect("valid");
+        s.templates.insert(t.id.clone(), t);
+        let mut r = req("sig-3", json!({"deployment_id": 3, "channel": "futures"}));
+        r.template = "bot.edge-signal".into();
+        let p = plan(&s, &cfg(), &r).expect("plans");
+        assert_eq!(p.secrets, vec!["massive".to_string()]);
+        let want = BTreeMap::from([(
+            "SIGNAL_DISCORD_WEBHOOK_URL".to_string(),
+            "futures".to_string(),
+        )]);
+        assert_eq!(p.spawn_request().webhooks, want);
+        // The saved config keeps both, so a respawn wires them again.
+        assert_eq!(p.config_request().webhooks, want);
+        assert_eq!(p.config_request().secrets, vec!["massive".to_string()]);
+        // No channel named: no webhook (the bot runs without the variable).
+        let mut r = req("sig-4", json!({"deployment_id": 4}));
+        r.template = "bot.edge-signal".into();
+        assert!(plan(&s, &cfg(), &r).expect("plans").webhooks.is_empty());
+    }
+
+    #[test]
+    fn a_bot_that_could_go_live_gives_its_paper_instances_no_keys() {
+        let mut t = signal_bot();
+        t.modes = vec!["paper".into(), "live".into()];
+        t.lake = None;
+        t.database = None;
+        t.secrets_allowed = vec!["kraken".into()];
+        let mut s = TemplateSet::default();
+        s.templates.insert(t.id.clone(), t);
+        let mut r = req("sig-5", json!({"deployment_id": 5}));
+        r.template = "bot.edge-signal".into();
+        r.mode = Some("paper".into());
+        assert!(plan(&s, &cfg(), &r).expect("plans").secrets.is_empty());
     }
 
     #[test]

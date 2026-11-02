@@ -110,6 +110,10 @@ pub struct Template {
     /// Env vars every instance of this template gets.
     #[serde(default)]
     pub fixed_env: BTreeMap<String, String>,
+    /// Env var -> the form field naming a Settings notification channel; the
+    /// spawner injects that channel's URL at every spawn (crate::webhooks).
+    #[serde(default)]
+    pub webhooks: BTreeMap<String, String>,
 }
 
 /// Env vars the spawner sets itself; a template may not set them.
@@ -141,8 +145,9 @@ const FIELD_KEYS: &[&str] = &[
 ];
 const ITEM_KEYS: &[&str] = &["type", "enum", "minLength", "maxLength", "x-format"];
 
-/// The stored credentials a RECORDER template may name: data vendors' API
-/// keys, injected as `{NAME}_API_KEY` like an exchange's. Never an exchange.
+/// The stored credentials a RECORDER or a PAPER BOT template may name: data
+/// vendors' API keys, injected as `{NAME}_API_KEY` like an exchange's. Never
+/// an exchange: neither kind can place an order.
 pub const DATA_VENDOR_SECRETS: &[&str] = &["massive"];
 
 /// The templates in a folder, and what was wrong with the ones that aren't.
@@ -262,6 +267,19 @@ pub fn validate_template(t: &Template, allowed_image_prefix: &str) -> Result<(),
                 .into(),
         );
     }
+    // A paper bot (the signal runner) may read a data vendor's feed, and
+    // nothing else: no exchange key ever reaches a bot through a template.
+    if paper_bot
+        && let Some(s) = t
+            .secrets_allowed
+            .iter()
+            .find(|s| !DATA_VENDOR_SECRETS.contains(&s.as_str()))
+    {
+        return Err(format!(
+            "a paper bot gets no exchange keys: {s:?} isn't a data vendor's \
+             ({DATA_VENDOR_SECRETS:?})"
+        ));
+    }
     if t.kind == TemplateKind::Job {
         // A job runs once. A restart, or a second mode that isn't one-shot,
         // would run it again: for a search that means its trials counted
@@ -339,6 +357,17 @@ pub fn validate_template(t: &Template, allowed_image_prefix: &str) -> Result<(),
         check_env_name(var)?;
         if !set_by_form.insert(var.as_str()) {
             return Err(format!("{var} is set by both env and fixed_env"));
+        }
+    }
+    for (var, field) in &t.webhooks {
+        check_env_name(var)?;
+        if !set_by_form.insert(var.as_str()) {
+            return Err(format!("{var} is set by both a webhook and env/fixed_env"));
+        }
+        if !fields.contains_key(field.as_str()) {
+            return Err(format!(
+                "webhooks maps {var} to {field}, which the form doesn't have"
+            ));
         }
     }
     Ok(())
@@ -601,6 +630,18 @@ pub fn validate_params(t: &Template, params: &Value) -> Result<Map<String, Value
     } else {
         Err(errors)
     }
+}
+
+/// The webhooks an instance gets: env var -> the channel its form named. A
+/// blank field means none (the bot runs without that variable).
+pub fn webhooks_for(t: &Template, params: &Map<String, Value>) -> BTreeMap<String, String> {
+    t.webhooks
+        .iter()
+        .filter_map(|(var, field)| {
+            let channel = params.get(field)?.as_str()?.trim();
+            (!channel.is_empty()).then(|| (var.clone(), channel.to_string()))
+        })
+        .collect()
 }
 
 /// The env an instance gets from its template and checked params: the fixed
@@ -954,5 +995,27 @@ mod tests {
             missing.templates.is_empty()
                 && missing.errors[0].contains("can't read the templates folder")
         );
+    }
+
+    #[test]
+    fn a_paper_bot_names_only_a_data_vendor_and_maps_webhooks_to_its_form() {
+        let mut t: Template = serde_json::from_value(json!({
+            "id": "bot.edge-signal", "version": 1, "kind": "bot", "display_name": "Signals",
+            "image": "ghcr.io/nuniesmith/fks-bot-edge-search:latest", "modes": ["paper"],
+            "database": "research", "secrets_allowed": ["massive"],
+            "webhooks": {"SIGNAL_DISCORD_WEBHOOK_URL": "channel"},
+            "params": {"type": "object", "properties": {"channel": {"type": "string"}}}
+        }))
+        .unwrap();
+        validate_template(&t, "ghcr.io/nuniesmith/").expect("a vendor key and a mapped channel");
+        t.secrets_allowed = vec!["kraken".into()];
+        let e = validate_template(&t, "ghcr.io/nuniesmith/").unwrap_err();
+        assert!(e.contains("paper bot gets no exchange keys"), "{e}");
+        t.secrets_allowed = vec!["massive".into()];
+        t.webhooks = BTreeMap::from([("SIGNAL_DISCORD_WEBHOOK_URL".into(), "nope".into())]);
+        let e = validate_template(&t, "ghcr.io/nuniesmith/").unwrap_err();
+        assert!(e.contains("which the form doesn't have"), "{e}");
+        t.webhooks = BTreeMap::from([("FKS_BOT_ID".into(), "channel".into())]);
+        assert!(validate_template(&t, "ghcr.io/nuniesmith/").is_err());
     }
 }
