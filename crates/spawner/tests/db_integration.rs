@@ -1296,12 +1296,18 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
     );
     // Writing the counter is the forgery fks 029 refuses: it is the forward
     // ledger's row count.
-    let forged = sqlx::query("UPDATE edge_deployments SET forward_sessions_observed = 20 WHERE id = $1")
-        .bind(good_id)
-        .execute(&pool)
-        .await
-        .expect_err("a written counter must be refused");
-    assert!(forged.to_string().contains("counted from edge_forward_sessions"), "{forged}");
+    let forged =
+        sqlx::query("UPDATE edge_deployments SET forward_sessions_observed = 20 WHERE id = $1")
+            .bind(good_id)
+            .execute(&pool)
+            .await
+            .expect_err("a written counter must be refused");
+    assert!(
+        forged
+            .to_string()
+            .contains("counted from edge_forward_sessions"),
+        "{forged}"
+    );
     // Stand in for 20 days of the forward runner: the ledger's own admission
     // rules (dates, lateness) are 029's suite; lifted here for a deployment
     // promoted moments ago.
