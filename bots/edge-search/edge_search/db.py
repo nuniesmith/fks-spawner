@@ -53,6 +53,11 @@ def has_column(conn: psycopg.Connection, table: str, column: str) -> bool:
     return bool(n)
 
 
+def has_function(conn: psycopg.Connection, name: str) -> bool:
+    (n,) = conn.execute("SELECT count(*) FROM pg_proc WHERE proname = %s", (name,)).fetchone()
+    return bool(n)
+
+
 def write_experiment(conn: psycopg.Connection, row: dict) -> int:
     cols = list(row)
     values = [json.dumps(v) if isinstance(v, dict) else v for v in row.values()]

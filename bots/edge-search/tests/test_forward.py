@@ -153,6 +153,21 @@ def test_metrics_render_from_the_status():
     assert "fks_forward_sessions_observed 4" in text and "fks_forward_sessions_required 20" in text
 
 
+def test_metrics_carry_the_monitor():
+    health = {"applies": True, "band": {"verdict": "fail", "mean": -0.002, "floor": -0.0005},
+              "cusum": {"value": 3.5, "h": 7.25}}
+    text = forward.render_metrics({"stage": "retired", "health": health})
+    for line in ("fks_forward_retired 1", "fks_forward_band_failed 1", "fks_forward_band_floor -0.0005",
+                 "fks_forward_cusum 3.5", "fks_forward_cusum_h 7.25"):
+        assert line in text
+    # A pending window has no mean yet; a low-frequency edge has no P&L monitor.
+    pending = {"applies": True, "band": {"verdict": "pending", "mean": None, "floor": -0.0005},
+               "cusum": {"value": 0, "h": 7.25}}
+    assert "fks_forward_band_mean NaN" in forward.render_metrics({"stage": "forward", "health": pending})
+    lf = forward.render_metrics({"stage": "forward", "health": {"applies": False, "why": "low-frequency"}})
+    assert "fks_forward_cusum" not in lf and "fks_forward_retired 0" in lf
+
+
 def test_the_search_records_its_selection():
     h = T.orb_hypothesis()
     r = __import__("edge_search.search", fromlist=["run_search"]).run_search(
@@ -160,3 +175,16 @@ def test_the_search_records_its_selection():
     row = core.experiment_row(h, T.window(T.DAYS), r, "s", datetime.now(timezone.utc))
     assert row["selected_params"] == r.best.params and set(row["selected_params"]) == set(orb.PARAMS)
     assert np.isfinite(row["holdout_score"])
+    # fks 030: the selection's holdout sessions, the monitor's reference.
+    assert row["holdout_returns"] == [float(x) for x in r.best.holdout]
+    assert len(row["holdout_returns"]) == len(r.best.holdout) > 0
+
+
+def test_an_unusable_holdout_series_is_not_recorded():
+    h = T.orb_hypothesis()
+    r = __import__("edge_search.search", fromlist=["run_search"]).run_search(
+        h, "orb", T.window(T.DAYS), T.series_for(T.DAYS, 0.00015), prior_trials=0, now=T.NOW)
+    r.best.holdout = np.array([0.001, np.nan])
+    assert core.experiment_row(h, T.window(T.DAYS), r, "s", T.NOW)["holdout_returns"] is None
+    r.best.holdout = np.array([])
+    assert core.experiment_row(h, T.window(T.DAYS), r, "s", T.NOW)["holdout_returns"] is None

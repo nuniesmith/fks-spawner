@@ -1186,9 +1186,10 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         // A CTE, so psql prints the id and not the INSERT's command tag.
         pg.psql_scalar(&format!(
             "WITH ins AS (INSERT INTO edge_experiments (study_name, config_fingerprint, symbol, \
-             bar_minutes, n_trials, verdict, finished_at, hypothesis_id, selected_params) \
+             bar_minutes, n_trials, verdict, finished_at, hypothesis_id, selected_params, \
+             holdout_returns) \
              VALUES ('{name}', 'fp-liq', 'BTCUSDT', 5, 40, '{verdict}', now(), {second}, \
-                     '{{\"threshold_usd\": 5000000}}') \
+                     '{{\"threshold_usd\": 5000000}}', '{{0.001,-0.001}}') \
              RETURNING id) SELECT id FROM ins"
         ))
         .parse::<i64>()
@@ -1296,12 +1297,18 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
     );
     // Writing the counter is the forgery fks 029 refuses: it is the forward
     // ledger's row count.
-    let forged = sqlx::query("UPDATE edge_deployments SET forward_sessions_observed = 20 WHERE id = $1")
-        .bind(good_id)
-        .execute(&pool)
-        .await
-        .expect_err("a written counter must be refused");
-    assert!(forged.to_string().contains("counted from edge_forward_sessions"), "{forged}");
+    let forged =
+        sqlx::query("UPDATE edge_deployments SET forward_sessions_observed = 20 WHERE id = $1")
+            .bind(good_id)
+            .execute(&pool)
+            .await
+            .expect_err("a written counter must be refused");
+    assert!(
+        forged
+            .to_string()
+            .contains("counted from edge_forward_sessions"),
+        "{forged}"
+    );
     // Stand in for 20 days of the forward runner: the ledger's own admission
     // rules (dates, lateness) are 029's suite; lifted here for a deployment
     // promoted moments ago.
@@ -1321,6 +1328,89 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         .expect("live")
         .expect("exists");
     assert_eq!(live["stage"], "live");
+
+    // ── The monitor (fks 030): a forward window that lost every session ──
+    // is retired by the database, and the spawner has an event to deliver.
+    let doomed = store
+        .create_deployment(&deployment(usable, "ladder-personal", None))
+        .await
+        .expect("a second deployment")["id"]
+        .as_i64()
+        .expect("id");
+    store
+        .promote_deployment(
+            doomed,
+            Promotion::Forward {
+                sessions_required: 5,
+            },
+        )
+        .await
+        .expect("forward")
+        .expect("exists");
+    assert_eq!(
+        store
+            .undelivered_monitor_events()
+            .await
+            .expect("events")
+            .len(),
+        0
+    );
+    let stage = pg.psql_scalar(&format!(
+        "ALTER TABLE edge_forward_sessions DISABLE TRIGGER trg_edge_forward_sessions_admit; \
+         INSERT INTO edge_forward_sessions (deployment_id, session_date, symbol, traded, trade, \
+             session_return, data_ref, runner, code_version) \
+         SELECT {doomed}, current_date - g, 'BTCUSDT', TRUE, '{{}}', -0.01, \
+                '[{{\"path\": \"x\", \"sha256\": \"0\"}}]', 'test', 'test' \
+           FROM generate_series(1, 5) g; \
+         ALTER TABLE edge_forward_sessions ENABLE TRIGGER trg_edge_forward_sessions_admit; \
+         SELECT stage FROM edge_deployments WHERE id = {doomed}"
+    ));
+    assert_eq!(
+        stage.lines().last(),
+        Some("retired"),
+        "the band retires a failed forward window"
+    );
+    let events = store.undelivered_monitor_events().await.expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].deployment_id, doomed);
+    assert!(
+        events[0].reason.contains("band floor"),
+        "{}",
+        events[0].reason
+    );
+    assert_eq!(events[0].symbol, "BTCUSDT");
+    store
+        .mark_monitor_event_delivered(events[0].id)
+        .await
+        .expect("delivered");
+    assert!(
+        store
+            .undelivered_monitor_events()
+            .await
+            .expect("events")
+            .is_empty()
+    );
+    // The board carries each deployment's health and each experiment's selection.
+    let board = store.ladder_board().await.expect("board");
+    assert_eq!(
+        board["health"][doomed.to_string()]["band"]["verdict"],
+        "fail"
+    );
+    assert_eq!(
+        board["health"][good_id.to_string()]["band"]["verdict"],
+        "pass"
+    );
+    let listed = board["experiments"]
+        .as_array()
+        .expect("experiments")
+        .iter()
+        .find(|e| e["id"] == usable)
+        .expect("listed");
+    assert_eq!(
+        listed["selected_params"],
+        serde_json::json!({"threshold_usd": 5_000_000})
+    );
+    assert_eq!(listed["holdout_sessions"], 2);
     assert!(
         store
             .promote_deployment(999_999, Promotion::Live)
