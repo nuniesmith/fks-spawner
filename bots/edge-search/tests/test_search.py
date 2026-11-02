@@ -74,6 +74,7 @@ def test_a_one_point_grid_has_no_neighbours_or_edges_to_check(hypothesis):
     [
         ({"metric": "vibes"}, "metric 'vibes'"),
         ({"baseline": "zero"}, "baseline 'zero'"),
+        ({"evidence": "vibes"}, "evidence 'vibes'"),
         ({"params": [{"name": "lookback", "min": 1, "max": 5000, "step": 1},
                      {"name": "band", "min": 0.0, "max": 0.1, "step": 0.01}]}, "more than 5000"),
         ({"params": [{"name": "lookback", "min": 2000, "max": 3000, "step": 500},
@@ -94,6 +95,8 @@ def test_the_fingerprint_names_the_problem(hypothesis):
     assert a != search.fingerprint("trend-band", hypothesis(), s, ["lookback"], [[50, 150]])
     assert a != search.fingerprint("trend-band", hypothesis(costs={"maker_bps": 0, "taker_bps": 0, "slippage_bps": 0}),
                                    s, ["lookback"], [[50, 100]])
+    assert a != search.fingerprint("trend-band", hypothesis(evidence="low-frequency"),
+                                   s, ["lookback"], [[50, 100]])
     assert a.startswith("trend-band:")
 
 
@@ -104,3 +107,69 @@ def test_the_series_start_is_where_the_data_starts(hypothesis):
     series = [bars("AAAUSDT", random_walk(N, seed=8)), bars("BBBUSDT", random_walk(N, seed=10)), late]
     r = search.run_search(h, "trend-band", spec(), series, prior_trials=0, now=NOW)
     assert r.coverage["CCCUSDT"] == pytest.approx(1.0, abs=1e-3)
+
+
+# ── The low-frequency path (fks 028, EDGE_PROCESS §3–4) ─────────────────────
+
+
+def test_the_low_frequency_path_judges_u4_on_pooled_trades_over_many_coins(hypothesis):
+    # The same three trending coins that fail U4 above: declared
+    # low-frequency, U4 asks for 10 pooled trades and every coin trading.
+    h = hypothesis(evidence="low-frequency")
+    series = [bars(s, regimes(N, seed=10 + i)) for i, s in enumerate(h.symbols)]
+    r = search.run_search(h, "trend-band", spec(), series, prior_trials=0, now=NOW)
+    u4 = {c.id: c for c in r.verdict.clauses}["U4"]
+    assert "low-frequency path" in u4.text
+    by_symbol = r.holdout_trades_by_symbol
+    assert sum(by_symbol.values()) == r.holdout_trades
+    expect = r.holdout_trades >= 10 and all(k > 0 for k in by_symbol.values())
+    assert u4.ok == expect, u4.text
+    assert r.holdout_trades < config.THRESHOLDS["min_holdout_trades"], "still under the trades path's 30"
+
+
+def test_six_trending_coins_reach_the_low_frequency_floor(hypothesis):
+    # Three coins trade 7 times in the holdout (above), short of 10; six
+    # coins with ONE shared parameter set pass U4 on the low-frequency path,
+    # and still fail it on the trades path.
+    syms = [f"C{i}USDT" for i in range(6)]
+    series = [bars(s, regimes(N, seed=10 + i)) for i, s in enumerate(syms)]
+    lf = search.run_search(hypothesis(evidence="low-frequency", symbols=syms), "trend-band", spec(),
+                           series, prior_trials=0, now=NOW)
+    tr = search.run_search(hypothesis(symbols=syms), "trend-band", spec(),
+                           series, prior_trials=0, now=NOW)
+    assert {c.id: c for c in lf.verdict.clauses}["U4"].ok, lf.holdout_trades_by_symbol
+    assert not {c.id: c for c in tr.verdict.clauses}["U4"].ok
+
+
+def test_the_low_frequency_path_needs_many_coins(hypothesis):
+    h = hypothesis(evidence="low-frequency", symbols=["AAAUSDT"])
+    series = [bars("AAAUSDT", regimes(N, seed=10))]
+    r = search.run_search(h, "trend-band", spec(), series, prior_trials=0, now=NOW)
+    u4 = {c.id: c for c in r.verdict.clauses}["U4"]
+    assert not u4.ok and "1 of 1 symbols" in u4.text, u4.text
+
+
+def test_every_search_reports_its_holdout_by_regime(hypothesis):
+    h = hypothesis()
+    series = [bars(s, regimes(N, seed=10 + i)) for i, s in enumerate(h.symbols)]
+    r = search.run_search(h, "trend-band", spec(), series, prior_trials=0, now=NOW)
+    g = r.regimes
+    holdout_bars = len(r.best.holdout)
+    assert g["up"]["bars"] + g["down"]["bars"] + g["unlabeled_bars"] == holdout_bars
+    assert g["up"]["bars"] > 0 and g["down"]["bars"] > 0, g
+    assert g["lookback_days"] == config.THRESHOLDS["regime_lookback_days"]
+    # Report only: no clause is named after it.
+    assert {c.id for c in r.verdict.clauses} == {f"U{i}" for i in range(1, 10)}
+
+
+def test_a_regime_is_known_at_the_bar_before():
+    # Two coins; the regime of holdout bar t must not move when bar t's own
+    # close changes (it would, if the label peeked at t).
+    closes = np.vstack([np.linspace(100, 300, 400), np.linspace(100, 50, 400)])
+    sel = np.zeros(100)
+    a = search.regimes(closes, 300, 400, 86_400_000, "cagr", 365, sel, sel)
+    bumped = closes.copy()
+    bumped[:, 350] *= 100
+    b = search.regimes(bumped, 300, 400, 86_400_000, "cagr", 365, sel, sel)
+    # Only bar 351's label (decided at 350) may change, never bar 350's.
+    assert abs(a["up"]["bars"] - b["up"]["bars"]) <= 1

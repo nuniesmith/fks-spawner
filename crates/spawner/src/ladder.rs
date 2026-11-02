@@ -54,6 +54,11 @@ pub struct HypothesisRequest {
     /// The score, net of `costs`.
     pub metric: String,
     pub costs: Costs,
+    /// The evidence path (fks 028), declared now and frozen: `trades` (U4 as
+    /// written) or `low-frequency` (pooled trades over many coins, split by
+    /// regime; EDGE_PROCESS §3–4). Absent = `trades`.
+    #[serde(default = "default_evidence")]
+    pub evidence: String,
     /// Who registered it. The web UI's adapter sets this from the session;
     /// whatever a browser sent is overwritten there.
     #[serde(default)]
@@ -90,6 +95,7 @@ pub struct Costs {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidHypothesis {
     pub idea: String,
+    pub evidence: String,
     pub symbols: Vec<String>,
     pub dataset: String,
     pub holdout_share: f64,
@@ -98,6 +104,13 @@ pub struct ValidHypothesis {
     pub metric: String,
     pub costs: Value,
     pub registered_by: Option<String>,
+}
+
+/// The evidence paths `edge_hypotheses_evidence_known` (fks 028) allows.
+pub const EVIDENCE_PATHS: &[&str] = &["trades", "low-frequency"];
+
+fn default_evidence() -> String {
+    "trades".to_string()
 }
 
 fn is_symbol(s: &str) -> bool {
@@ -187,6 +200,12 @@ pub fn validate_hypothesis(req: &HypothesisRequest) -> Result<ValidHypothesis, V
     let dataset = text("dataset", &req.dataset, 1, 500, &mut errors);
     let baseline = text("baseline", &req.baseline, 1, 200, &mut errors);
     let metric = text("metric", &req.metric, 1, 200, &mut errors);
+    let evidence = req.evidence.trim().to_string();
+    if !EVIDENCE_PATHS.contains(&evidence.as_str()) {
+        errors.push(format!(
+            "evidence {evidence:?} isn't one of {EVIDENCE_PATHS:?}"
+        ));
+    }
 
     let mut symbols: Vec<String> = Vec::new();
     for s in &req.symbols {
@@ -248,6 +267,7 @@ pub fn validate_hypothesis(req: &HypothesisRequest) -> Result<ValidHypothesis, V
     }
     Ok(ValidHypothesis {
         idea,
+        evidence,
         symbols,
         dataset,
         holdout_share: req.holdout_share,
@@ -425,6 +445,20 @@ mod tests {
             "registered_by": "  jordan  "
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn evidence_defaults_to_trades_and_only_known_paths_pass() {
+        assert_eq!(
+            validate_hypothesis(&hypothesis()).unwrap().evidence,
+            "trades"
+        );
+        let mut h = hypothesis();
+        h.evidence = " low-frequency ".into();
+        assert_eq!(validate_hypothesis(&h).unwrap().evidence, "low-frequency");
+        h.evidence = "vibes".into();
+        let errs = validate_hypothesis(&h).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("evidence")), "{errs:?}");
     }
 
     #[test]

@@ -36,6 +36,9 @@ re-runs it: a search run twice counts its trials twice in N.
   `return over max drawdown after fees` (Calmar).
 - **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule).
 - **costs**: taker plus slippage are paid on every position change.
+- **evidence** (fks 028): `trades` (the default) or `low-frequency`,
+  declared at registration and frozen. It decides how U4 is judged; see
+  below. Choosing it after seeing a trade count is what the freeze stops.
 
 A search that can't run as registered (a bad dataset string, a parameter
 the family doesn't tune, too little data) writes nothing and counts nothing.
@@ -57,12 +60,24 @@ It exits 2 with the reason.
 | U1 | dataset gate | every symbol's bars from its listing to the window's end ≥ 99% present |
 | U2 | pre-registration | registered before the search (the database refuses otherwise too) |
 | U3 | beats the baseline | holdout score > the baseline's on the same holdout |
-| U4 | enough trades | holdout entries, pooled over symbols, ≥ 30 |
+| U4 | enough trades | `trades`: holdout entries, pooled over symbols, ≥ 30. `low-frequency`: ≥ 10 pooled, over ≥ 3 symbols, every symbol trading at least once |
 | U5 | overfit gap | holdout ≥ 50% of the selection score, both above their baselines |
 | U6 | neighbourhood | every one-step grid neighbour of the winner beats the baseline on the holdout |
 | U7 | deflated Sharpe | P(true Sharpe > the best of N null draws) ≥ 0.95, with N = every trial ever run for the edge |
 | U8 | random benchmark | beats ≥ 95% of 1,000 random strategies with the same trades, spell length and costs |
 | U9 | no edge of the range | the winner sits on neither end of a numeric range |
+
+**The low-frequency path** is EDGE_PROCESS §3–4's route for an edge that
+trades a few times a year per coin (a trend band): no history gives it 30
+holdout trades, so it is judged on many coins with ONE shared parameter set.
+U3, U5, U7 and U8 are already judged on the pooled trades; only U4 changes.
+Three coins over a 2-year holdout give a trend band about 7 trades, short of
+10: the low-frequency path needs more coins, not a lower bar.
+
+**The regime split** is reported in `verdict.json` for every search (not a
+clause): each holdout bar is "up" when the coins' mean trailing return over
+`regime_lookback_days` (200), known at the bar before, is positive, and
+"down" otherwise; the selection and the baseline are scored in each.
 
 The thresholds are EDGE_PROCESS §9's **proposals (†)**, kept in
 `config.THRESHOLDS` with a version. The version goes into every
@@ -77,7 +92,7 @@ decided on a bar's close and earns the next bar's return.
 |---|---|
 | `trials.csv` | every grid point: its parameters, fold scores, selection score and trades |
 | `holdout.csv` | each holdout bar's pool return, for the selection and the baseline |
-| `verdict.json` | the row as written, every clause with its numbers, coverage, N, the deflated Sharpe, the random share and the thresholds |
+| `verdict.json` | the row as written, every clause with its numbers, coverage, N, the deflated Sharpe, the random share, the evidence path, holdout trades per symbol, the regime split and the thresholds |
 
 ## Tests
 

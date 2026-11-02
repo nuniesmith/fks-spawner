@@ -1141,6 +1141,24 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
         .await
         .expect_err("editing a registered hypothesis must be refused");
     assert!(edit.to_string().contains("frozen"), "{edit}");
+    assert_eq!(row["evidence"], "trades", "an undeclared path is trades");
+
+    // The evidence path (fks 028) is declared at registration and frozen:
+    // switching to low-frequency after seeing too few trades is refused.
+    let mut lf = h.clone();
+    lf.evidence = "low-frequency".to_string();
+    let lf_row = store
+        .register_hypothesis("liq-fade", &lf)
+        .await
+        .expect("register low-frequency");
+    assert_eq!(lf_row["evidence"], "low-frequency");
+    let lf_id = lf_row["id"].as_i64().expect("id");
+    let switch = sqlx::query("UPDATE edge_hypotheses SET evidence = 'low-frequency' WHERE id = $1")
+        .bind(first)
+        .execute(&pool)
+        .await
+        .expect_err("switching the evidence path must be refused");
+    assert!(switch.to_string().contains("frozen"), "{switch}");
 
     let withdrawn = store
         .withdraw_hypothesis(first, "superseded by a tighter idea")
@@ -1310,7 +1328,11 @@ async fn exercise_edge_ladder(store: &BotRunStore, pg: &DockerPostgres) {
             .filter_map(|r| r["id"].as_i64())
             .collect()
     };
-    assert_eq!(ids("hypotheses"), vec![second, first], "newest first");
+    assert_eq!(
+        ids("hypotheses"),
+        vec![second, lf_id, first],
+        "newest first"
+    );
     assert!(ids("experiments").contains(&usable) && ids("experiments").contains(&rejected));
     assert_eq!(ids("deployments")[0], good_id, "the last one touched first");
     let effort = board["effort"].as_array().expect("effort");

@@ -15,9 +15,12 @@ from .search import Hypothesis, SearchError
 
 def load_hypothesis(conn: psycopg.Connection, hypothesis_id: int) -> Hypothesis:
     row = conn.execute(
-        "SELECT id, edge_id, idea, symbols, dataset, holdout_share, params, baseline, metric, "
-        "       costs, registered_at, status "
-        "FROM edge_hypotheses WHERE id = %s",
+        # `evidence` via to_jsonb so a database without fks 028 still reads
+        # (as 'trades', which is what every row was before it).
+        "SELECT h.id, h.edge_id, h.idea, h.symbols, h.dataset, h.holdout_share, h.params, "
+        "       h.baseline, h.metric, h.costs, h.registered_at, h.status, "
+        "       COALESCE(to_jsonb(h) ->> 'evidence', 'trades') "
+        "FROM edge_hypotheses h WHERE h.id = %s",
         (hypothesis_id,),
     ).fetchone()
     if row is None:
@@ -27,7 +30,7 @@ def load_hypothesis(conn: psycopg.Connection, hypothesis_id: int) -> Hypothesis:
     return Hypothesis(
         id=row[0], edge_id=row[1], idea=row[2], symbols=list(row[3]), dataset=row[4],
         holdout_share=float(row[5]), params=list(row[6]), baseline=row[7], metric=row[8],
-        costs=dict(row[9]), registered_at=row[10],
+        costs=dict(row[9]), registered_at=row[10], evidence=row[12],
     )
 
 
