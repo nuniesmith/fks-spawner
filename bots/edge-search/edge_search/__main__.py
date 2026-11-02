@@ -1,9 +1,12 @@
 import os
 
-# One image, two programs: the search (a job) and the forward runner (a paper
-# bot), so the code that trades forward is the code that searched.
-if os.environ.get("EDGE_RUNNER", "").strip().lower() == "forward":
+# One image, three programs: the search (a job), the forward runner and the
+# signal runner (paper bots), so the code that trades is the code that searched.
+runner = os.environ.get("EDGE_RUNNER", "").strip().lower()
+if runner == "forward":
     from .forward import run
+elif runner == "signal":
+    from .live import run
 else:
     from .core import run
 
