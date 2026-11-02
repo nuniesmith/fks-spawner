@@ -64,7 +64,9 @@ METRICS = {
 }
 
 # Baselines a hypothesis may name (EDGE_PROCESS §2.4).
-BASELINES = ("buy-and-hold", "trend-200d-5pct")
+#: buy-and-hold and trend-200d-5pct judge a position family (trend-band);
+#: session-hold (long each session, open to close) judges the orb family.
+BASELINES = ("buy-and-hold", "trend-200d-5pct", "session-hold")
 
 # The most trials one search may run: a typo'd step can't ask for millions.
 MAX_TRIALS = 5000

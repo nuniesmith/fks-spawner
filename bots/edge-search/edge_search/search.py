@@ -20,14 +20,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 
-from . import engine
+from . import engine, orb
 from .config import BASELINES, EVIDENCE_PATHS, MAX_TRIALS, METRICS, THRESHOLDS
-from .dataset import Bars, DatasetSpec, align, coverage
+from .dataset import Bars, DatasetSpec, MinuteBars, align, coverage
 from .verdict import (
     Verdict,
     boundary_params,
@@ -103,7 +104,8 @@ class Result:
 
 
 def regimes(closes: np.ndarray, hold: int, n: int, bar_ms: int, metric: str,
-            bars_per_year: float, selection: np.ndarray, baseline: np.ndarray) -> dict:
+            bars_per_year: float, selection: np.ndarray, baseline: np.ndarray,
+            lookback_bars: int | None = None) -> dict:
     """The holdout split by market regime, for the record (not a clause).
 
     Holdout bar t earns the return of a position decided at t-1, so its regime
@@ -114,7 +116,7 @@ def regimes(closes: np.ndarray, hold: int, n: int, bar_ms: int, metric: str,
     hypothesis's metric, for the selection and the baseline alike.
     """
     days = THRESHOLDS["regime_lookback_days"]
-    lb = max(1, round(days * 86_400_000 / bar_ms))
+    lb = lookback_bars if lookback_bars is not None else max(1, round(days * 86_400_000 / bar_ms))
     labels: list[str] = []
     for t in range(hold, n):
         a, b = t - 1, t - 1 - lb
@@ -168,11 +170,115 @@ def fingerprint(family: str, h: Hypothesis, spec: DatasetSpec, names: list[str],
     return f"{family}:" + hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+#: A registered window must be complete before it is searched: the data has
+#: to reach this close to its end (weekends and holidays on a session grid).
+END_SLACK_MS = 4 * 86_400_000
+
+
+@dataclass
+class Evaluation:
+    """One parameter set over the whole grid."""
+
+    pool: np.ndarray  # the pool's net return per grid bar
+    entries: np.ndarray  # [symbol, bar] entries
+    state: object  # the family's own record, for its random benchmark
+
+
+@dataclass
+class Problem:
+    """What a family hands the judge: its grid, its runs, its baseline and
+    its random benchmark. Everything after this is the same for every family."""
+
+    times: np.ndarray
+    bar_ms: int
+    bars_per_year: float
+    warm: int
+    t1: int  # the data's exclusive end, ms
+    coverage: dict[str, float]
+    closes: np.ndarray  # [symbol, bar], for the regime split
+    regime_lookback_bars: int
+    evaluate: Callable[[dict], Evaluation]
+    baseline_pools: Callable[[int, int], tuple[np.ndarray, np.ndarray]]
+    random_pools: Callable[[Evaluation, dict, int, np.random.Generator, int], Iterable[np.ndarray]]
+
+
+def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: list[Bars],
+                      combos: list[dict]) -> Problem:
+    if h.baseline not in ("buy-and-hold", "trend-200d-5pct"):
+        raise SearchError(f"{family} is judged against buy-and-hold or trend-200d-5pct, not {h.baseline!r}")
+    bar_ms = spec.bar_ms
+    times, closes = align(series, bar_ms)
+    closes = engine.forward_fill(closes)
+    rets = engine.returns(closes)
+    cost = (float(h.costs.get("taker_bps", 0)) + float(h.costs.get("slippage_bps", 0))) / 10_000
+    baseline_lookback = round(200 * 86_400_000 / bar_ms)
+    warm = max(
+        max(int(c.get("lookback", 0)) for c in combos),
+        baseline_lookback if h.baseline == "trend-200d-5pct" else 0,
+    )
+
+    def evaluate(params: dict) -> Evaluation:
+        pos = engine.positions(family, closes, params)
+        run = engine.run(pos, rets, cost)
+        entries = np.zeros_like(pos)
+        entries[:, 1:] = pos[:, 1:] > pos[:, :-1]
+        return Evaluation(run.pool, entries, pos)
+
+    def baseline_pools(warm_: int, hold: int) -> tuple[np.ndarray, np.ndarray]:
+        if h.baseline == "buy-and-hold":
+            return engine.buy_and_hold(rets, cost, warm_).pool, engine.buy_and_hold(rets, cost, hold).pool
+        base = engine.run(engine.trend_band_positions(closes, baseline_lookback, 0.05), rets, cost).pool
+        return base, base
+
+    def random(ev: Evaluation, params: dict, hold: int, rng: np.random.Generator, draws: int):
+        n = len(times)
+        for _ in range(draws):
+            yield engine.run(random_positions(ev.state, hold, n, rng), rets, cost).pool
+
+    return Problem(
+        times=times, bar_ms=bar_ms, bars_per_year=365 * 86_400_000 / bar_ms, warm=warm,
+        t1=int(times[-1]) + bar_ms, coverage={b.symbol: coverage(b, spec) for b in series},
+        closes=closes, regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / bar_ms)),
+        evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
+    )
+
+
+def _orb_problem(h: Hypothesis, spec: DatasetSpec, series: list[MinuteBars], combos: list[dict]) -> Problem:
+    if h.baseline != orb.BASELINE:
+        raise SearchError(
+            f"orb is judged against {orb.BASELINE!r} (long each session, open to close: the "
+            f"intraday drift an intraday rule could be riding), not {h.baseline!r}"
+        )
+    try:
+        orb.check_params(combos)
+        data = orb.prepare(h.symbols, series, spec, h.costs)
+    except orb.OrbError as e:
+        raise SearchError(str(e)) from None
+    base = orb.session_hold(data)
+
+    def evaluate(params: dict) -> Evaluation:
+        try:
+            trades = orb.trades_for(data, params)
+        except orb.OrbError as e:
+            raise SearchError(str(e)) from None
+        net, entries = orb.daily(data, trades)
+        return Evaluation(orb.pool(net), entries, trades)
+
+    return Problem(
+        times=data.times, bar_ms=86_400_000, bars_per_year=orb.SESSIONS_PER_YEAR, warm=0,
+        t1=int(data.times[-1]) + 86_400_000, coverage=orb.coverage(data),
+        closes=orb.session_closes(data),
+        regime_lookback_bars=orb.regime_lookback_sessions(THRESHOLDS["regime_lookback_days"]),
+        evaluate=evaluate, baseline_pools=lambda warm_, hold: (base, base),
+        random_pools=lambda ev, params, hold, rng, draws: orb.random_pools(data, ev.state, params, hold, rng, draws),
+    )
+
+
 def run_search(
     h: Hypothesis,
     family: str,
     spec: DatasetSpec,
-    series: list[Bars],
+    series: list,
     prior_trials: int,
     now: datetime,
     seed: int = 20261026,
@@ -190,23 +296,24 @@ def run_search(
     if len(combos) > MAX_TRIALS:
         raise SearchError(f"{len(combos)} grid points is more than {MAX_TRIALS}; widen the steps")
 
-    bar_ms = spec.bar_ms
-    bars_per_year = 365 * 86_400_000 / bar_ms
-    times, closes = align(series, bar_ms)
-    closes = engine.forward_fill(closes)
-    rets = engine.returns(closes)
+    problem = (_orb_problem(h, spec, series, combos) if family == "orb"
+               else _position_problem(family, h, spec, series, combos))
+    times, bars_per_year, warm = problem.times, problem.bars_per_year, problem.warm
     n = len(times)
-    cost = (float(h.costs.get("taker_bps", 0)) + float(h.costs.get("slippage_bps", 0))) / 10_000
+
+    # A forward holdout: the split follows the data, so a window searched
+    # before it is complete would move its holdout into data already seen.
+    if problem.t1 < spec.end_ms - END_SLACK_MS:
+        last = datetime.fromtimestamp((problem.t1 - 1) / 1000, tz=now.tzinfo).date()
+        raise SearchError(
+            f"the data ends {last}, before the registered window's end {spec.end}: "
+            "a window is searched once it is complete"
+        )
 
     # 1. The split, by time.
-    t0, t1 = int(times[0]), int(times[-1]) + bar_ms
+    t0, t1 = int(times[0]), problem.t1
     split_ms = t0 + (1.0 - h.holdout_share) * (t1 - t0)
     hold = int(np.searchsorted(times, split_ms))
-    baseline_lookback = round(200 * 86_400_000 / bar_ms)
-    warm = max(
-        max(int(c.get("lookback", 0)) for c in combos),
-        baseline_lookback if h.baseline == "trend-200d-5pct" else 0,
-    )
     k = int(THRESHOLDS["folds"])
     if hold - warm < 2 * k or n - hold < 2:
         raise SearchError(
@@ -218,10 +325,9 @@ def run_search(
     # 2-3. Every grid point on the training folds; the best mean is the selection.
     trials: list[Trial] = []
     for done, params in enumerate(combos, start=1):
-        pos = engine.positions(family, closes, params)
-        run = engine.run(pos, rets, cost)
-        fold_scores = [engine.score(metric, run.pool[a:b], bars_per_year) for a, b in spans]
-        train = run.pool[warm:hold]
+        ev = problem.evaluate(params)
+        fold_scores = [engine.score(metric, ev.pool[a:b], bars_per_year) for a, b in spans]
+        train = ev.pool[warm:hold]
         sd = float(np.std(train, ddof=1)) if len(train) > 1 else 0.0
         trials.append(
             Trial(
@@ -229,22 +335,17 @@ def run_search(
                 folds=fold_scores,
                 selection=float(np.mean(fold_scores)),
                 sharpe_per_bar=float(np.mean(train)) / sd if sd > 0 else 0.0,
-                trades=engine.trades(pos, warm, hold),
-                holdout=run.pool[hold:].copy(),
+                trades=int(ev.entries[:, warm:hold].sum()),
+                holdout=ev.pool[hold:].copy(),
             )
         )
         if progress is not None:
             progress(done, len(combos))
     best = max(trials, key=lambda t: t.selection)
-    best_pos = engine.positions(family, closes, best.params)
+    best_ev = problem.evaluate(best.params)
 
     # The baseline, on the same bars and costs.
-    if h.baseline == "buy-and-hold":
-        base_train = engine.buy_and_hold(rets, cost, warm).pool
-        base_hold = engine.buy_and_hold(rets, cost, hold).pool
-    else:
-        base = engine.run(engine.trend_band_positions(closes, baseline_lookback, 0.05), rets, cost).pool
-        base_train = base_hold = base
+    base_train, base_hold = problem.baseline_pools(warm, hold)
     base_folds = [engine.score(metric, base_train[a:b], bars_per_year) for a, b in spans]
     baseline_selection = float(np.mean(base_folds))
 
@@ -252,11 +353,11 @@ def run_search(
     holdout = best.holdout
     holdout_score = engine.score(metric, holdout, bars_per_year)
     baseline_holdout = engine.score(metric, base_hold[hold:], bars_per_year)
-    holdout_trades = engine.trades(best_pos, hold, n)
+    holdout_trades = int(best_ev.entries[:, hold:n].sum())
 
     # 5. The clauses.
     v = Verdict()
-    cov = {b.symbol: coverage(b, spec) for b in series}
+    cov = problem.coverage
     low = {s: c for s, c in cov.items() if c < THRESHOLDS["min_coverage"]}
     v.add("U1", not low, "dataset complete" if not low else
           "coverage under {:.0%}: {}".format(THRESHOLDS["min_coverage"],
@@ -265,21 +366,21 @@ def run_search(
           f"registered {h.registered_at:%Y-%m-%d %H:%M} UTC, before the search")
     v.add("U3", holdout_score > baseline_holdout,
           f"holdout {holdout_score:.4g} vs {h.baseline} {baseline_holdout:.4g}")
-    per_symbol = {b.symbol: engine.trades(best_pos[i:i + 1], hold, n) for i, b in enumerate(series)}
+    per_symbol = {s: int(best_ev.entries[i, hold:n].sum()) for i, s in enumerate(h.symbols)}
     if h.evidence == "low-frequency":
         # EDGE_PROCESS §3–4: a low-frequency edge can't reach 30 trades on any
         # history; it must instead hold with ONE parameter set across many
         # coins, every one of which trades in the holdout.
         need_t = THRESHOLDS["low_frequency_min_holdout_trades"]
         need_s = THRESHOLDS["low_frequency_min_symbols"]
-        traded = [s for s, k in per_symbol.items() if k > 0]
-        v.add("U4", holdout_trades >= need_t and len(traded) >= need_s and len(traded) == len(series),
+        traded = [s for s, c in per_symbol.items() if c > 0]
+        v.add("U4", holdout_trades >= need_t and len(traded) >= need_s and len(traded) == len(per_symbol),
               f"low-frequency path: {holdout_trades} holdout trades pooled (need {need_t}); "
-              f"{len(traded)} of {len(series)} symbols traded (need {need_s}, and all of them): "
-              + ", ".join(f"{s} {k}" for s, k in per_symbol.items()))
+              f"{len(traded)} of {len(per_symbol)} symbols traded (need {need_s}, and all of them): "
+              + ", ".join(f"{s} {c}" for s, c in per_symbol.items()))
     else:
         v.add("U4", holdout_trades >= THRESHOLDS["min_holdout_trades"],
-              f"{holdout_trades} holdout trades over {len(series)} symbols "
+              f"{holdout_trades} holdout trades over {len(per_symbol)} symbols "
               f"(need {THRESHOLDS['min_holdout_trades']})")
     retention = THRESHOLDS["overfit_retention"]
     keeps = (best.selection > baseline_selection and holdout_score > baseline_holdout
@@ -306,12 +407,11 @@ def run_search(
           f"deflated Sharpe {dsr:.3f} after {trials_total} trials for the edge "
           f"(need {THRESHOLDS['dsr_confidence']})")
     rng = np.random.default_rng(seed)
-    beaten = 0
     draws = int(THRESHOLDS["random_strategies"])
-    for _ in range(draws):
-        rp = random_positions(best_pos, hold, n, rng)
-        if holdout_score > engine.score(metric, engine.run(rp, rets, cost).pool[hold:], bars_per_year):
-            beaten += 1
+    beaten = sum(
+        1 for rp in problem.random_pools(best_ev, best.params, hold, rng, draws)
+        if holdout_score > engine.score(metric, rp[hold:], bars_per_year)
+    )
     share = beaten / draws if draws else 0.0
     v.add("U8", share >= THRESHOLDS["random_beat_share"],
           f"beats {share:.1%} of {draws} random strategies (need {THRESHOLDS['random_beat_share']:.0%})")
@@ -319,7 +419,8 @@ def run_search(
     v.add("U9", not edge, "no parameter on its range's edge" if not edge
           else "on the range's edge: " + ", ".join(edge))
 
-    regime_split = regimes(closes, hold, n, bar_ms, metric, bars_per_year, holdout, base_hold[hold:])
+    regime_split = regimes(problem.closes, hold, n, problem.bar_ms, metric, bars_per_year,
+                           holdout, base_hold[hold:], lookback_bars=problem.regime_lookback_bars)
 
     return Result(
         family=family,

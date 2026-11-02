@@ -16,7 +16,7 @@ re-runs it: a search run twice counts its trials twice in N.
 | Variable | Set by | Meaning |
 |---|---|---|
 | `EDGE_HYPOTHESIS_ID` | the template's form | the registered hypothesis to test |
-| `EDGE_FAMILY` | the template's form | the strategy family, default `trend-band` |
+| `EDGE_FAMILY` | the template's form | the strategy family: `trend-band` (default) or `orb` |
 | `FKS_DB_URL` | the spawner, at spawn | the scoped research role (`fks_backtest`, fks 025) |
 | `LAKE_DIR` | the spawner | the lake, read-only (`/lake`) |
 | `DATA_DIR` | the spawner | this job's folder, `jobs/<instance>` (`/data`) |
@@ -29,20 +29,59 @@ re-runs it: a search run twice counts its trials twice in N.
   a history recorder's. Monthly and daily files are merged, and timestamps
   are normalized: spot is in microseconds from 2025, futures in
   milliseconds.
+  A CME folder (`raw/cme/...`, the `orb` family) is one stitched 1-minute
+  series per root, `<ROOT>/1m/<ROOT>-1m-<period>.csv.gz`, with `rolls.csv`
+  and `roll_flips.csv`. Folders join with `+`, the first winning a minute:
+  `raw/cme/massive-cache+raw/cme/massive 1m 2024-09-09..2027-05-31`.
 - **params**: the family's parameters, each a range with a step (the grid)
   or a list of choices. `trend-band` tunes `lookback` (bars) and `band`
-  (a fraction). At most 5,000 grid points.
+  (a fraction); `orb` tunes `orb_minutes`, `target_r` and `exit`
+  (`target` or `trail`). At most 5,000 grid points.
 - **metric**: `net return after fees` (CAGR), `sharpe after fees`, or
   `return over max drawdown after fees` (Calmar).
-- **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule).
-- **costs**: taker plus slippage are paid on every position change.
+- **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule), for
+  `trend-band`; `session-hold` (long each session, open to close) for `orb`.
+- **costs**: taker plus slippage are paid on every position change. An `orb`
+  hypothesis states `commission_usd_rt` ($ per contract, round turn) and
+  `slippage_ticks` (per side) instead, with the bps fields at 0; the job
+  refuses one that sets both rather than charge twice.
 - **evidence** (fks 028): `trades` (the default) or `low-frequency`,
   declared at registration and frozen. It decides how U4 is judged; see
   below. Choosing it after seeing a trade count is what the freeze stops.
 
 A search that can't run as registered (a bad dataset string, a parameter
 the family doesn't tune, too little data) writes nothing and counts nothing.
-It exits 2 with the reason.
+It exits 2 with the reason. So does a window that **isn't complete yet**:
+the split follows the data, and a forward holdout searched early would
+move into data already seen. The data must reach within 4 days of the
+registered end.
+
+## The `orb` family (`edge_search/orb.py`)
+
+An opening-range breakout on CME futures, one trade per session, judged on a
+session grid (one bar per trading day, 252 a year). Its rules are fixed in
+code, so they are part of every `orb` hypothesis:
+
+| | |
+|---|---|
+| Session | ES/MES/NQ/MNQ 09:30-16:00, GC/MGC 08:20-13:30, New York time (DST-aware) |
+| Range | the first `orb_minutes` minutes' high and low, every minute present |
+| Entry | the first 1-minute close beyond the range, either side, at that close plus slippage; one trade per session |
+| Stop | the other side of the range |
+| Exit | `target`: a limit at `target_r` × risk, filled when a bar trades a tick through it. `trail`: touching it moves the stop 1R behind the best price since. Open at the last bar: out at its close |
+| Fills | a stop the bar opens through fills at the open; a bar touching stop and target is the stop |
+| No trade | roll and interleaved days (`rolls.csv`, `roll_flips.csv`), US exchange holidays, sessions under 98% of their minutes |
+| Return | P&L over the notional at entry, one contract: roots pool as equal weights. MES/MNQ trade the ES/NQ series at their own point value |
+
+U1 counts sessions with at least half their minutes (early closes are
+present) over the weekdays that aren't holidays. U8's random strategies keep
+each symbol's holdout trade count and holding times, at random sessions,
+minutes after the range and sides, with the same costs.
+
+`bots/history/tools/import_futures_cache.py` imported the futures repo's
+Massive cache (ES, NQ, GC, MGC, 2024-09-09..2026-09-11) into
+`raw/cme/massive-cache`, recording the cache's interleaved roll days instead
+of repairing them.
 
 ## How it judges
 

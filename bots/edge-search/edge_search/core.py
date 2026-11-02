@@ -24,7 +24,8 @@ import psycopg
 
 from . import db
 from .config import THRESHOLDS, ConfigError, load
-from .dataset import DatasetError, load_bars, parse_spec
+from . import orb
+from .dataset import DatasetError, load_bars, load_cme_minutes, parse_spec
 from .search import Result, SearchError, run_search
 from .server import Status, serve
 
@@ -104,9 +105,18 @@ def main() -> int:
             spec = parse_spec(h.dataset)
             log.info("hypothesis %d (%s): %s", h.id, h.edge_id, h.idea)
             status.update(phase="reading the dataset")
-            series = [load_bars(cfg.lake_dir, spec, s) for s in h.symbols]
-            for b in series:
-                log.info("%s: %d %s bars from %s", b.symbol, len(b.open_ms), spec.interval,
+            if cfg.family == "orb":
+                try:
+                    roots = [orb.contract(s).root for s in h.symbols]
+                except orb.OrbError as e:
+                    raise SearchError(str(e)) from None
+                series = [load_cme_minutes(cfg.lake_dir, spec, r) for r in roots]
+                names = roots
+            else:
+                series = [load_bars(cfg.lake_dir, spec, s) for s in h.symbols]
+                names = [b.symbol for b in series]
+            for name, b in zip(names, series):
+                log.info("%s: %d %s bars from %s", name, len(b.open_ms), spec.interval,
                          datetime.fromtimestamp(b.open_ms[0] / 1000, timezone.utc).date())
             prior = db.prior_trials(conn, h.edge_id)
             status.update(phase="searching")

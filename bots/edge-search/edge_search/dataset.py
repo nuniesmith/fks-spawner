@@ -11,6 +11,13 @@ are the archive's own zips: <SYMBOL>/klines/<interval>/<SYMBOL>-<interval>-
 <YYYY-MM | YYYY-MM-DD>.zip. Monthly and daily files overlap near the end of
 a month; rows are merged by open time.
 
+CME futures folders (raw/cme/..., read by the `orb` family) hold one
+stitched 1-minute series per root instead: <ROOT>/1m/<ROOT>-1m-<period>.csv.gz
+(open_time_ms,open,high,low,close,volume), with <ROOT>/rolls.csv and
+<ROOT>/roll_flips.csv naming the days a series changes contract. Several
+folders can be joined with '+' (the imported cache, then the recorder that
+keeps it current): for a minute in more than one, the FIRST folder wins.
+
 Two traps from the archive, handled here (bots/history README):
   - spot klines are in MICROSECONDS from 2025 on, milliseconds before, and
     futures in milliseconds: times are normalized to milliseconds;
@@ -20,6 +27,7 @@ Two traps from the archive, handled here (bots/history README):
 from __future__ import annotations
 
 import csv
+import gzip
 import io
 import re
 import zipfile
@@ -36,7 +44,7 @@ INTERVAL_MS = {
 }
 
 SPEC_RE = re.compile(
-    r"^\s*(?P<path>raw/[a-z0-9._/-]+?)/?\s+(?P<interval>\d+[mhd])\s+"
+    r"^\s*(?P<path>raw/[a-z0-9._/-]+?(?:\+raw/[a-z0-9._/-]+?)*)/?\s+(?P<interval>\d+[mhd])\s+"
     r"(?P<start>\d{4}-\d{2}-\d{2})\s*\.\.\s*(?P<end>\d{4}-\d{2}-\d{2})\s*$"
 )
 
@@ -47,10 +55,15 @@ class DatasetError(ValueError):
 
 @dataclass(frozen=True)
 class DatasetSpec:
-    path: str  # under the lake, without the leading raw/
+    path: str  # under the lake, without the leading raw/ ('+' joins folders)
     interval: str
     start: date
     end: date  # inclusive
+
+    @property
+    def paths(self) -> list[str]:
+        """The folders, in the order named: the first one wins a minute."""
+        return self.path.split("+")
 
     @property
     def bar_ms(self) -> int:
@@ -87,10 +100,10 @@ def parse_spec(text: str) -> DatasetSpec:
         raise DatasetError(f"dataset dates: {e}") from None
     if end <= start:
         raise DatasetError("the dataset's end must come after its start")
-    path = m.group("path").removeprefix("raw/").strip("/")
-    if ".." in path.split("/"):
+    parts = [p.removeprefix("raw/").strip("/") for p in m.group("path").split("+")]
+    if any(".." in p.split("/") for p in parts):
         raise DatasetError("the dataset folder can't climb out of the lake")
-    return DatasetSpec(path=path, interval=interval, start=start, end=end)
+    return DatasetSpec(path="+".join(parts), interval=interval, start=start, end=end)
 
 
 @dataclass
@@ -117,6 +130,8 @@ def _to_ms(t: int) -> int:
 
 
 def load_bars(lake: Path, spec: DatasetSpec, symbol: str) -> Bars:
+    if len(spec.paths) > 1:
+        raise DatasetError("a history recorder's dataset names one folder; '+' joins CME folders only")
     folder = lake / spec.path / symbol / "klines" / spec.interval
     if not folder.is_dir():
         raise DatasetError(f"no {spec.interval} klines for {symbol} at {folder}")
@@ -158,3 +173,71 @@ def align(series: list[Bars], bar_ms: int) -> tuple[np.ndarray, np.ndarray]:
         idx = (b.open_ms - first) // bar_ms
         closes[i, idx] = b.close
     return times, closes
+
+
+# ── CME futures: one stitched 1-minute series per root ─────────────────────────
+
+
+@dataclass
+class MinuteBars:
+    """One root's 1-minute OHLCV on its own clock, and the days it must not
+    be traded: the recorded roll days (any detection) and the days the
+    stitched series interleaves two contracts (roll_flips.csv)."""
+
+    root: str
+    open_ms: np.ndarray
+    open: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    close: np.ndarray
+    volume: np.ndarray
+    roll_days: set[date]
+
+
+def _day_column(path: Path, column: str) -> set[date]:
+    if not path.is_file():
+        return set()
+    with path.open(newline="") as f:
+        return {date.fromisoformat(r[column]) for r in csv.DictReader(f) if r.get(column)}
+
+
+def _read_minutes(path: Path) -> np.ndarray:
+    """One file's rows as [n, 6] (open_time_ms, open, high, low, close, volume)."""
+    with gzip.open(path, "rt") as fh:
+        a = np.loadtxt(fh, delimiter=",", skiprows=1, ndmin=2, dtype=float)
+    if a.size and a.shape[1] < 6:
+        raise ValueError(f"{a.shape[1]} columns, expected 6")
+    return a.reshape(-1, 6) if a.size else np.zeros((0, 6))
+
+
+def load_cme_minutes(lake: Path, spec: DatasetSpec, root: str) -> MinuteBars:
+    if spec.interval != "1m":
+        raise DatasetError(f"CME folders hold 1-minute bars; the dataset asks for {spec.interval}")
+    parts: list[np.ndarray] = []
+    roll_days: set[date] = set()
+    found = False
+    for rank, part in enumerate(spec.paths):
+        folder = lake / part / root
+        files = sorted((folder / "1m").glob(f"{root}-1m-*.csv.gz")) if folder.is_dir() else []
+        found = found or bool(files)
+        roll_days |= _day_column(folder / "rolls.csv", "day")
+        roll_days |= _day_column(folder / "roll_flips.csv", "day_utc")
+        for f in files:
+            try:
+                a = _read_minutes(f)
+            except (OSError, ValueError) as e:
+                raise DatasetError(f"{f.name}: {e}") from None
+            keep = (a[:, 0] >= spec.start_ms) & (a[:, 0] < spec.end_ms)
+            parts.append(np.column_stack([a[keep], np.full(int(keep.sum()), rank)]))
+    if not found:
+        raise DatasetError(f"no 1m bars for {root} in {' + '.join(spec.paths)}")
+    rows = np.vstack(parts) if parts else np.zeros((0, 7))
+    if not len(rows):
+        raise DatasetError(f"{root}: no bars between {spec.start} and {spec.end}")
+    # By time, then by folder rank: the first row of each minute is the
+    # earliest-named folder's, which wins.
+    rows = rows[np.lexsort((rows[:, 6], rows[:, 0]))]
+    first = np.concatenate([[True], rows[1:, 0] != rows[:-1, 0]])
+    rows = rows[first]
+    return MinuteBars(root=root, open_ms=rows[:, 0].astype(np.int64), open=rows[:, 1], high=rows[:, 2],
+                      low=rows[:, 3], close=rows[:, 4], volume=rows[:, 5], roll_days=roll_days)
