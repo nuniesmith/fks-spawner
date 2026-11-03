@@ -97,6 +97,15 @@ pub struct Costs {
     /// Futures: slippage per side, in ticks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slippage_ticks: Option<f64>,
+    /// Futures: the prop account the edge would trade (the search's U13):
+    /// contracts of each symbol, the starting balance and the trailing
+    /// drawdown, all three or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_usd: Option<f64>,
 }
 
 /// A hypothesis that passed validation, normalized for the INSERT.
@@ -271,6 +280,42 @@ pub fn validate_hypothesis(req: &HypothesisRequest) -> Result<ValidHypothesis, V
         && !(v.is_finite() && (0.0..=100.0).contains(&v))
     {
         errors.push("costs.slippage_ticks must be between 0 and 100 ticks".to_string());
+    }
+    let account = [
+        c.contracts.is_some(),
+        c.account_usd.is_some(),
+        c.trail_usd.is_some(),
+    ];
+    if account.iter().any(|x| *x) {
+        if !account.iter().all(|x| *x) {
+            errors.push(
+                "costs: the account is contracts, account_usd and trail_usd together".to_string(),
+            );
+        }
+        if c.commission_usd_rt.is_none() {
+            errors.push(
+                "costs: an account (contracts, account_usd, trail_usd) is for a futures \
+                 hypothesis, with commission_usd_rt and slippage_ticks"
+                    .to_string(),
+            );
+        }
+        if c.contracts.is_some_and(|n| !(1..=100).contains(&n)) {
+            errors.push("costs.contracts must be between 1 and 100".to_string());
+        }
+        if c.account_usd
+            .is_some_and(|v| !(v.is_finite() && (1_000.0..=100_000_000.0).contains(&v)))
+        {
+            errors.push(
+                "costs.account_usd must be between 1,000 and 100,000,000 dollars".to_string(),
+            );
+        }
+        if let (Some(t), a) = (c.trail_usd, c.account_usd.unwrap_or(f64::INFINITY))
+            && !(t.is_finite() && t >= 100.0 && t < a)
+        {
+            errors.push(
+                "costs.trail_usd must be at least 100 dollars and under account_usd".to_string(),
+            );
+        }
     }
     if c.commission_usd_rt.is_some() != c.slippage_ticks.is_some() {
         errors.push(
@@ -475,6 +520,36 @@ mod tests {
             "registered_by": "  jordan  "
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn a_futures_account_is_three_terms_together_and_bounded() {
+        let errs = |h: &HypothesisRequest| validate_hypothesis(h).unwrap_err();
+        let mut h = hypothesis();
+        h.costs = serde_json::from_value(json!({
+            "maker_bps": 0, "taker_bps": 0, "slippage_bps": 0,
+            "commission_usd_rt": 1.28, "slippage_ticks": 1,
+            "contracts": 1, "account_usd": 150000, "trail_usd": 4500
+        }))
+        .unwrap();
+        let v = validate_hypothesis(&h).expect("a declared TPT account");
+        assert_eq!(v.costs["trail_usd"], 4500.0);
+        assert_eq!(v.costs["contracts"], 1);
+        h.costs.trail_usd = None;
+        assert!(errs(&h).iter().any(|e| e.contains("together")));
+        h.costs.trail_usd = Some(200000.0);
+        assert!(errs(&h).iter().any(|e| e.contains("under account_usd")));
+        h.costs.trail_usd = Some(4500.0);
+        h.costs.contracts = Some(0);
+        assert!(errs(&h).iter().any(|e| e.contains("contracts must be")));
+        h.costs.contracts = Some(1);
+        h.costs.commission_usd_rt = None;
+        h.costs.slippage_ticks = None;
+        assert!(
+            errs(&h)
+                .iter()
+                .any(|e| e.contains("for a futures hypothesis"))
+        );
     }
 
     #[test]

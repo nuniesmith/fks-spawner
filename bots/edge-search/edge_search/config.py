@@ -29,7 +29,7 @@ from typing import Mapping
 
 THRESHOLDS = {
     # EDGE_PROCESS §9 proposals, 2026-10-26. Bump the version on any change.
-    "version": "edge-process-2026-11-02-proposed",
+    "version": "edge-process-2026-11-02-program-bars-proposed",
     # U1: share of the window's bars present, per symbol.
     "min_coverage": 0.99,
     # U4: holdout trades, pooled over the symbols.
@@ -41,6 +41,12 @@ THRESHOLDS = {
     # U8: share of random strategies (same trades, holding, costs) beaten.
     "random_beat_share": 0.95,
     "random_strategies": 1000,
+    # U10-U13, the futures program's bars (2026-11-02): net expectancy above
+    # 0 at 1x and at this multiple of the costs; both holdout halves above 0;
+    # still above 0 without the best this-many days; the declared prop
+    # account never breaches its trailing drawdown.
+    "cost_stress": 2.0,
+    "concentration_days": 5,
     # The walk-forward over the training part.
     "folds": 4,
     # The low-frequency path (a hypothesis with evidence = 'low-frequency',

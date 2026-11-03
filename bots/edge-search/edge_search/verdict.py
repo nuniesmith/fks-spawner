@@ -14,6 +14,15 @@ and each failed one is written into `verdict_reasons` in words.
      trades, holding period and costs, on the holdout
   U9 no tuned parameter on its range's edge (a dead zone attracting the
      sampler)
+  U10 holdout net expectancy above 0 at 1x and THRESHOLDS["cost_stress"]x costs
+  U11 both halves of the holdout above 0
+  U12 the holdout still above 0 without its THRESHOLDS["concentration_days"]
+      best days
+  U13 a futures edge: the prop account it declares (contracts, account_usd,
+      trail_usd) never breaches its trailing drawdown over the holdout, from
+      a fresh account at the holdout's start
+  (U10-U13 are the futures research program's bars, 2026-11-02, so the
+  ladder can't pass what the program would reject.)
 
 DO NOT PASTE is a result, not a failure: it is kept and counts toward N.
 """

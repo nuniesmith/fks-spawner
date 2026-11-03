@@ -273,6 +273,10 @@ class Trade:
     exit_min: int
     side: int
     ret: float
+    # One contract, in dollars, net of commission and slippage: the trade's
+    # result, and its worst unrealized point (the account path, U13).
+    pnl_usd: float = 0.0
+    mae_usd: float = 0.0
 
 
 @dataclass
@@ -362,8 +366,18 @@ def trades_for(data: OrbData, params: dict) -> list[Trade]:
             if risk <= 0:
                 continue
             x, px = exit_trade(s, int(i), e, side, entry, stop, risk, target_r, mode, slip)
-            ret = side * (px - entry) / entry - data.commission / (entry * s.k.point_value)
-            out.append(Trade(si, int(data.day_of[si][i]), int(i), e, x, side, ret))
+            pv = s.k.point_value
+            ret = side * (px - entry) / entry - data.commission / (entry * pv)
+            pnl = side * (px - entry) * pv - data.commission
+            # The worst price between entry and exit (inclusive of the exit
+            # bar), against the position: what the account saw open.
+            if x > e:
+                worst = np.nanmin(s.l[i, e + 1:x + 1]) if side > 0 else np.nanmax(s.h[i, e + 1:x + 1])
+                adverse = min(0.0, side * (float(worst) - entry) * pv)
+            else:
+                adverse = 0.0
+            mae = min(adverse - data.commission, pnl)
+            out.append(Trade(si, int(data.day_of[si][i]), int(i), e, x, side, ret, pnl, mae))
     return out
 
 
@@ -465,3 +479,39 @@ def regime_lookback_sessions(days: int) -> int:
 
 def coverage(data: OrbData) -> dict[str, float]:
     return {s.symbol: s.coverage for s in data.sessions}
+
+
+# ── The account a prop firm judges (U13) ──────────────────────────────────────
+
+
+def account_path(data: OrbData, trades: list[Trade], start: int, contracts: int,
+                 account_usd: float, trail_usd: float) -> dict:
+    """A fresh account from grid day `start` on, trading `contracts` of each
+    symbol, against a trailing floor: account_usd - trail_usd at first,
+    rising with the best end-of-day balance and stopping at account_usd
+    (TPT's rule). Breached the first time a day's worst point (the balance
+    before it plus every trade's worst excursion that day, as if all at
+    once: conservative) or its close is at or under the floor."""
+    days = len(data.times)
+    pnl = np.zeros(days)
+    worst = np.zeros(days)
+    for t in trades:
+        if t.day >= start:
+            pnl[t.day] += t.pnl_usd * contracts
+            worst[t.day] += t.mae_usd * contracts
+    balance = peak = float(account_usd)
+    floor = account_usd - trail_usd
+    headroom, breach, low_day = float("inf"), None, None
+    for j in range(start, days):
+        low = balance + worst[j]
+        room = min(low, balance + pnl[j]) - floor
+        if room < headroom:
+            headroom, low_day = room, j
+        if room <= 0 and breach is None:
+            breach = j
+        balance += pnl[j]
+        peak = max(peak, balance)
+        floor = min(account_usd, peak - trail_usd)
+    day = lambda j: None if j is None else str(np.datetime64(int(data.times[j]), "ms").astype("datetime64[D]"))  # noqa: E731
+    return {"breached": breach is not None, "breach_day": day(breach), "worst_headroom": headroom,
+            "worst_day": day(low_day), "final_balance": balance, "floor_locked": floor >= account_usd}
