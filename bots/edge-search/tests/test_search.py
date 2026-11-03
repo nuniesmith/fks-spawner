@@ -26,8 +26,8 @@ def test_a_random_walk_is_not_an_edge(hypothesis):
     r = search.run_search(h, "trend-band", spec(), series, prior_trials=100, now=NOW)
     assert r.verdict.label == "DO NOT PASTE"
     assert r.n_trials == 20 and r.trials_total == 120
-    assert len(r.verdict.clauses) == 9
-    assert [c.id for c in r.verdict.clauses] == [f"U{i}" for i in range(1, 10)]
+    assert len(r.verdict.clauses) == 13
+    assert [c.id for c in r.verdict.clauses] == [f"U{i}" for i in range(1, 14)]
     assert r.coverage == {s: pytest.approx(1.0, abs=1e-3) for s in h.symbols}
     # The holdout is the last quarter, by time.
     assert r.test_days == pytest.approx(N * 0.25, abs=2)
@@ -159,7 +159,7 @@ def test_every_search_reports_its_holdout_by_regime(hypothesis):
     assert g["up"]["bars"] > 0 and g["down"]["bars"] > 0, g
     assert g["lookback_days"] == config.THRESHOLDS["regime_lookback_days"]
     # Report only: no clause is named after it.
-    assert {c.id for c in r.verdict.clauses} == {f"U{i}" for i in range(1, 10)}
+    assert {c.id for c in r.verdict.clauses} == {f"U{i}" for i in range(1, 14)}
 
 
 def test_a_regime_is_known_at_the_bar_before():

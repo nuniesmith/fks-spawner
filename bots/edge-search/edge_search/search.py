@@ -21,7 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import numpy as np
@@ -200,6 +200,11 @@ class Problem:
     evaluate: Callable[[dict], Evaluation]
     baseline_pools: Callable[[int, int], tuple[np.ndarray, np.ndarray]]
     random_pools: Callable[[Evaluation, dict, int, np.random.Generator, int], Iterable[np.ndarray]]
+    #: The same run with every cost multiplied (U10's stress).
+    evaluate_costs: Callable[[dict, float], Evaluation] | None = None
+    #: The account a prop firm would judge, from bar `hold` on (U13); None
+    #: when the family trades a cash account.
+    account: Callable[[Evaluation, int], dict] | None = None
 
 
 def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: list[Bars],
@@ -217,12 +222,15 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
         baseline_lookback if h.baseline == "trend-200d-5pct" else 0,
     )
 
-    def evaluate(params: dict) -> Evaluation:
+    def evaluate_costs(params: dict, mult: float) -> Evaluation:
         pos = engine.positions(family, closes, params)
-        run = engine.run(pos, rets, cost)
+        run = engine.run(pos, rets, cost * mult)
         entries = np.zeros_like(pos)
         entries[:, 1:] = pos[:, 1:] > pos[:, :-1]
         return Evaluation(run.pool, entries, pos)
+
+    def evaluate(params: dict) -> Evaluation:
+        return evaluate_costs(params, 1.0)
 
     def baseline_pools(warm_: int, hold: int) -> tuple[np.ndarray, np.ndarray]:
         if h.baseline == "buy-and-hold":
@@ -240,6 +248,7 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
         t1=int(times[-1]) + bar_ms, coverage={b.symbol: coverage(b, spec) for b in series},
         closes=closes, regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / bar_ms)),
         evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
+        evaluate_costs=evaluate_costs,
     )
 
 
@@ -256,13 +265,25 @@ def _orb_problem(h: Hypothesis, spec: DatasetSpec, series: list[MinuteBars], com
         raise SearchError(str(e)) from None
     base = orb.session_hold(data)
 
-    def evaluate(params: dict) -> Evaluation:
+    def evaluate_costs(params: dict, mult: float) -> Evaluation:
+        d = data if mult == 1.0 else replace(data, commission=data.commission * mult,
+                                             slip_ticks=data.slip_ticks * mult)
         try:
-            trades = orb.trades_for(data, params)
+            trades = orb.trades_for(d, params)
         except orb.OrbError as e:
             raise SearchError(str(e)) from None
-        net, entries = orb.daily(data, trades)
+        net, entries = orb.daily(d, trades)
         return Evaluation(orb.pool(net), entries, trades)
+
+    def evaluate(params: dict) -> Evaluation:
+        return evaluate_costs(params, 1.0)
+
+    acct = account_terms(h.costs)
+
+    def account(ev: Evaluation, hold: int) -> dict:
+        if acct is None:
+            return {"declared": False}
+        return {"declared": True, **acct, **orb.account_path(data, ev.state, hold, **acct)}
 
     return Problem(
         times=data.times, bar_ms=86_400_000, bars_per_year=orb.SESSIONS_PER_YEAR, warm=0,
@@ -271,7 +292,30 @@ def _orb_problem(h: Hypothesis, spec: DatasetSpec, series: list[MinuteBars], com
         regime_lookback_bars=orb.regime_lookback_sessions(THRESHOLDS["regime_lookback_days"]),
         evaluate=evaluate, baseline_pools=lambda warm_, hold: (base, base),
         random_pools=lambda ev, params, hold, rng, draws: orb.random_pools(data, ev.state, params, hold, rng, draws),
+        evaluate_costs=evaluate_costs, account=account,
     )
+
+
+def account_terms(costs: dict) -> dict | None:
+    """The prop account a futures hypothesis declares (U13): contracts per
+    symbol, the starting balance and the trailing drawdown, all or none."""
+    keys = ("contracts", "account_usd", "trail_usd")
+    present = [k for k in keys if costs.get(k) is not None]
+    if not present:
+        return None
+    if len(present) != len(keys):
+        raise SearchError(f"the account is contracts, account_usd and trail_usd together; got {present}")
+    return {"contracts": int(costs["contracts"]), "account_usd": float(costs["account_usd"]),
+            "trail_usd": float(costs["trail_usd"])}
+
+
+def day_sums(times: np.ndarray, pool: np.ndarray) -> np.ndarray:
+    """The pool's net return summed per UTC day (bars may be shorter than a day)."""
+    days = (np.asarray(times, dtype=np.int64) // 86_400_000)
+    if not len(days):
+        return np.zeros(0)
+    _, idx = np.unique(days, return_inverse=True)
+    return np.bincount(idx, weights=pool)
 
 
 def run_search(
@@ -418,6 +462,37 @@ def run_search(
     edge = boundary_params(best.params, names, values)
     v.add("U9", not edge, "no parameter on its range's edge" if not edge
           else "on the range's edge: " + ", ".join(edge))
+
+    # The futures program's bars (2026-11-02), on the same holdout.
+    mult = float(THRESHOLDS["cost_stress"])
+    stressed = (problem.evaluate_costs(best.params, mult).pool[hold:]
+                if problem.evaluate_costs is not None else holdout)
+    m1, m2 = float(np.mean(holdout)), float(np.mean(stressed))
+    v.add("U10", m1 > 0 and m2 > 0,
+          f"holdout mean net return per bar {m1:.3g} at 1x costs, {m2:.3g} at {mult:g}x (both must be above 0)")
+    half = len(holdout) // 2
+    first, second = float(np.sum(holdout[:half])), float(np.sum(holdout[half:]))
+    v.add("U11", first > 0 and second > 0,
+          f"holdout halves {first:.4g} / {second:.4g} (both must be above 0)")
+    k_days = int(THRESHOLDS["concentration_days"])
+    by_day = day_sums(times[hold:], holdout)
+    rest = float(np.sum(np.sort(by_day)[:-k_days])) if len(by_day) > k_days else 0.0
+    v.add("U12", rest > 0,
+          f"holdout without its best {k_days} days {rest:.4g} (of {float(np.sum(by_day)):.4g}; must stay above 0)")
+    if problem.account is None:
+        v.add("U13", True, "a cash account: no trailing drawdown to survive")
+    else:
+        acc = problem.account(best_ev, hold)
+        if not acc["declared"]:
+            v.add("U13", False, "no prop account declared (contracts, account_usd, trail_usd): a futures "
+                                "edge is judged on the account it would trade")
+        else:
+            v.add("U13", not acc["breached"],
+                  f"{acc['contracts']} contract(s) per symbol on ${acc['account_usd']:,.0f} with a "
+                  f"${acc['trail_usd']:,.0f} trail from the holdout's start: "
+                  + (f"BREACHED {acc['breach_day']}" if acc["breached"] else "no breach")
+                  + f"; worst headroom ${acc['worst_headroom']:,.2f} ({acc['worst_day']}), "
+                  f"final ${acc['final_balance']:,.2f}")
 
     regime_split = regimes(problem.closes, hold, n, problem.bar_ms, metric, bars_per_year,
                            holdout, base_hold[hold:], lookback_bars=problem.regime_lookback_bars)
