@@ -1,0 +1,32 @@
+# =============================================================================
+# fks-mcp CI: the MCP server's tests (tools/fks-mcp is Python, rust.yml skips it)
+# =============================================================================
+name: 🔌 fks-mcp
+on:
+    pull_request:
+        paths:
+            - "tools/fks-mcp/**"
+            - ".github/workflows/fks-mcp.yml"
+    push:
+        branches: [main]
+        paths:
+            - "tools/fks-mcp/**"
+            - ".github/workflows/fks-mcp.yml"
+
+concurrency:
+    group: fks-mcp-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    test:
+        name: 🧪 pytest
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-python@v5
+              with:
+                  python-version: "3.12"
+            - name: Install
+              run: pip install -r tools/fks-mcp/requirements.txt pytest
+            - name: Test
+              run: python -m pytest tools/fks-mcp/tests -q
