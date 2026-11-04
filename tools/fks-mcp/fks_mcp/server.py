@@ -68,12 +68,16 @@ def build(fks: FKS | None = None) -> MCPServer:
         return run(lambda: api().create_edge(edge_id, name, edge_type, assets))
 
     @server.tool(description="Register a hypothesis on an edge. It is FROZEN once registered. Fields: "
-                             "idea (str), symbols (list), dataset ('<folder> <interval> <from>..<to>', see "
-                             "datasets), holdout_share (0..1, e.g. 0.25), params (list of {name, choices} or "
-                             "{name, min, max, step}), baseline (str), metric (e.g. 'sharpe'), costs "
-                             "({maker_bps, taker_bps, slippage_bps} for crypto; {commission_usd_rt, "
-                             "slippage_ticks, contracts, account_usd, trail_usd} for futures), evidence (str: "
-                             "why this might work, before any search).")
+                             "idea (20-1000 chars), symbols (list, e.g. ['BTCUSDT'] or ['MES','MNQ']), dataset "
+                             "('<folder> <interval> <from>..<to>', see datasets), holdout_share (e.g. 0.25), "
+                             "params (list of {name, choices} or {name, min, max, step}; trend-band tunes "
+                             "lookback (bars) and band (fraction), orb tunes orb_minutes, target_r, exit; at "
+                             "most 5000 grid points), baseline ('buy-and-hold' or 'trend-200d-5pct' for "
+                             "trend-band, 'session-hold' for orb), metric ('net return after fees', 'sharpe "
+                             "after fees' or 'return over max drawdown after fees'), costs ({maker_bps, "
+                             "taker_bps, slippage_bps} for crypto, e.g. 40/80/5 = Kraken tier 1; "
+                             "{commission_usd_rt, slippage_ticks, contracts, account_usd, trail_usd} for "
+                             "futures), evidence ('trades', the default, or 'low-frequency').")
     def register_hypothesis(edge_id: str, hypothesis: dict[str, Any]) -> str:
         return run(lambda: api().register_hypothesis(edge_id, hypothesis))
 
