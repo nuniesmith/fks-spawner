@@ -39,14 +39,24 @@ check), so a lagging API is never frozen into the lake as a gap.
 
 The gzip header carries no timestamp, so the same rows always give the same
 bytes and the same sha256.
+
+RATE LIMITS. KuCoin's public API allows about 2,000 request-weight per 30 s
+per IP, and every KuCoin instance on a host shares that IP. Requests are
+paced (MIN_INTERVAL_S apart per process, env KUCOIN_MIN_INTERVAL_S), and an
+HTTP 429 or 5xx is retried after a growing pause (1, 2, 4 ... 32 s) before
+it counts as an error. Found 2026-11-07: two instances with 16 symbols each,
+unpaced, had 2,388 of 5,616 first-pass requests refused with 429 (nothing
+wrong was written: a refused page fails its whole period).
 """
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import hashlib
 import json
 import os
+import weakref
 from datetime import datetime, timezone
 
 from .plan import Target
@@ -70,6 +80,28 @@ SPOT_KLINE_CAP = 1500
 SETTLE_MS = 2 * 86_400_000
 #: More pages than any one period needs means the API is not advancing.
 MAX_PAGES = 400
+#: Seconds between requests from one process: 5 a second keeps two
+#: instances on one IP well inside KuCoin's public limit.
+MIN_INTERVAL_S = float(os.environ.get("KUCOIN_MIN_INTERVAL_S", "0.2"))
+#: Pauses before retrying a 429 or a 5xx; then it counts as an error.
+RETRY_DELAYS_S = (1, 2, 4, 8, 16, 32)
+
+# One pacer per event loop (tests run many loops; a lock belongs to one).
+_pacers: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, tuple[asyncio.Lock, list[float]]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _pace() -> None:
+    if MIN_INTERVAL_S <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    lock, last = _pacers.setdefault(loop, (asyncio.Lock(), [0.0]))
+    async with lock:
+        wait = last[0] + MIN_INTERVAL_S - loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        last[0] = loop.time()
 
 KLINE_HEADER = "open_time_ms,open,high,low,close,volume,turnover"
 FUNDING_HEADER = "funding_time_ms,funding_rate"
@@ -96,14 +128,24 @@ def period_ms(t: Target) -> tuple[int, int]:
 
 
 async def _get(fetch, url: str):
-    status, body = await fetch(url)
+    for delay in (*RETRY_DELAYS_S, None):
+        await _pace()
+        status, body = await fetch(url)
+        doc = None
+        if status == 200:
+            try:
+                # Numbers stay the strings KuCoin sent: nothing is reformatted.
+                doc = json.loads(body, parse_float=str, parse_int=str)
+            except ValueError:
+                raise KucoinError("KuCoin's answer is not JSON") from None
+        # A rate limit comes as HTTP 429, or as code 429000 in a 200.
+        limited = status == 429 or status >= 500 or (doc is not None and str(doc.get("code")) == "429000")
+        if limited and delay is not None:
+            await asyncio.sleep(delay)
+            continue
+        break
     if status != 200:
         raise KucoinError(f"KuCoin answered HTTP {status}")
-    try:
-        # Numbers stay the strings KuCoin sent: nothing is reformatted.
-        doc = json.loads(body, parse_float=str, parse_int=str)
-    except ValueError:
-        raise KucoinError("KuCoin's answer is not JSON") from None
     if str(doc.get("code")) != "200000":
         raise KucoinError(f"KuCoin code {doc.get('code')}: {str(doc.get('msg'))[:120]}")
     return doc.get("data")

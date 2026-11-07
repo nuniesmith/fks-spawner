@@ -33,6 +33,8 @@ class FakeKucoin:
         self.spot: dict[tuple[str, str], dict[int, list]] = {}
         self.calls: list[str] = []
         self.code = "200000"
+        self.refuse = 0  # answer this many requests with HTTP 429 first
+        self.refuse_in_body = 0  # ... or with code 429000 in a 200
 
     def futures_candles(self, symbol, gran, start, end, step):
         rows = self.fut.setdefault((symbol, gran), {})
@@ -55,6 +57,12 @@ class FakeKucoin:
         self.calls.append(url)
         u = urlparse(url)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if self.refuse:
+            self.refuse -= 1
+            return 429, b""
+        if self.refuse_in_body:
+            self.refuse_in_body -= 1
+            return 200, json.dumps({"code": "429000", "msg": "Too many requests"}).encode()
         if self.code != "200000":
             return 200, json.dumps({"code": self.code, "msg": "Too many requests"}).encode()
         if u.path == "/api/v1/kline/query":
@@ -75,6 +83,13 @@ class FakeKucoin:
 @pytest.fixture
 def kc():
     return FakeKucoin()
+
+
+@pytest.fixture(autouse=True)
+def no_waiting(monkeypatch):
+    """Pacing and back-off are real seconds; the tests that check them set their own."""
+    monkeypatch.setattr(kucoin, "MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(kucoin, "RETRY_DELAYS_S", (0, 0, 0, 0, 0, 0))
 
 
 @pytest.fixture
@@ -183,6 +198,39 @@ def test_no_rows_is_missing_like_a_404(kcfg, kc, cycle):
     # 2 months older than 45 days -> never (Aug); Sep + 35 days -> not yet
     assert (s["present"], s["not_published"], s["pending"], s["errors"]) == (0, 1, 36, 0)
     assert not list(cfg.data_dir.glob("XBTUSDTM/**/*.csv.gz"))
+
+
+def test_a_rate_limit_is_retried_and_the_period_still_lands(kcfg, kc):
+    cfg = kcfg(HISTORY_DATASETS="fundingRate")
+    kc.funding_every("XBTUSDTM", ms(2026, 9, 1), ms(2026, 10, 1), 8 * H)
+    kc.refuse, kc.refuse_in_body = 2, 1  # 429, 429, then code 429000, then the data
+    t = target(cfg, "fundingRate", "monthly", date(2026, 9, 1))
+    assert fetch(cfg, kc, t)[0] == "downloaded"
+    assert len(kc.calls) == 4 and len(read_csv(t.path(cfg))[1]) == 90
+
+
+def test_a_rate_limit_that_never_lifts_is_an_error_and_writes_nothing(kcfg, kc, cycle):
+    cfg = kcfg(HISTORY_DATASETS="fundingRate")
+    kc.funding_every("XBTUSDTM", ms(2026, 9, 1), ms(2026, 10, 27), 8 * H)
+    kc.refuse = 10 ** 6
+    status = cycle(cfg, kc)
+    assert status.cycle["errors"] > 0 and "HTTP 429" in status.recent_errors[0]["error"]
+    # every attempt: the first try plus one per back-off step
+    assert len(kc.calls) == status.cycle["planned"] * (len(kucoin.RETRY_DELAYS_S) + 1)
+    assert not list(cfg.data_dir.glob("XBTUSDTM/**/*.csv.gz"))
+
+
+def test_requests_are_paced(monkeypatch):
+    monkeypatch.setattr(kucoin, "MIN_INTERVAL_S", 0.05)
+
+    async def three():
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        for _ in range(3):
+            await kucoin._pace()
+        return loop.time() - t0
+
+    assert asyncio.run(three()) >= 0.1  # the 2nd and 3rd wait 0.05 s each
 
 
 def test_an_error_code_is_an_error_and_writes_nothing(kcfg, kc, cycle):
