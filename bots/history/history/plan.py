@@ -33,6 +33,7 @@ class Target:
     interval: str | None
     period: str  # "monthly" | "daily"
     day: date  # the first of the month for a monthly file
+    ext: str = "zip"  # the archive's zips; "csv.gz" for rows KuCoin's API gave
 
     @property
     def last_day(self) -> date:
@@ -49,7 +50,7 @@ class Target:
     @property
     def filename(self) -> str:
         middle = self.interval if self.interval else self.dataset
-        return f"{self.symbol}-{middle}-{self.stamp}.zip"
+        return f"{self.symbol}-{middle}-{self.stamp}.{self.ext}"
 
     def url(self, cfg: Config) -> str:
         parts = [cfg.base_url, "data", cfg.market_path, self.period, self.dataset, self.symbol]
@@ -90,14 +91,16 @@ def targets(cfg: Config, today: date) -> list[Target]:
     yesterday = today - timedelta(days=1)
     window_start = max(cfg.start, today - timedelta(days=DAILY_WINDOW_DAYS))
     out: list[Target] = []
+    ext = cfg.file_ext
     for name in cfg.datasets:
         ds = DATASETS[name]
+        periods = cfg.periods(name)
         for symbol in cfg.symbols:
             for interval in (cfg.intervals if ds.per_interval else (None,)):
-                if "monthly" in ds.periods:
-                    out += [Target(name, symbol, interval, "monthly", m) for m in months(cfg.start, today)]
-                    if "daily" in ds.periods:
-                        out += [Target(name, symbol, interval, "daily", d) for d in days(window_start, yesterday)]
+                if "monthly" in periods:
+                    out += [Target(name, symbol, interval, "monthly", m, ext) for m in months(cfg.start, today)]
+                    if "daily" in periods:
+                        out += [Target(name, symbol, interval, "daily", d, ext) for d in days(window_start, yesterday)]
                 else:  # daily only
-                    out += [Target(name, symbol, interval, "daily", d) for d in days(cfg.start, yesterday)]
+                    out += [Target(name, symbol, interval, "daily", d, ext) for d in days(cfg.start, yesterday)]
     return sorted(out)
