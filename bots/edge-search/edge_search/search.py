@@ -26,7 +26,7 @@ from datetime import datetime
 
 import numpy as np
 
-from . import engine, orb
+from . import carry, engine, orb
 from .config import BASELINES, EVIDENCE_PATHS, MAX_TRIALS, METRICS, THRESHOLDS
 from .dataset import Bars, DatasetSpec, MinuteBars, align, align_funding, coverage
 from .verdict import (
@@ -104,6 +104,8 @@ class Result:
     #: A perpetual's funding, as applied: each symbol's mean rate and what
     #: the selection paid, per year in the market. None for spot and sessions.
     funding: dict | None = None
+    #: The carry family's record (carry.report). None for other families.
+    carry: dict | None = None
 
 
 def regimes(closes: np.ndarray, hold: int, n: int, bar_ms: int, metric: str,
@@ -211,6 +213,9 @@ class Problem:
     #: A perpetual's funding[symbol, bar], already in every run; None for
     #: spot and sessions. Kept to report what the selection paid.
     funding: np.ndarray | None = None
+    #: The carry family's record of the selection (leverage, liquidations,
+    #: funding received), from bar `hold` on for the holdout figures.
+    carry_report: Callable[[Evaluation, int], dict] | None = None
 
 
 def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: list[Bars],
@@ -259,6 +264,56 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
         closes=closes, regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / bar_ms)),
         evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
         evaluate_costs=evaluate_costs, funding=funding,
+    )
+
+
+def _carry_problem(h: Hypothesis, spec: DatasetSpec, series: list, combos: list[dict]) -> Problem:
+    if h.baseline != carry.BASELINE:
+        raise SearchError(
+            f"carry is judged against {carry.BASELINE!r} (holding the pair the whole time: what "
+            f"timing it must beat), not {h.baseline!r}"
+        )
+    try:
+        leverage = carry.check_params(combos)
+        d = carry.prepare(series, spec.bar_ms, spec)
+    except carry.CarryError as e:
+        raise SearchError(str(e)) from None
+    # Fee plus slippage on EACH leg, per side: a pair's entry or exit trades both.
+    leg_cost = (float(h.costs.get("taker_bps", 0)) + float(h.costs.get("slippage_bps", 0))) / 10_000
+    warm = max(int(c["lookback"]) for c in combos)
+    wants: dict[tuple, np.ndarray] = {}
+
+    def want(params: dict) -> np.ndarray:
+        key = carry.params_of(params)
+        if key not in wants:
+            wants[key] = carry.wanted(d, *key)
+        return wants[key]
+
+    def evaluate_costs(params: dict, mult: float) -> Evaluation:
+        sim = carry.simulate(d, want(params), leg_cost * mult, leverage)
+        entries = np.zeros_like(sim.pos)
+        entries[:, 1:] = sim.pos[:, 1:] > sim.pos[:, :-1]
+        return Evaluation(sim.pool, entries, sim)
+
+    def evaluate(params: dict) -> Evaluation:
+        return evaluate_costs(params, 1.0)
+
+    def baseline_pools(warm_: int, hold: int) -> tuple[np.ndarray, np.ndarray]:
+        return (carry.simulate(d, carry.always(d, warm_), leg_cost, leverage).pool,
+                carry.simulate(d, carry.always(d, hold), leg_cost, leverage).pool)
+
+    def random(ev: Evaluation, params: dict, hold: int, rng: np.random.Generator, draws: int):
+        n = len(d.times)
+        for _ in range(draws):
+            yield carry.simulate(d, random_positions(ev.state.pos, hold, n, rng), leg_cost, leverage).pool
+
+    return Problem(
+        times=d.times, bar_ms=d.bar_ms, bars_per_year=d.bars_per_year, warm=warm,
+        t1=int(d.times[-1]) + d.bar_ms, coverage=d.coverage, closes=d.spot_close,
+        regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / d.bar_ms)),
+        evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
+        evaluate_costs=evaluate_costs,
+        carry_report=lambda ev, hold: carry.report(d, ev.state, hold, leverage),
     )
 
 
@@ -350,8 +405,12 @@ def run_search(
     if len(combos) > MAX_TRIALS:
         raise SearchError(f"{len(combos)} grid points is more than {MAX_TRIALS}; widen the steps")
 
-    problem = (_orb_problem(h, spec, series, combos) if family == "orb"
-               else _position_problem(family, h, spec, series, combos))
+    if family == "orb":
+        problem = _orb_problem(h, spec, series, combos)
+    elif family == "carry":
+        problem = _carry_problem(h, spec, series, combos)
+    else:
+        problem = _position_problem(family, h, spec, series, combos)
     times, bars_per_year, warm = problem.times, problem.bars_per_year, problem.warm
     n = len(times)
 
@@ -550,4 +609,5 @@ def run_search(
         holdout_trades_by_symbol=per_symbol,
         regimes=regime_split,
         funding=funding_summary,
+        carry=problem.carry_report(best_ev, hold) if problem.carry_report is not None else None,
     )
