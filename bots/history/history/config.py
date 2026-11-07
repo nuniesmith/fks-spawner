@@ -1,18 +1,22 @@
 """History-recorder configuration, read from the environment.
 
-The spawner sets these from a `history.binance-*` template's form (one
-template per market, since the market names the lake folder); the same names
-work by hand with `docker run -e ...`.
+The spawner sets these from a `history.*` template's form (one template per
+market, since the market names the lake folder); the same names work by hand
+with `docker run -e ...`.
 
-  HISTORY_MARKET      spot | usdm (USDⓈ-M futures); required
-  HISTORY_SYMBOLS     comma-separated, e.g. BTCUSDT,ETHUSDT; required
-  HISTORY_DATASETS    klines (default); usdm also offers fundingRate, metrics
-  HISTORY_INTERVALS   kline intervals (default 1h,1d)
+  HISTORY_MARKET      spot | usdm (Binance's archive) | kucoin-futures |
+                      kucoin-spot (KuCoin's API, see kucoin.py); required
+  HISTORY_SYMBOLS     comma-separated, e.g. BTCUSDT,ETHUSDT (Binance, KuCoin
+                      spot pairs) or XBTUSDTM,ETHUSDTM (KuCoin contracts)
+  HISTORY_DATASETS    klines (default); usdm also offers fundingRate, metrics;
+                      kucoin-futures also offers fundingRate
+  HISTORY_INTERVALS   kline intervals (default 1h,1d; KuCoin: 1h, 4h, 1d)
   HISTORY_START       first month, YYYY-MM, or a year YYYY for its January
                       (default 2020-01)
   HISTORY_POLL_HOURS  hours between checks for new files (default 6)
   HISTORY_CONCURRENCY parallel downloads (default 4, at most 8)
-  HISTORY_BASE_URL    the archive (default https://data.binance.vision)
+  HISTORY_BASE_URL    the source (default: data.binance.vision, or KuCoin's
+                      futures or spot API for the kucoin-* markets)
   DATA_DIR            where files go (default /data)
   RECORDER_PORT       the /health, /metrics, /status port (default 9091)
   FKS_BOT_ID          set by the spawner; names this instance in logs
@@ -49,10 +53,24 @@ DATASETS = {
 }
 
 # Archive path per market, and the datasets it publishes. The names match
-# the lake's (raw/binance/<market>/...).
+# the lake's (raw/<venue>/<market>/...). KuCoin has no archive: kucoin.py
+# pages its API, so its "path" is unused.
 MARKETS = {
     "spot": ("spot", ("klines",)),
     "usdm": ("futures/um", ("klines", "fundingRate", "metrics")),
+    "kucoin-futures": ("", ("klines", "fundingRate")),
+    "kucoin-spot": ("", ("klines",)),
+}
+KUCOIN_MARKETS = ("kucoin-futures", "kucoin-spot")
+# The API answers any period, so KuCoin funding is kept daily as well as
+# monthly (the archive publishes Binance's monthly only).
+KUCOIN_PERIODS = {"klines": ("monthly", "daily"), "fundingRate": ("monthly", "daily")}
+KUCOIN_INTERVALS = ("1h", "4h", "1d")
+DEFAULT_URLS = {
+    "spot": "https://data.binance.vision",
+    "usdm": "https://data.binance.vision",
+    "kucoin-futures": "https://api-futures.kucoin.com",
+    "kucoin-spot": "https://api.kucoin.com",
 }
 
 INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d")
@@ -77,6 +95,18 @@ class Config:
     @property
     def market_path(self) -> str:
         return MARKETS[self.market][0]
+
+    @property
+    def is_kucoin(self) -> bool:
+        return self.market in KUCOIN_MARKETS
+
+    @property
+    def file_ext(self) -> str:
+        """The archive's own zips; KuCoin rows are written as gzipped CSV."""
+        return "csv.gz" if self.is_kucoin else "zip"
+
+    def periods(self, dataset: str) -> tuple[str, ...]:
+        return KUCOIN_PERIODS[dataset] if self.is_kucoin else DATASETS[dataset].periods
 
 
 def _list(raw: str | None) -> list[str]:
@@ -109,10 +139,18 @@ def load(env: Mapping[str, str] | None = None, today: date | None = None) -> Con
     if unknown:
         raise ConfigError(f"HISTORY_DATASETS has {unknown}, which {market} doesn't publish (offered: {list(offered)})")
 
+    if market == "kucoin-spot":
+        from .kucoin import SPOT_QUOTES, spot_pair
+
+        bad = [s for s in symbols if spot_pair(s) is None]
+        if bad:
+            raise ConfigError(f"HISTORY_SYMBOLS for kucoin-spot must be {'/'.join(SPOT_QUOTES)} pairs like BTCUSDT: {bad}")
+
+    offered_intervals = KUCOIN_INTERVALS if market in KUCOIN_MARKETS else INTERVALS
     intervals = _list(env.get("HISTORY_INTERVALS")) or ["1h", "1d"]
-    unknown = [i for i in intervals if i not in INTERVALS]
+    unknown = [i for i in intervals if i not in offered_intervals]
     if unknown:
-        raise ConfigError(f"HISTORY_INTERVALS has {unknown} (offered: {list(INTERVALS)})")
+        raise ConfigError(f"HISTORY_INTERVALS has {unknown} (offered: {list(offered_intervals)})")
     if "klines" not in datasets:
         intervals = []
 
@@ -144,7 +182,7 @@ def load(env: Mapping[str, str] | None = None, today: date | None = None) -> Con
         start=start,
         poll_hours=poll_hours,
         concurrency=concurrency,
-        base_url=env.get("HISTORY_BASE_URL", "https://data.binance.vision").rstrip("/"),
+        base_url=(env.get("HISTORY_BASE_URL") or DEFAULT_URLS[market]).rstrip("/"),
         data_dir=Path(env.get("DATA_DIR", "/data")),
         port=port,
         bot_id=env.get("FKS_BOT_ID", "local"),

@@ -36,6 +36,7 @@ from typing import Awaitable, Callable
 
 import aiohttp
 
+from . import kucoin
 from .config import Config, load
 from .plan import Target, targets
 
@@ -195,6 +196,8 @@ async def fetch_one(cfg: Config, t: Target, fetch: Fetch, manifest: Manifest) ->
     """("present" | "downloaded" | "missing", bytes on disk). Raises on an
     error worth retrying: a non-200/404 answer, a bad checksum file, or data
     that does not match its checksum (then nothing is written)."""
+    if cfg.is_kucoin:
+        return await kucoin.fetch_target(cfg, t, fetch, manifest, now_ms())
     path = t.path(cfg)
     if path.exists():
         return "present", path.stat().st_size
