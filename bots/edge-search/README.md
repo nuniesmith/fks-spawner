@@ -28,7 +28,21 @@ re-runs it: a search run twice counts its trials twice in N.
   `raw/binance/spot/spot-history 1d 2017-08-17..2026-10-25`. The folder is
   a history recorder's. Monthly and daily files are merged, and timestamps
   are normalized: spot is in microseconds from 2025, futures in
-  milliseconds.
+  milliseconds. KuCoin folders (`raw/kucoin/futures/...`,
+  `raw/kucoin/spot/...`) are the same recorder's gzipped CSV and read the
+  same way.
+  **A perpetual pays funding.** A perpetual folder (`raw/binance/usdm/...` or
+  `raw/kucoin/futures/...`) is read with its `fundingRate` files, and a
+  position held through a bar pays every settlement inside the bar's
+  (open, close], or receives it when the rate is negative. The selection,
+  both baselines (holding the perpetual pays funding too) and the random
+  benchmark all pay it. It is measured, not estimated, so U10's cost stress
+  doesn't multiply it. Funding that is missing, or has no settlement for more
+  than 12 hours inside the bars, stops the search with the gap named: a
+  perpetual priced as if it were free to hold is a different instrument. On
+  KuCoin, 2020-26, funding cost the live trend rule 12-19 CAGR points a year
+  (19.6% a year paid on BTC while in the market, 28.4% on ETH). It is also
+  venue-specific: read the venue the position would trade on.
   A CME folder (`raw/cme/...`, the `orb` family) is one stitched 1-minute
   series per root, `<ROOT>/1m/<ROOT>-1m-<period>.csv.gz`, with `rolls.csv`
   and `roll_flips.csv`. Folders join with `+`, the first winning a whole UTC
@@ -42,7 +56,8 @@ day (never a session stitched from two folders):
   `return over max drawdown after fees` (Calmar).
 - **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule), for
   `trend-band`; `session-hold` (long each session, open to close) for `orb`.
-- **costs**: taker plus slippage are paid on every position change. An `orb`
+- **costs**: taker plus slippage are paid on every position change (and a
+  perpetual's funding on every bar held, above). An `orb`
   hypothesis states `commission_usd_rt` ($ per contract, round turn) and
   `slippage_ticks` (per side) instead, with the bps fields at 0; the job
   refuses one that sets both rather than charge twice.
@@ -132,7 +147,7 @@ decided on a bar's close and earns the next bar's return.
 |---|---|
 | `trials.csv` | every grid point: its parameters, fold scores, selection score and trades |
 | `holdout.csv` | each holdout bar's pool return, for the selection and the baseline |
-| `verdict.json` | the row as written, every clause with its numbers, coverage, N, the deflated Sharpe, the random share, the evidence path, holdout trades per symbol, the regime split and the thresholds |
+| `verdict.json` | the row as written, every clause with its numbers, coverage, N, the deflated Sharpe, the random share, the evidence path, holdout trades per symbol, the regime split, the thresholds, and on a perpetual `funding`: each symbol's mean rate a year and what the selection paid a year in the market, over the whole series and the holdout |
 
 ## Tests
 
