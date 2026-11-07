@@ -52,7 +52,7 @@ import gzip
 import io
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -60,6 +60,11 @@ import numpy as np
 
 #: Lake folders whose symbols are perpetuals (pay funding), under raw/.
 PERP_PREFIXES = ("binance/usdm/", "kucoin/futures/")
+#: Spot folders, by the perpetual folder whose venue they share (the carry
+#: family's two legs must trade on one venue).
+SPOT_PREFIX_FOR = {"binance/usdm/": "binance/spot/", "kucoin/futures/": "kucoin/spot/"}
+#: KuCoin names BTC's contracts XBT (XBTUSDTM) and its spot pair BTC.
+KUCOIN_BASE_ALIASES = {"XBT": "BTC"}
 #: Longest stretch without a settlement that still counts as covered: 8h
 #: schedules, KuCoin's 2025 move from 04/12/20 to 00/08/16 UTC (a 4h step),
 #: and contracts on 4h or 1h funding all fit.
@@ -145,6 +150,7 @@ class Bars:
     close: np.ndarray
     funding_ms: np.ndarray | None = None
     funding_rate: np.ndarray | None = None
+    high: np.ndarray | None = None
 
 
 def _rows(raw: bytes):
@@ -184,21 +190,21 @@ def load_bars(lake: Path, spec: DatasetSpec, symbol: str) -> Bars:
     folder = lake / spec.path / symbol / "klines" / spec.interval
     if not folder.is_dir():
         raise DatasetError(f"no {spec.interval} klines for {symbol} at {folder}")
-    by_time: dict[int, tuple[float, float]] = {}
+    by_time: dict[int, tuple[float, float, float]] = {}
     # Monthly and daily files overlap near a month's end: rows merge by time.
     for f in _files(folder, f"{symbol}-{spec.interval}"):
         try:
             for row in _file_rows(f):
                 t = _to_ms(int(row[0]))
                 if spec.start_ms <= t < spec.end_ms:
-                    by_time[t] = (float(row[1]), float(row[4]))
+                    by_time[t] = (float(row[1]), float(row[4]), float(row[2]))
         except (zipfile.BadZipFile, OSError, ValueError, IndexError) as e:
             raise DatasetError(f"{f.name}: {e}") from None
     if not by_time:
         raise DatasetError(f"{symbol}: no bars between {spec.start} and {spec.end}")
     times = np.array(sorted(by_time), dtype=np.int64)
     values = np.array([by_time[t] for t in times], dtype=float)
-    bars = Bars(symbol=symbol, open_ms=times, open=values[:, 0], close=values[:, 1])
+    bars = Bars(symbol=symbol, open_ms=times, open=values[:, 0], close=values[:, 1], high=values[:, 2])
     if is_perpetual(spec):
         bars.funding_ms, bars.funding_rate = load_funding(lake, spec, symbol, bars)
     return bars
@@ -250,6 +256,61 @@ def coverage(bars: Bars, spec: DatasetSpec) -> float:
     first = int(bars.open_ms[0])
     expected = (spec.end_ms - first) // spec.bar_ms
     return min(1.0, len(bars.open_ms) / expected) if expected > 0 else 0.0
+
+
+@dataclass
+class CarryPair:
+    """The carry family's two legs of one coin, on one venue: the perpetual
+    (with its funding and highs) and the spot pair."""
+
+    perp: Bars
+    spot: Bars
+
+    @property
+    def symbol(self) -> str:
+        return self.perp.symbol
+
+    @property
+    def open_ms(self) -> np.ndarray:
+        return self.perp.open_ms
+
+
+def spot_symbol(perp_folder: str, symbol: str) -> str:
+    """The spot pair a perpetual hedges against: KuCoin's XBTUSDTM is BTCUSDT;
+    Binance's BTCUSDT perpetual is the BTCUSDT pair."""
+    if perp_folder.startswith("kucoin/futures/"):
+        if not symbol.endswith("USDTM"):
+            raise DatasetError(f"{symbol} isn't a KuCoin USDT perpetual (…USDTM)")
+        base = symbol[: -len("USDTM")]
+        return KUCOIN_BASE_ALIASES.get(base, base) + "USDT"
+    return symbol
+
+
+def carry_folders(spec: DatasetSpec) -> tuple[str, str]:
+    """(perpetual folder, spot folder): the carry family's dataset joins the
+    two with '+', perpetual first, on one venue."""
+    if len(spec.paths) != 2:
+        raise DatasetError(
+            "a carry dataset joins the perpetual's folder and the spot folder, perpetual first: "
+            "'raw/kucoin/futures/<instance>+raw/kucoin/spot/<instance> 1d <from>..<to>'"
+        )
+    perp, spot = spec.paths
+    prefix = next((p for p in PERP_PREFIXES if perp.startswith(p)), None)
+    if prefix is None:
+        raise DatasetError(f"{perp} isn't a perpetual folder ({', '.join(PERP_PREFIXES)})")
+    if not spot.startswith(SPOT_PREFIX_FOR[prefix]):
+        raise DatasetError(
+            f"the spot leg must trade on the perpetual's venue: {perp} pairs with a "
+            f"{SPOT_PREFIX_FOR[prefix]}... folder, not {spot}"
+        )
+    return perp, spot
+
+
+def load_carry(lake: Path, spec: DatasetSpec, symbol: str) -> CarryPair:
+    perp_folder, spot_folder = carry_folders(spec)
+    perp = load_bars(lake, replace(spec, path=perp_folder), symbol)
+    spot = load_bars(lake, replace(spec, path=spot_folder), spot_symbol(perp_folder, symbol))
+    return CarryPair(perp=perp, spot=spot)
 
 
 def align_funding(series: list[Bars], times: np.ndarray, bar_ms: int) -> np.ndarray | None:

@@ -25,7 +25,7 @@ import psycopg
 from . import db
 from .config import THRESHOLDS, ConfigError, load
 from . import orb
-from .dataset import DatasetError, load_bars, load_cme_minutes, parse_spec
+from .dataset import DatasetError, load_bars, load_carry, load_cme_minutes, parse_spec
 from .search import Result, SearchError, run_search
 from .server import Status, serve
 
@@ -93,6 +93,7 @@ def write_artifacts(folder: Path, result: Result, row: dict) -> None:
         "holdout_trades_by_symbol": result.holdout_trades_by_symbol,
         "regimes": result.regimes,
         "funding": result.funding,
+        "carry": result.carry,
         "clauses": [{"id": c.id, "ok": c.ok, "text": c.text} for c in result.verdict.clauses],
         "thresholds": THRESHOLDS,
     }
@@ -122,14 +123,21 @@ def main() -> int:
                     raise SearchError(str(e)) from None
                 series = [load_cme_minutes(cfg.lake_dir, spec, r) for r in roots]
                 names = roots
+            elif cfg.family == "carry":
+                # each symbol is a pair: its perpetual and its spot, one venue
+                series = [load_carry(cfg.lake_dir, spec, s) for s in h.symbols]
+                names = [p.symbol for p in series]
+                for p in series:
+                    log.info("%s: hedged with %s (%d spot bars)", p.symbol, p.spot.symbol, len(p.spot.open_ms))
             else:
                 series = [load_bars(cfg.lake_dir, spec, s) for s in h.symbols]
                 names = [b.symbol for b in series]
             for name, b in zip(names, series):
                 log.info("%s: %d %s bars from %s", name, len(b.open_ms), spec.interval,
                          datetime.fromtimestamp(b.open_ms[0] / 1000, timezone.utc).date())
-                if getattr(b, "funding_ms", None) is not None:
-                    log.info("%s: a perpetual, priced with %d funding settlements", name, len(b.funding_ms))
+                perp = getattr(b, "perp", b)
+                if getattr(perp, "funding_ms", None) is not None:
+                    log.info("%s: a perpetual, priced with %d funding settlements", name, len(perp.funding_ms))
             prior = db.prior_trials(conn, h.edge_id)
             status.update(phase="searching")
             result = run_search(

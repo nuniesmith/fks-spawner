@@ -51,11 +51,14 @@ day (never a session stitched from two folders):
 - **params**: the family's parameters, each a range with a step (the grid)
   or a list of choices. `trend-band` tunes `lookback` (bars) and `band`
   (a fraction); `orb` tunes `orb_minutes`, `target_r` and `exit`
-  (`target` or `trail`). At most 5,000 grid points.
+  (`target` or `trail`); `carry` tunes `lookback` (bars), `enter_apr` and
+  `exit_apr` (a year's funding, as a fraction) and declares `leverage`
+  (one choice). At most 5,000 grid points.
 - **metric**: `net return after fees` (CAGR), `sharpe after fees`, or
   `return over max drawdown after fees` (Calmar).
 - **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule), for
-  `trend-band`; `session-hold` (long each session, open to close) for `orb`.
+  `trend-band`; `session-hold` (long each session, open to close) for `orb`;
+  `always-carry` (the pair held the whole time) for `carry`.
 - **costs**: taker plus slippage are paid on every position change (and a
   perpetual's funding on every bar held, above). An `orb`
   hypothesis states `commission_usd_rt` ($ per contract, round turn) and
@@ -98,6 +101,34 @@ minutes after the range and sides, with the same costs.
 Massive cache (ES, NQ, GC, MGC, 2024-09-09..2026-09-11) into
 `raw/cme/massive-cache`, recording the cache's interleaved roll days instead
 of repairing them.
+
+## The `carry` family (`edge_search/carry.py`)
+
+Long spot and short the perpetual, the same coin amount, on one venue: price
+moves cancel, and what's left is the funding the short receives (or pays),
+the basis between the legs, and fees on both legs. The dataset joins the two
+folders, perpetual first:
+`raw/kucoin/futures/<instance>+raw/kucoin/spot/<instance> 1d <from>..<to>`;
+each symbol is the perpetual (`XBTUSDTM` hedges with spot `BTCUSDT`).
+
+| | |
+|---|---|
+| Rule | the trailing funding over `lookback` bars, a year's worth: in the pair at or above `enter_apr`, out below `exit_apr` (every exit threshold at or below every entry threshold); decided on a bar's close |
+| Return | per bar held: spot return − perpetual return + the bar's funding, on the capital the pair ties up, 1 + 1/`leverage` per unit of notional |
+| Costs | `taker_bps` + `slippage_bps` on **each leg**, per side: an entry or an exit trades both. Use the dearer leg's rate (KuCoin's base: spot 10 bps, futures 6) |
+| Liquidation | the short's margin is 1/`leverage`; it is taken when the perpetual's **high** reaches entry × (1 + 1/`leverage` − 1%), the 1% being a maintenance margin set above KuCoin's and Binance's 0.4-0.5% for BTC/ETH. That bar: the short closes there (at the open, if the bar opens beyond it), the 1% is lost, the spot sells at the close (one leg's fee), no funding. A wick that retraces by the close is a real loss. The rule may enter again on that close |
+| Leverage | declared, frozen with the hypothesis, never searched: one choice, 1 to 20 |
+
+The baseline, `always-carry`, holds the pair from the end of the warm-up (and
+from the holdout's start, for the holdout), with the same liquidation. U8's
+random strategies are random spells of the pair with the selection's count
+and length, through the same arithmetic. `verdict.json` gains `carry`: the
+leverage, the capital per notional, liquidations (whole series and holdout),
+the funding received per year in the pair, and each symbol's mean funding.
+
+Not modelled: the venue failing while it holds both legs, topping up the
+short's margin from the spot leg (it sits in another account), moving money
+between the two accounts, borrowing, and the basis inside a bar.
 
 ## How it judges
 
