@@ -92,6 +92,7 @@ def write_artifacts(folder: Path, result: Result, row: dict) -> None:
         "evidence": result.evidence,
         "holdout_trades_by_symbol": result.holdout_trades_by_symbol,
         "regimes": result.regimes,
+        "funding": result.funding,
         "clauses": [{"id": c.id, "ok": c.ok, "text": c.text} for c in result.verdict.clauses],
         "thresholds": THRESHOLDS,
     }
@@ -127,6 +128,8 @@ def main() -> int:
             for name, b in zip(names, series):
                 log.info("%s: %d %s bars from %s", name, len(b.open_ms), spec.interval,
                          datetime.fromtimestamp(b.open_ms[0] / 1000, timezone.utc).date())
+                if getattr(b, "funding_ms", None) is not None:
+                    log.info("%s: a perpetual, priced with %d funding settlements", name, len(b.funding_ms))
             prior = db.prior_trials(conn, h.edge_id)
             status.update(phase="searching")
             result = run_search(

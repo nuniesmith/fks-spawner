@@ -2,8 +2,11 @@
 
 Positions are decided on a bar's close and earn the next bar's return; a
 change of position pays `cost` (taker + slippage, per side) on the bar it
-happens. A pool is the equal-weight average of the symbols that have a bar
-at that time, so a coin that lists late joins the pool when it lists.
+happens. On a perpetual, a position held through a bar also pays that bar's
+funding (dataset.align_funding: the settlements inside its (open, close]),
+and receives it when the rate is negative. A pool is the equal-weight
+average of the symbols that have a bar at that time, so a coin that lists
+late joins the pool when it lists.
 
 Families
 --------
@@ -107,13 +110,16 @@ class Run:
     pos: np.ndarray  # [symbol, bar]
 
 
-def run(pos: np.ndarray, rets: np.ndarray, cost: float) -> Run:
+def run(pos: np.ndarray, rets: np.ndarray, cost: float, funding: np.ndarray | None = None) -> Run:
     held = np.zeros_like(pos)
     held[:, 1:] = pos[:, :-1]
     change = np.zeros_like(pos)
     change[:, 1:] = np.abs(pos[:, 1:] - pos[:, :-1])
     change[:, 0] = np.abs(pos[:, 0])
     net = held * np.nan_to_num(rets) - change * cost
+    if funding is not None:
+        # a long pays a positive rate, a short receives it
+        net = net - held * funding
     net[np.isnan(rets)] = np.nan
     # Bars where no symbol has listed yet average nothing: 0, not a warning.
     with warnings.catch_warnings():
@@ -123,11 +129,21 @@ def run(pos: np.ndarray, rets: np.ndarray, cost: float) -> Run:
     return Run(net=net, pool=pool, pos=pos)
 
 
-def buy_and_hold(rets: np.ndarray, cost: float, start: int) -> Run:
-    """Long every symbol from `start` (one entry cost there, or when it lists)."""
+def buy_and_hold(rets: np.ndarray, cost: float, start: int, funding: np.ndarray | None = None) -> Run:
+    """Long every symbol from `start` (one entry cost there, or when it lists);
+    on a perpetual, paying its funding all the way."""
     pos = np.where(np.isnan(rets), 0.0, 1.0)
     pos[:, :start] = 0.0
-    return run(pos, rets, cost)
+    return run(pos, rets, cost, funding)
+
+
+def funding_paid(pos: np.ndarray, funding: np.ndarray, bars_per_year: float) -> float:
+    """What holding these positions paid in funding, per year in the market
+    (a fraction of the position; negative when it was received)."""
+    held = np.zeros_like(pos)
+    held[:, 1:] = pos[:, :-1]
+    in_market = float(np.sum(np.abs(held)))
+    return float(np.sum(held * funding)) / in_market * bars_per_year if in_market else 0.0
 
 
 # ── Scores over a span of bars [a, b) ─────────────────────────────────────────

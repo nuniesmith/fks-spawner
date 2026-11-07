@@ -26,6 +26,23 @@ Two traps from the archive, handled here (bots/history README):
   - spot klines are in MICROSECONDS from 2025 on, milliseconds before, and
     futures in milliseconds: times are normalized to milliseconds;
   - spot klines have no header row, futures klines do.
+
+KuCoin folders (raw/kucoin/futures/..., raw/kucoin/spot/...) are the same
+history recorder's, written from KuCoin's API as gzipped CSV with a header
+(<SYMBOL>-<interval>-<period>.csv.gz: open_time_ms,open,high,low,close,...);
+both kinds of file are read.
+
+A PERPETUAL's position pays (or, when the rate is negative, receives) funding
+at every settlement it is held through, so a perpetual folder
+(raw/binance/usdm/..., raw/kucoin/futures/...) is read with its funding:
+<SYMBOL>/fundingRate/, the archive's zips (calc_time, interval, rate) or
+KuCoin's CSV (funding_time_ms, funding_rate). A settlement belongs to the bar
+whose span (open, close] holds it: the bar a position decided on the previous
+close is held through. Funding that doesn't cover the bars, or has a gap
+longer than FUNDING_MAX_GAP_MS, is an error, never a silent zero: a perpetual
+priced without its funding is the wrong instrument (KuCoin's ran 12-19 CAGR
+points a year against the live trend rule, 2020-26). Venues' funding differs
+too: read the venue the position would trade on.
 """
 
 from __future__ import annotations
@@ -40,6 +57,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
+
+#: Lake folders whose symbols are perpetuals (pay funding), under raw/.
+PERP_PREFIXES = ("binance/usdm/", "kucoin/futures/")
+#: Longest stretch without a settlement that still counts as covered: 8h
+#: schedules, KuCoin's 2025 move from 04/12/20 to 00/08/16 UTC (a 4h step),
+#: and contracts on 4h or 1h funding all fit.
+FUNDING_MAX_GAP_MS = 12 * 3_600_000
 
 INTERVAL_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -112,12 +136,15 @@ def parse_spec(text: str) -> DatasetSpec:
 
 @dataclass
 class Bars:
-    """One symbol's bars on its own clock: open time (ms), open, close."""
+    """One symbol's bars on its own clock: open time (ms), open, close; and a
+    perpetual's funding settlements (time ms, rate), None for spot."""
 
     symbol: str
     open_ms: np.ndarray
     open: np.ndarray
     close: np.ndarray
+    funding_ms: np.ndarray | None = None
+    funding_rate: np.ndarray | None = None
 
 
 def _rows(raw: bytes):
@@ -133,6 +160,24 @@ def _to_ms(t: int) -> int:
     return t // 1000 if t >= 100_000_000_000_000 else t
 
 
+def _file_rows(f: Path):
+    """Rows of an archive zip (every member) or a recorder's .csv.gz."""
+    if f.name.endswith(".csv.gz"):
+        yield from _rows(gzip.decompress(f.read_bytes()))
+        return
+    with zipfile.ZipFile(f) as z:
+        for name in z.namelist():
+            yield from _rows(z.read(name))
+
+
+def _files(folder: Path, stem: str) -> list[Path]:
+    return sorted(folder.glob(f"{stem}-*.zip")) + sorted(folder.glob(f"{stem}-*.csv.gz"))
+
+
+def is_perpetual(spec: DatasetSpec) -> bool:
+    return spec.path.startswith(PERP_PREFIXES)
+
+
 def load_bars(lake: Path, spec: DatasetSpec, symbol: str) -> Bars:
     if len(spec.paths) > 1:
         raise DatasetError("a history recorder's dataset names one folder; '+' joins CME folders only")
@@ -140,21 +185,62 @@ def load_bars(lake: Path, spec: DatasetSpec, symbol: str) -> Bars:
     if not folder.is_dir():
         raise DatasetError(f"no {spec.interval} klines for {symbol} at {folder}")
     by_time: dict[int, tuple[float, float]] = {}
-    for f in sorted(folder.glob(f"{symbol}-{spec.interval}-*.zip")):
+    # Monthly and daily files overlap near a month's end: rows merge by time.
+    for f in _files(folder, f"{symbol}-{spec.interval}"):
         try:
-            with zipfile.ZipFile(f) as z:
-                for name in z.namelist():
-                    for row in _rows(z.read(name)):
-                        t = _to_ms(int(row[0]))
-                        if spec.start_ms <= t < spec.end_ms:
-                            by_time[t] = (float(row[1]), float(row[4]))
-        except (zipfile.BadZipFile, ValueError, IndexError) as e:
+            for row in _file_rows(f):
+                t = _to_ms(int(row[0]))
+                if spec.start_ms <= t < spec.end_ms:
+                    by_time[t] = (float(row[1]), float(row[4]))
+        except (zipfile.BadZipFile, OSError, ValueError, IndexError) as e:
             raise DatasetError(f"{f.name}: {e}") from None
     if not by_time:
         raise DatasetError(f"{symbol}: no bars between {spec.start} and {spec.end}")
     times = np.array(sorted(by_time), dtype=np.int64)
     values = np.array([by_time[t] for t in times], dtype=float)
-    return Bars(symbol=symbol, open_ms=times, open=values[:, 0], close=values[:, 1])
+    bars = Bars(symbol=symbol, open_ms=times, open=values[:, 0], close=values[:, 1])
+    if is_perpetual(spec):
+        bars.funding_ms, bars.funding_rate = load_funding(lake, spec, symbol, bars)
+    return bars
+
+
+def load_funding(lake: Path, spec: DatasetSpec, symbol: str, bars: Bars) -> tuple[np.ndarray, np.ndarray]:
+    """A perpetual's settlements over its bars, as (time ms, rate); an error
+    when they don't cover the bars, since a missing settlement would price
+    the position as if it were free to hold."""
+    folder = lake / spec.path / symbol / "fundingRate"
+    files = _files(folder, f"{symbol}-fundingRate") if folder.is_dir() else []
+    if not files:
+        raise DatasetError(
+            f"{symbol}: a perpetual's position pays funding, and there is none at {folder} "
+            "(record the fundingRate dataset)"
+        )
+    lo = int(bars.open_ms[0])
+    hi = min(spec.end_ms, int(bars.open_ms[-1]) + spec.bar_ms)
+    rates: dict[int, float] = {}
+    for f in files:
+        try:
+            for row in _file_rows(f):
+                # The archive's calc_time runs a few ms past the hour: settle on the second.
+                t = round(int(row[0]) / 1000) * 1000
+                rate = float(row[2] if f.suffix == ".zip" else row[1])
+                if lo < t <= hi:
+                    rates[t] = rate
+        except (zipfile.BadZipFile, OSError, ValueError, IndexError) as e:
+            raise DatasetError(f"{f.name}: {e}") from None
+    times = np.array(sorted(rates), dtype=np.int64)
+    edges = np.concatenate([[lo], times, [hi]])
+    gaps = np.diff(edges)
+    if gaps.max() > FUNDING_MAX_GAP_MS:
+        i = int(np.argmax(gaps))
+        a = datetime.fromtimestamp(edges[i] / 1000, tz=timezone.utc)
+        b = datetime.fromtimestamp(edges[i + 1] / 1000, tz=timezone.utc)
+        raise DatasetError(
+            f"{symbol}: no funding settlement from {a:%Y-%m-%d %H:%M} to {b:%Y-%m-%d %H:%M} UTC "
+            f"(over {FUNDING_MAX_GAP_MS // 3_600_000}h): a perpetual can't be priced without its funding; "
+            "end the window before the gap, or record the missing months"
+        )
+    return times, np.array([rates[t] for t in times], dtype=float)
 
 
 def coverage(bars: Bars, spec: DatasetSpec) -> float:
@@ -164,6 +250,23 @@ def coverage(bars: Bars, spec: DatasetSpec) -> float:
     first = int(bars.open_ms[0])
     expected = (spec.end_ms - first) // spec.bar_ms
     return min(1.0, len(bars.open_ms) / expected) if expected > 0 else 0.0
+
+
+def align_funding(series: list[Bars], times: np.ndarray, bar_ms: int) -> np.ndarray | None:
+    """funding[symbol, bar]: the settlements inside each bar's (open, close],
+    summed; None when no symbol is a perpetual. A settlement at a bar's open
+    belongs to the bar before (it closes there)."""
+    if all(b.funding_ms is None for b in series):
+        return None
+    first = int(times[0])
+    out = np.zeros((len(series), len(times)))
+    for i, b in enumerate(series):
+        if b.funding_ms is None:
+            continue
+        idx = -((first - b.funding_ms) // bar_ms) - 1  # ceil((t - first) / bar) - 1
+        keep = (idx >= 0) & (idx < len(times))
+        np.add.at(out[i], idx[keep], b.funding_rate[keep])
+    return out
 
 
 def align(series: list[Bars], bar_ms: int) -> tuple[np.ndarray, np.ndarray]:

@@ -28,7 +28,7 @@ import numpy as np
 
 from . import engine, orb
 from .config import BASELINES, EVIDENCE_PATHS, MAX_TRIALS, METRICS, THRESHOLDS
-from .dataset import Bars, DatasetSpec, MinuteBars, align, coverage
+from .dataset import Bars, DatasetSpec, MinuteBars, align, align_funding, coverage
 from .verdict import (
     Verdict,
     boundary_params,
@@ -101,6 +101,9 @@ class Result:
     evidence: str = "trades"
     holdout_trades_by_symbol: dict | None = None
     regimes: dict | None = None
+    #: A perpetual's funding, as applied: each symbol's mean rate and what
+    #: the selection paid, per year in the market. None for spot and sessions.
+    funding: dict | None = None
 
 
 def regimes(closes: np.ndarray, hold: int, n: int, bar_ms: int, metric: str,
@@ -205,6 +208,9 @@ class Problem:
     #: The account a prop firm would judge, from bar `hold` on (U13); None
     #: when the family trades a cash account.
     account: Callable[[Evaluation, int], dict] | None = None
+    #: A perpetual's funding[symbol, bar], already in every run; None for
+    #: spot and sessions. Kept to report what the selection paid.
+    funding: np.ndarray | None = None
 
 
 def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: list[Bars],
@@ -215,6 +221,9 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
     times, closes = align(series, bar_ms)
     closes = engine.forward_fill(closes)
     rets = engine.returns(closes)
+    # A perpetual's funding is measured, not estimated: it is in every run
+    # (selection, baselines, random benchmark) and is not stressed by U10.
+    funding = align_funding(series, times, bar_ms)
     cost = (float(h.costs.get("taker_bps", 0)) + float(h.costs.get("slippage_bps", 0))) / 10_000
     baseline_lookback = round(200 * 86_400_000 / bar_ms)
     warm = max(
@@ -224,7 +233,7 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
 
     def evaluate_costs(params: dict, mult: float) -> Evaluation:
         pos = engine.positions(family, closes, params)
-        run = engine.run(pos, rets, cost * mult)
+        run = engine.run(pos, rets, cost * mult, funding)
         entries = np.zeros_like(pos)
         entries[:, 1:] = pos[:, 1:] > pos[:, :-1]
         return Evaluation(run.pool, entries, pos)
@@ -234,21 +243,22 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
 
     def baseline_pools(warm_: int, hold: int) -> tuple[np.ndarray, np.ndarray]:
         if h.baseline == "buy-and-hold":
-            return engine.buy_and_hold(rets, cost, warm_).pool, engine.buy_and_hold(rets, cost, hold).pool
-        base = engine.run(engine.trend_band_positions(closes, baseline_lookback, 0.05), rets, cost).pool
+            return (engine.buy_and_hold(rets, cost, warm_, funding).pool,
+                    engine.buy_and_hold(rets, cost, hold, funding).pool)
+        base = engine.run(engine.trend_band_positions(closes, baseline_lookback, 0.05), rets, cost, funding).pool
         return base, base
 
     def random(ev: Evaluation, params: dict, hold: int, rng: np.random.Generator, draws: int):
         n = len(times)
         for _ in range(draws):
-            yield engine.run(random_positions(ev.state, hold, n, rng), rets, cost).pool
+            yield engine.run(random_positions(ev.state, hold, n, rng), rets, cost, funding).pool
 
     return Problem(
         times=times, bar_ms=bar_ms, bars_per_year=365 * 86_400_000 / bar_ms, warm=warm,
         t1=int(times[-1]) + bar_ms, coverage={b.symbol: coverage(b, spec) for b in series},
         closes=closes, regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / bar_ms)),
         evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
-        evaluate_costs=evaluate_costs,
+        evaluate_costs=evaluate_costs, funding=funding,
     )
 
 
@@ -497,6 +507,20 @@ def run_search(
     regime_split = regimes(problem.closes, hold, n, problem.bar_ms, metric, bars_per_year,
                            holdout, base_hold[hold:], lookback_bars=problem.regime_lookback_bars)
 
+    funding_summary = None
+    if problem.funding is not None:
+        f, pos = problem.funding, best_ev.state
+        listed = ~np.isnan(problem.closes)
+        funding_summary = {
+            "applied": True,
+            "mean_rate_per_year": {
+                s: float(f[i, listed[i]].sum() / max(int(listed[i].sum()), 1) * bars_per_year)
+                for i, s in enumerate(h.symbols)
+            },
+            "selection_paid_per_year_in_market": engine.funding_paid(pos, f, bars_per_year),
+            "holdout_paid_per_year_in_market": engine.funding_paid(pos[:, hold - 1:], f[:, hold - 1:], bars_per_year),
+        }
+
     return Result(
         family=family,
         names=names,
@@ -525,4 +549,5 @@ def run_search(
         evidence=h.evidence,
         holdout_trades_by_symbol=per_symbol,
         regimes=regime_split,
+        funding=funding_summary,
     )
