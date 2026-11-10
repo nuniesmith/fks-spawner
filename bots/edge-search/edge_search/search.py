@@ -231,17 +231,21 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
     funding = align_funding(series, times, bar_ms)
     cost = (float(h.costs.get("taker_bps", 0)) + float(h.costs.get("slippage_bps", 0))) / 10_000
     baseline_lookback = round(200 * 86_400_000 / bar_ms)
+    bars_per_year = 365 * 86_400_000 / bar_ms
+    if family == "trend-vol":
+        try:
+            engine.check_vol_params(combos)
+        except engine.FamilyError as e:
+            raise SearchError(str(e)) from None
     warm = max(
-        max(int(c.get("lookback", 0)) for c in combos),
+        max(max(int(c.get("lookback", 0)), int(c.get("vol_lookback", 0))) for c in combos),
         baseline_lookback if h.baseline == "trend-200d-5pct" else 0,
     )
 
     def evaluate_costs(params: dict, mult: float) -> Evaluation:
-        pos = engine.positions(family, closes, params)
+        pos = engine.positions(family, closes, params, bars_per_year)
         run = engine.run(pos, rets, cost * mult, funding)
-        entries = np.zeros_like(pos)
-        entries[:, 1:] = pos[:, 1:] > pos[:, :-1]
-        return Evaluation(run.pool, entries, pos)
+        return Evaluation(run.pool, engine.entries_of(pos), pos)
 
     def evaluate(params: dict) -> Evaluation:
         return evaluate_costs(params, 1.0)
@@ -253,13 +257,23 @@ def _position_problem(family: str, h: Hypothesis, spec: DatasetSpec, series: lis
         base = engine.run(engine.trend_band_positions(closes, baseline_lookback, 0.05), rets, cost, funding).pool
         return base, base
 
+    vols: dict[int, np.ndarray] = {}
+
     def random(ev: Evaluation, params: dict, hold: int, rng: np.random.Generator, draws: int):
         n = len(times)
+        spells_of = (ev.state > 0).astype(float)
         for _ in range(draws):
-            yield engine.run(random_positions(ev.state, hold, n, rng), rets, cost, funding).pool
+            pos = random_positions(spells_of, hold, n, rng)
+            if family == "trend-vol":
+                # random spells, sized exactly as the selection sizes its own
+                k = int(params["vol_lookback"])
+                if k not in vols:
+                    vols[k] = engine.realised_vol(closes, k, bars_per_year)
+                pos = engine.vol_sized(pos, vols[k], float(params["target_vol"]), float(params["rebalance"]))
+            yield engine.run(pos, rets, cost, funding).pool
 
     return Problem(
-        times=times, bar_ms=bar_ms, bars_per_year=365 * 86_400_000 / bar_ms, warm=warm,
+        times=times, bar_ms=bar_ms, bars_per_year=bars_per_year, warm=warm,
         t1=int(times[-1]) + bar_ms, coverage={b.symbol: coverage(b, spec) for b in series},
         closes=closes, regime_lookback_bars=max(1, round(THRESHOLDS["regime_lookback_days"] * 86_400_000 / bar_ms)),
         evaluate=evaluate, baseline_pools=baseline_pools, random_pools=random,
