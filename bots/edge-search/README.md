@@ -53,11 +53,13 @@ day (never a session stitched from two folders):
   (a fraction); `orb` tunes `orb_minutes`, `target_r` and `exit`
   (`target` or `trail`); `carry` tunes `lookback` (bars), `enter_apr` and
   `exit_apr` (a year's funding, as a fraction) and declares `leverage`
-  (one choice). At most 5,000 grid points.
+  (one choice); `trend-vol` adds `vol_lookback` (bars), `target_vol` (a
+  year's volatility, a fraction) and `rebalance` (a fraction of full size)
+  to trend-band's two. At most 5,000 grid points.
 - **metric**: `net return after fees` (CAGR), `sharpe after fees`, or
   `return over max drawdown after fees` (Calmar).
 - **baseline**: `buy-and-hold`, or `trend-200d-5pct` (the live rule), for
-  `trend-band`; `session-hold` (long each session, open to close) for `orb`;
+  `trend-band` and `trend-vol`; `session-hold` (long each session, open to close) for `orb`;
   `always-carry` (the pair held the whole time) for `carry`.
 - **costs**: taker plus slippage are paid on every position change (and a
   perpetual's funding on every bar held, above). An `orb`
@@ -101,6 +103,24 @@ minutes after the range and sides, with the same costs.
 Massive cache (ES, NQ, GC, MGC, 2024-09-09..2026-09-11) into
 `raw/cme/massive-cache`, recording the cache's interleaved roll days instead
 of repairing them.
+
+## The `trend-vol` family (`edge_search/engine.py`)
+
+The live rule's signal (`trend-band`), sized by volatility (Moreira & Muir,
+2017: volatility-managed portfolios). While the signal is long, the position
+is `min(1, target_vol / realised vol)`, the vol being the annualised sample
+standard deviation of the last `vol_lookback` log returns, known at the
+deciding close; no position until it is known. Entries and exits act at once;
+a held position is resized only when the new size differs from it by more
+than `rebalance`, and every change pays the cost on its size (a resize of
+0.3 pays 0.3 × the cost). Built for Kraken's fees, where daily resizing would
+cost more than it saves.
+
+A trade (U4) is an entry from flat; a resize is not one, so sizing never adds
+trades. U8's random strategies are random spells of the signal, sized by the
+same rule. With a target no volatility reaches it is `trend-band`, bar for
+bar (a test holds it to that). The search job can't tell it from trend-band
+by its dataset: start it with `family` set.
 
 ## The `carry` family (`edge_search/carry.py`)
 

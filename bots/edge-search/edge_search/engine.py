@@ -14,6 +14,14 @@ trend-band (the live rule's family, EDGE_PROCESS §2.4's incumbent):
     long while close > SMA(lookback) × (1 + band), flat once
     close < SMA(lookback) × (1 − band), unchanged in between (hysteresis).
     Params: lookback (bars), band (fraction).
+trend-vol (the same signal, volatility-managed; Moreira & Muir 2017):
+    while trend-band is long, hold min(1, target_vol / realised vol), the
+    vol being the annualised standard deviation of the last `vol_lookback`
+    log returns, known at the deciding close. Entries and exits act at once;
+    a resize only when the new size differs from the held one by more than
+    `rebalance` (each change pays its cost on the change's size). Params:
+    lookback, band, vol_lookback (bars), target_vol (a year's, a fraction),
+    rebalance (a fraction of full size).
 """
 
 from __future__ import annotations
@@ -31,6 +39,8 @@ FAMILIES = {
     "orb": ("orb_minutes", "target_r", "exit"),
     # A hedged pair (edge_search/carry.py): long spot, short the perpetual.
     "carry": ("lookback", "enter_apr", "exit_apr", "leverage"),
+    # trend-band's signal, sized by volatility.
+    "trend-vol": ("lookback", "band", "vol_lookback", "target_vol", "rebalance"),
 }
 
 
@@ -94,9 +104,66 @@ def trend_band_positions(closes: np.ndarray, lookback: int, band: float) -> np.n
     return pos
 
 
-def positions(family: str, closes: np.ndarray, params: dict) -> np.ndarray:
+def realised_vol(closes: np.ndarray, n: int, bars_per_year: float) -> np.ndarray:
+    """Annualised standard deviation of each bar's last n log returns, NaN
+    until a symbol has n of them. Known at that bar's close."""
+    out = np.full_like(closes, np.nan)
+    lr = np.full_like(closes, np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        lr[:, 1:] = np.log(closes[:, 1:] / closes[:, :-1])
+    for i, row in enumerate(lr):
+        valid = ~np.isnan(row)
+        if valid.sum() < n:
+            continue
+        first = int(np.argmax(valid))
+        seg = row[first:]
+        c1 = np.cumsum(np.insert(np.nan_to_num(seg), 0, 0.0))
+        c2 = np.cumsum(np.insert(np.nan_to_num(seg) ** 2, 0, 0.0))
+        for t in range(n - 1, len(seg)):
+            s1 = c1[t + 1] - c1[t + 1 - n]
+            s2 = c2[t + 1] - c2[t + 1 - n]
+            var = (s2 - s1 * s1 / n) / (n - 1) if n > 1 else 0.0
+            out[i, first + t] = math.sqrt(max(var, 0.0) * bars_per_year)
+    return out
+
+
+def vol_sized(signal: np.ndarray, vol: np.ndarray, target_vol: float, rebalance: float) -> np.ndarray:
+    """Fractional positions: `signal` (0/1) sized to min(1, target/vol), held
+    until the target moves by more than `rebalance`. No position while the
+    vol isn't known yet."""
+    out = np.zeros_like(signal)
+    for i in range(signal.shape[0]):
+        held = 0.0
+        for t in range(signal.shape[1]):
+            v = vol[i, t]
+            if signal[i, t] <= 0 or np.isnan(v):
+                held = 0.0
+            else:
+                want = min(1.0, target_vol / v) if v > 0 else 1.0
+                if held == 0.0 or abs(want - held) > rebalance:
+                    held = want
+            out[i, t] = held
+    return out
+
+
+def check_vol_params(combos: list[dict]) -> None:
+    """trend-vol's grid must make sense before a trial is spent."""
+    for c in combos:
+        if int(c["vol_lookback"]) < 2:
+            raise FamilyError("vol_lookback must be at least 2 bars")
+        if not float(c["target_vol"]) > 0:
+            raise FamilyError("target_vol must be above 0 (a year's volatility, e.g. 0.6)")
+        if not 0.0 <= float(c["rebalance"]) < 1.0:
+            raise FamilyError("rebalance must be at least 0 and below 1 (a fraction of full size)")
+
+
+def positions(family: str, closes: np.ndarray, params: dict, bars_per_year: float = 365.0) -> np.ndarray:
     if family == "trend-band":
         return trend_band_positions(closes, int(params["lookback"]), float(params["band"]))
+    if family == "trend-vol":
+        signal = trend_band_positions(closes, int(params["lookback"]), float(params["band"]))
+        vol = realised_vol(closes, int(params["vol_lookback"]), bars_per_year)
+        return vol_sized(signal, vol, float(params["target_vol"]), float(params["rebalance"]))
     if family == "orb":
         raise FamilyError("orb trades sessions, not bar positions (edge_search/orb.py)")
     if family == "carry":
@@ -186,12 +253,21 @@ def score(metric: str, r: np.ndarray, bars_per_year: float) -> float:
     raise ValueError(f"unknown metric {metric!r}")
 
 
+def entries_of(pos: np.ndarray) -> np.ndarray:
+    """1 where a symbol goes from flat to a position: an entry. A resize of a
+    held (fractional) position is not one."""
+    out = np.zeros_like(pos)
+    out[:, 1:] = (pos[:, 1:] > 0) & (pos[:, :-1] <= 0)
+    out[:, 0] = pos[:, 0] > 0
+    return out
+
+
 def trades(pos: np.ndarray, a: int, b: int) -> int:
-    """Entries (0 → long) inside [a, b), over all symbols."""
+    """Entries (flat → long) inside [a, b), over all symbols."""
     if b <= a:
         return 0
     seg = pos[:, max(a - 1, 0):b]
-    entries = (seg[:, 1:] > seg[:, :-1]).sum() if seg.shape[1] > 1 else 0
+    entries = ((seg[:, 1:] > 0) & (seg[:, :-1] <= 0)).sum() if seg.shape[1] > 1 else 0
     return int(entries)
 
 
